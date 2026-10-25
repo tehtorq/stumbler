@@ -1,0 +1,13 @@
+[package]
+name = "stumbler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "30.0.1"
+winit = "0.30.13"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = { version = "0.24", features = ["bytemuck"] }
+rodio = "0.22.2"
+gilrs = "0.11.2"
