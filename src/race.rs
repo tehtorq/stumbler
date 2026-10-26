@@ -2,7 +2,7 @@
 
 use glam::{Quat, Vec2, Vec3};
 
-use crate::ai_cars::{AiCar, AiDriver, AiTrack};
+use crate::ai_cars::{AiCar, AiDriver, AiTrack, Personality};
 use crate::physics::{CarPhysics, WorldGround};
 
 pub const RACE_LAPS: u32 = 3;
@@ -10,20 +10,23 @@ pub const COUNTDOWN: f32 = 3.0;
 /// Path points between grid slots (4 units each): the cars stagger left and
 /// right, so each is two of these behind the one in front on its side.
 const GRID_SPACING: usize = 5;
+/// A gravel stage's start line is this many path points along its road,
+/// with the grid behind it.
+pub const STAGE_START: usize = 3 + GRID_SPACING * 9;
+/// A gravel stage's finish line is this many path points before its road
+/// ends, leaving room to pull up.
+pub const STAGE_RUNOFF: usize = 40;
 /// A lap only counts if the player passed through every sector.
 const SECTORS: usize = 8;
 /// Further than this from the circuit and the HUD nags you to return.
 const OFF_TRACK_WARNING: f32 = 250.0;
-/// Rivals well behind the player find a little extra pace, and those well
-/// ahead ease off a touch, so the pack stays in contention: the change per
-/// unit of track between them, and its limits either way.
-const CATCH_UP_PER_UNIT: f32 = 0.00004;
-const CATCH_UP_MAX: f32 = 0.05;
-const EASE_OFF_MAX: f32 = 0.03;
+/// Times further you may stray from a gravel stage's road.
+const STAGE_ROAM: f32 = 4.0;
 /// How long a sector split stays on screen.
 const SPLIT_SHOW: f32 = 3.0;
-/// Rivals react to the start signal after somewhere in this range (seconds).
-const REACTION: (f32, f32) = (0.12, 0.45);
+/// Rivals react to the start signal within this long (seconds) either side
+/// of their usual reaction (see `Personality::reaction`).
+const REACTION_SPREAD: f32 = 0.1;
 /// Each race, each rival's pace varies by up to this share either way, so
 /// the same car doesn't always lead.
 const FORM: f32 = 0.02;
@@ -87,8 +90,6 @@ pub struct Race {
     sectors: [bool; SECTORS],
     /// The first crossing of the line (from the grid) starts lap 1.
     started_lap: bool,
-    /// Rivals' paces as they lined up (with the day's form), before any catch-up.
-    base_pace: Vec<f32>,
     /// How long after the start signal each rival gets going.
     reactions: Vec<f32>,
     /// Seeds the rivals' reactions and form; from the clock if not set.
@@ -100,6 +101,9 @@ pub struct Race {
     pub split: Option<(f32, f32)>,
     /// A time trial: alone, lap after lap, against your own ghost.
     pub trial: bool,
+    /// A gravel stage: one run from the start to the finish, anywhere in
+    /// between allowed.
+    pub stage: bool,
     /// The player's lap so far, and the last valid lap once it's done
     /// (for the game to keep as a ghost if it's the best).
     recording: Vec<GhostFrame>,
@@ -119,17 +123,17 @@ impl Race {
             laps_done: 0,
             off_track: 0.0,
             wrong_way: 0.0,
-            progress: AiDriver::new(0, 1.0, 0.0, 0.0),
+            progress: AiDriver::new(0, Personality::plain(1.0, 0.0), 0.0),
             lap_start: 0.0,
             sectors: [false; SECTORS],
             started_lap: false,
-            base_pace: Vec::new(),
             reactions: Vec::new(),
             seed: None,
             splits: [None; SECTORS],
             best_splits: None,
             split: None,
             trial: false,
+            stage: false,
             recording: Vec::new(),
             completed_lap: None,
         }
@@ -170,14 +174,28 @@ impl Race {
     }
 
     pub fn is_off_track(&self) -> bool {
-        self.off_track > OFF_TRACK_WARNING && self.phase == Phase::Racing
+        self.off_track > OFF_TRACK_WARNING * self.roam() && self.phase == Phase::Racing
+    }
+
+    /// How much further from the road than on a circuit you may wander:
+    /// stages can be cut across the woods.
+    pub fn roam(&self) -> f32 {
+        if self.stage { STAGE_ROAM } else { 1.0 }
+    }
+
+    /// How far there is still to go to a stage's finish line (units).
+    pub fn to_go(&self, track: &AiTrack) -> f32 {
+        (track.len() - 1 - STAGE_RUNOFF).saturating_sub(self.progress.progress_idx) as f32 * crate::road::SAMPLE_SPACING
     }
 
     /// Line everyone up on the grid behind the start line and begin the countdown.
     /// The player starts at the back.
     pub fn start(&mut self, player: &mut CarPhysics, cars: &mut [AiCar], track: &AiTrack) {
         let n = track.len();
-        let slot = |k: usize| (n - 3 - k * GRID_SPACING, if k % 2 == 0 { -8.0 } else { 8.0 });
+        // On a stage the grid is two narrow columns on the gravel behind its
+        // start line; on a circuit, behind the line at the end of the lap
+        let (line, wide) = if self.stage { (STAGE_START, 5.5) } else { (n, 8.0) };
+        let slot = |k: usize| (line - 3 - k * GRID_SPACING, if k % 2 == 0 { -wide } else { wide });
 
         // Slowest at the front, so the quicker rivals have to come through
         // the field and there's racing ahead of the player, not a procession
@@ -194,7 +212,7 @@ impl Race {
         let (pos, yaw) = track.pose(idx, lateral);
         player.place(&WorldGround, pos.x, pos.y, yaw);
 
-        *self = Self { rivals: std::mem::take(&mut self.rivals), trial: self.trial, seed: self.seed, ..Self::new(self.circuit, Vec::new()) };
+        *self = Self { rivals: std::mem::take(&mut self.rivals), trial: self.trial, stage: self.stage, seed: self.seed, ..Self::new(self.circuit, Vec::new()) };
         self.progress.progress_idx = idx;
         // Every race a little different: reactions off the line, and form
         let mut seed = self.seed.unwrap_or_else(|| {
@@ -206,8 +224,13 @@ impl Race {
             seed ^= seed << 5;
             (seed >> 8) as f32 / (1u32 << 24) as f32
         };
-        self.base_pace = self.rivals.iter().map(|&ci| cars[ci].driver.pace * (1.0 + FORM * (rand() * 2.0 - 1.0))).collect();
-        self.reactions = self.rivals.iter().map(|_| REACTION.0 + rand() * (REACTION.1 - REACTION.0)).collect();
+        for &ci in &self.rivals {
+            let driver = &mut cars[ci].driver;
+            driver.pace = driver.style.pace * (1.0 + FORM * (rand() * 2.0 - 1.0));
+        }
+        self.reactions = self.rivals.iter()
+            .map(|&ci| (cars[ci].driver.style.reaction + REACTION_SPREAD * (rand() * 2.0 - 1.0)).max(0.05))
+            .collect();
     }
 
     /// Note which way the player is heading (`velocity` on the ground), to
@@ -260,9 +283,19 @@ impl Race {
         let sector_before = self.progress.progress_idx * SECTORS / n;
         self.progress.track_progress(track, player_pos);
         self.off_track = track.points[self.progress.progress_idx].distance(player_pos);
+        if self.stage {
+            // Timed from the start signal to the finish line, however you
+            // get there
+            self.started_lap = true;
+            if self.phase == Phase::Racing && self.progress.progress_idx >= n - 1 - STAGE_RUNOFF {
+                self.update_position(cars, n);
+                self.phase = Phase::Finished { position: self.position, total_time: self.clock };
+                events.push(RaceEvent::Finished);
+            }
+            return events;
+        }
         let sector = self.progress.progress_idx * SECTORS / n;
         self.sectors[sector] = true;
-        self.pace_rivals(cars, n);
         if let Some((_, age)) = &mut self.split {
             *age += dt;
         }
@@ -310,17 +343,6 @@ impl Race {
             events.push(RaceEvent::Finished);
         }
         events
-    }
-
-    /// Catch-up and ease-off for the rivals (see `CATCH_UP_PER_UNIT`).
-    fn pace_rivals(&mut self, cars: &mut [AiCar], track_len: usize) {
-        let me = self.progress.progress(track_len);
-        for (k, &ci) in self.rivals.iter().enumerate() {
-            let driver = &mut cars[ci].driver;
-            let behind = (me - driver.progress(track_len)) * 4.0;
-            let adjust = (behind * CATCH_UP_PER_UNIT).clamp(-EASE_OFF_MAX, CATCH_UP_MAX);
-            driver.pace = self.base_pace[k] * (1.0 + adjust);
-        }
     }
 
     /// The latest split while it's still on show.

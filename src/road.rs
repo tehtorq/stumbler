@@ -15,6 +15,12 @@ use crate::track::Track;
 pub const ROAD_HALF_WIDTH: f32 = 24.0;
 /// Half the width of a dirt trail.
 pub const TRAIL_HALF_WIDTH: f32 = 7.0;
+/// Half the width of a gravel stage road.
+pub const GRAVEL_HALF_WIDTH: f32 = 11.0;
+/// A jump on a gravel stage: a kicker rising this high over this many
+/// samples, dropping steeply back to the road beyond its lip.
+pub const RAMP_HEIGHT: f32 = 3.5;
+pub const RAMP_SAMPLES: usize = 6;
 /// Half the width of the railway's bed (ballast, sleepers and rails).
 pub const RAIL_HALF_WIDTH: f32 = 9.0;
 /// Distance between the two rails.
@@ -47,12 +53,18 @@ const KERB_RED: [f32; 4] = [0.85, 0.12, 0.1, 1.0];
 const CHECKER_BLACK: [f32; 4] = [0.08, 0.08, 0.08, 1.0];
 const DIRT: [f32; 4] = [0.56, 0.43, 0.29, 1.0];
 const DIRT_RUT: [f32; 4] = [0.46, 0.34, 0.22, 1.0];
+const GRAVEL: [f32; 4] = [0.6, 0.55, 0.47, 1.0];
+const GRAVEL_RUT: [f32; 4] = [0.5, 0.45, 0.38, 1.0];
+const RAMP_PLANK: [f32; 4] = [0.55, 0.38, 0.22, 1.0];
+const RAMP_PLANK_DARK: [f32; 4] = [0.42, 0.28, 0.16, 1.0];
 const BALLAST: [f32; 4] = [0.5, 0.47, 0.43, 1.0];
 const SLEEPER: [f32; 4] = [0.3, 0.22, 0.16, 1.0];
 const RAIL_SIDE: [f32; 4] = [0.36, 0.3, 0.27, 1.0];
 const RAIL_TOP: [f32; 4] = [0.78, 0.78, 0.8, 1.0];
 /// Trails give less grip than tarmac, and kick up dust.
 const TRAIL_GRIP: f32 = 0.45;
+/// Loose gravel stages: a bit more than a trail.
+const GRAVEL_GRIP: f32 = 0.55;
 /// Loose ballast and sleepers give a little more than a trail.
 const RAIL_GRIP: f32 = 0.55;
 
@@ -61,6 +73,7 @@ const RAIL_GRIP: f32 = 0.55;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum PathKind {
     Trail,
+    Gravel,
     Rail,
     Road,
     Circuit,
@@ -70,6 +83,7 @@ impl PathKind {
     pub fn half_width(self) -> f32 {
         match self {
             PathKind::Trail => TRAIL_HALF_WIDTH,
+            PathKind::Gravel => GRAVEL_HALF_WIDTH,
             PathKind::Rail => RAIL_HALF_WIDTH,
             PathKind::Road | PathKind::Circuit => ROAD_HALF_WIDTH,
         }
@@ -100,6 +114,8 @@ pub struct RoadPath {
     pub curvature: Vec<f32>,
     pub closed: bool,
     pub kind: PathKind,
+    /// Gravel stages: the first sample of each jump (see `RAMP_HEIGHT`).
+    pub ramps: Vec<usize>,
 }
 
 impl RoadPath {
@@ -213,6 +229,7 @@ pub fn on_road(x: f32, z: f32) -> f32 {
         Some(s) => {
             let surface = match s.kind {
                 PathKind::Trail => TRAIL_GRIP,
+                PathKind::Gravel => GRAVEL_GRIP,
                 PathKind::Rail => RAIL_GRIP,
                 _ => 1.0,
             };
@@ -288,6 +305,80 @@ impl RoadNetwork {
             added.push(path);
         }
         self.paths.extend(added);
+        self.index();
+    }
+
+    /// Add gravel stage roads (open paths). Where one crosses a road, the
+    /// railway or a circuit it eases to that path's height so the crossing
+    /// is level; then jumps are set into its straighter stretches.
+    pub fn add_gravel(&mut self, stages: &[Track], natural_height: impl Fn(f32, f32) -> f32) {
+        // Eased over this many samples either side of a crossing, beyond
+        // the stretch flat with the other path
+        const EASE: usize = 30;
+        for track in stages.iter().filter(|t| t.points_2d.len() >= 2) {
+            let mut path = build_path(&track.points_2d, false, PathKind::Gravel, &natural_height);
+            let n = path.len();
+            // Each crossing: its closest sample, the other path's height
+            // there, and how many samples either side lie on its surface
+            let across = |p: Vec2| self.nearest_matching(p.x, p.y, |k| k > PathKind::Gravel)
+                .filter(|o| !o.raised && o.dist < o.half_width() + KERB_WIDTH);
+            let mut crossings: Vec<(usize, f32, usize)> = Vec::new();
+            let mut run: Option<(usize, f32, f32, usize)> = None;
+            for i in 0..=n {
+                match (i < n).then(|| across(path.points[i])).flatten() {
+                    Some(o) => {
+                        let flat = ((o.half_width() + o.shoulder() + GRAVEL_HALF_WIDTH) / SAMPLE_SPACING) as usize;
+                        if run.is_none_or(|r| o.dist < r.1) {
+                            run = Some((i, o.dist, o.height, flat));
+                        }
+                    }
+                    None => {
+                        if let Some((c, _, h, flat)) = run.take() {
+                            crossings.push((c, h, flat));
+                        }
+                    }
+                }
+            }
+            let mut crossing = vec![false; n];
+            for &(c, h, flat) in &crossings {
+                // On the other path's surface and shoulder: its height there
+                // (it slopes along itself, so that changes across a skewed
+                // crossing); then eased back from either edge
+                let (lo, hi) = (c.saturating_sub(flat), (c + flat).min(n - 1));
+                let other = |k: usize| {
+                    let p = path.points[k];
+                    self.nearest_matching(p.x, p.y, |kind| kind > PathKind::Gravel).filter(|o| !o.raised).map_or(h, |o| o.height)
+                };
+                for k in lo..=hi {
+                    path.heights[k] = other(k);
+                    crossing[k] = true;
+                }
+                for (edge, dir) in [(lo, -1_isize), (hi, 1)] {
+                    let he = path.heights[edge];
+                    for step in 1..=EASE {
+                        let k = edge as isize + dir * step as isize;
+                        if k < 0 || k >= n as isize {
+                            break;
+                        }
+                        let t = step as f32 / EASE as f32;
+                        let w = 1.0 - t * t * (3.0 - 2.0 * t);
+                        let k = k as usize;
+                        path.heights[k] += (he - path.heights[k]) * w;
+                        crossing[k] = true;
+                    }
+                }
+            }
+            path.ramps = place_ramps(&path, &crossing);
+            for &r in &path.ramps {
+                for k in 0..RAMP_SAMPLES {
+                    path.heights[r + k] += RAMP_HEIGHT * (k + 1) as f32 / RAMP_SAMPLES as f32;
+                }
+                // A steep back rather than a sheer drop, so a car that rolls
+                // over it slowly comes down it instead of tipping off
+                path.heights[r + RAMP_SAMPLES] += RAMP_HEIGHT * 0.4;
+            }
+            self.paths.push(path);
+        }
         self.index();
     }
 
@@ -459,7 +550,7 @@ impl RoadNetwork {
     }
 
     fn nearest_of(&self, x: f32, z: f32, raised: bool) -> Option<RoadSample> {
-        let mut best: [Option<RoadSample>; 4] = [None; 4];
+        let mut best: [Option<RoadSample>; 5] = [None; 5];
         for (seg, dist, t) in self.segments_near(Vec2::new(x, z)).filter(|(seg, _, _)| raised || !seg.raised) {
             let slot = &mut best[seg.kind as usize];
             if slot.is_none_or(|b| dist < b.dist) {
@@ -517,6 +608,7 @@ impl RoadNetwork {
                 PathKind::Road => (0.0, ROAD_TARMAC),
                 PathKind::Rail => (-0.02, BALLAST),
                 PathKind::Trail => (-0.03, DIRT),
+                PathKind::Gravel => (-0.025, GRAVEL),
             };
 
             for i in 0..quads {
@@ -584,6 +676,16 @@ impl RoadNetwork {
                     // Worn wheel ruts
                     for c in [-3.2, 3.2] {
                         mesh.quad(path, i, j, c - 0.8, c + 0.8, base + 0.03, DIRT_RUT);
+                    }
+                } else if path.kind == PathKind::Gravel {
+                    // Two racing lines swept clear, and plank-faced jumps
+                    if path.ramps.iter().any(|&r| (r..r + RAMP_SAMPLES).contains(&i)) {
+                        let color = if i % 2 == 0 { RAMP_PLANK } else { RAMP_PLANK_DARK };
+                        mesh.quad(path, i, j, -hw + 1.0, hw - 1.0, base + 0.06, color);
+                    } else {
+                        for c in [-4.5, 4.5] {
+                            mesh.quad(path, i, j, c - 1.2, c + 1.2, base + 0.03, GRAVEL_RUT);
+                        }
                     }
                 } else if path.circuit() {
                     // Edge lines
@@ -759,6 +861,7 @@ fn build_path(
         PathKind::Circuit => 0.10,
         PathKind::Road => 0.15,
         PathKind::Trail => 0.22,
+        PathKind::Gravel => 0.15,
         PathKind::Rail => 0.025,
     };
     for _ in 0..4 {
@@ -776,9 +879,9 @@ fn build_path(
     // The limit leaves sharp crests and dips where it cut a slope short;
     // round them into vertical curves so cars don't take off over them
     // (averaging can't make any stretch steeper)
-    round_vertical_curves(&mut heights, closed, if kind == PathKind::Trail { 4 } else { 10 });
+    round_vertical_curves(&mut heights, closed, if matches!(kind, PathKind::Trail | PathKind::Gravel) { 4 } else { 10 });
 
-    let mut path = RoadPath { points, heights, structure: vec![Structure::Ground; n], curvature: vec![0.0; n], closed, kind };
+    let mut path = RoadPath { points, heights, structure: vec![Structure::Ground; n], curvature: vec![0.0; n], closed, kind, ramps: Vec::new() };
     // Curvature from heading change over a few samples (smooths out noise)
     let span = 3;
     for i in 0..n {
@@ -794,6 +897,31 @@ fn build_path(
         path.curvature[i] = angle / (SAMPLE_SPACING * steps as f32);
     }
     path
+}
+
+/// Jumps along a gravel stage, at least `RAMP_GAP` apart: each on a
+/// straight, gently graded stretch with a run-up and room to land, away
+/// from crossings (`crossing`) and the stage's ends.
+fn place_ramps(path: &RoadPath, crossing: &[bool]) -> Vec<usize> {
+    const RAMP_GAP: f32 = 450.0;
+    const STRAIGHT: f32 = 1.0 / 250.0;
+    let n = path.points.len();
+    const GRADE: f32 = 0.1 * SAMPLE_SPACING;
+    let (before, after) = (20, 35);
+    let gap = (RAMP_GAP / SAMPLE_SPACING) as usize;
+    let mut ramps = Vec::new();
+    let mut i = (400.0 / SAMPLE_SPACING) as usize;
+    while i + after + 80 < n {
+        let around = i - before..i + after;
+        let fits = around.clone().all(|k| path.curvature[k] < STRAIGHT && !crossing[k] && (path.heights[k + 1] - path.heights[k]).abs() < GRADE);
+        if fits {
+            ramps.push(i);
+            i += gap;
+        } else {
+            i += 1;
+        }
+    }
+    ramps
 }
 
 /// Three passes of a moving average `radius` samples either side.

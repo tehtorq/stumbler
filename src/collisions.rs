@@ -1,5 +1,5 @@
-//! Collisions. Trees are soft: the car ploughs into the branches, losing
-//! speed fast and spinning on hard hits, while the tree whips about. Scenery
+//! Collisions. Trees are soft: the car brushes through the branches, losing
+//! a little speed and twitching on hard hits, while the tree whips about. Scenery
 //! and other cars are solid, resolved with impulses at the contact point so
 //! glancing hits spin the car naturally.
 
@@ -10,13 +10,14 @@ use crate::physics::CarPhysics;
 /// Each car is approximated by two circles along its length.
 const CAR_CIRCLE_OFFSET: f32 = 2.4;
 const CAR_CIRCLE_RADIUS: f32 = 2.5;
-const TREE_RADIUS: f32 = 1.2;
-/// Speed lost per second while in a tree (the old 12% per frame at 60 fps).
-const TREE_DRAG: f32 = 7.7;
-/// Above this speed a tree hit starts to spin the car.
-const TREE_SPIN_SPEED: f32 = 40.0;
+const TREE_RADIUS: f32 = 0.8;
+/// Speed lost per second while in a tree: a fifth or so of it going
+/// straight through one at speed, so forests slow you rather than stop you.
+const TREE_DRAG: f32 = 1.2;
+/// Above this speed a tree hit starts to twist the car.
+const TREE_SPIN_SPEED: f32 = 70.0;
 /// Yaw rate gained per second in a tree, per unit of speed above `TREE_SPIN_SPEED`.
-const TREE_SPIN: f32 = 1.0;
+const TREE_SPIN: f32 = 0.4;
 const RESTITUTION: f32 = 0.25;
 const FRICTION: f32 = 0.3;
 
@@ -277,28 +278,29 @@ mod tests {
     fn tree_slows_the_car_without_bouncing_it_back() {
         let (car, after, contact) = crash(0.0, 60.0);
         assert!(contact > 40.0, "no contact registered: {contact}");
-        assert!(after < contact * 0.6, "barely slowed: {contact} -> {after}");
+        assert!(after < contact * 0.9 && after > contact * 0.6, "should lose some speed, not most: {contact} -> {after}");
         assert!(car.vel.z <= 0.5, "bounced back off the tree: {}", car.vel);
         assert!(car.up().y > 0.9, "tree hit flipped the car");
     }
 
     #[test]
     fn slow_bump_into_a_tree_isnt_a_wall() {
-        // Creep into a trunk: the car slows to a crawl but isn't flung back
-        let (car, _, contact) = crash(0.0, 15.0);
+        // Creep into a trunk: the car pushes through, slowed, and isn't flung back
+        let (car, after, contact) = crash(0.0, 15.0);
         assert!(contact > 0.0, "missed the tree");
-        assert!(car.vel.z <= 0.0 && car.vel.length() < 5.0, "unexpected: {}", car.vel);
+        assert!(car.vel.z <= 0.0 && after < contact, "unexpected: {} ({contact} -> {after})", car.vel);
     }
 
     #[test]
-    fn fast_tree_hit_spins_the_car_toward_the_tree() {
+    fn fast_tree_hit_twists_the_car_toward_the_tree() {
         for side in [-1.0_f32, 1.0] {
             let (car, _, contact) = crash(side * 3.0, 110.0);
             assert!(contact > 90.0, "missed the tree");
             // Clipping it on local +X swings the nose that way, which is a left turn (yaw down)
             let turn = -car.yaw() * side;
             println!("tree at {side}: turned {:.2} rad, speed after {:.0}", turn, car.vel.length());
-            assert!(turn > 0.3, "tree at {side}: yaw {} should turn toward it", car.yaw());
+            // A twitch toward it, not a spin
+            assert!(turn > 0.05 && turn < 0.6, "tree at {side}: yaw {} should turn a little toward it", car.yaw());
             assert!(car.up().y > 0.9);
         }
     }

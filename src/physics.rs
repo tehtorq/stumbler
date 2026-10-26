@@ -13,7 +13,7 @@ use glam::{Mat3, Mat4, Quat, Vec3, vec3};
 use crate::car::{WHEEL_MOUNTS, WHEEL_RADIUS};
 
 // --- Chassis ---
-const GRAVITY: f32 = 45.0;
+pub(crate) const GRAVITY: f32 = 45.0;
 const CAR_MASS: f32 = 40.0;
 /// Inertia about local X (pitch), Y (yaw), Z (roll). Inflated vs a solid box for stability.
 const INERTIA: Vec3 = vec3(450.0, 420.0, 220.0);
@@ -306,6 +306,20 @@ impl CarPhysics {
         let grip_limit = (WHEELBASE * TYRE_MU * self.setup.grip * CORNER_SHARE * GRAVITY / (self.speed * self.speed).max(1.0)).atan();
         let margin = STEER_SLIP_MARGIN * (MARGIN_SPEED / self.speed.abs().max(MARGIN_SPEED)).powi(2);
         MAX_STEER.min(grip_limit + margin)
+    }
+
+    /// How far sideways the body is to its travel (radians, + with the
+    /// velocity toward the car's right).
+    pub fn sideslip(&self) -> f32 {
+        self.vel.dot(self.rot * Vec3::X).atan2(self.speed.abs().max(1.0))
+    }
+
+    /// The steering that asks a drift under way to settle at `angle`
+    /// (radians): the drift's own response to the wheel, run backwards.
+    pub fn drift_steer(&self, angle: f32) -> f32 {
+        let full = crate::tuning::get().drift_angle;
+        let into = if angle >= DRIFT_UNWIND { (angle - DRIFT_UNWIND) / (full - DRIFT_UNWIND) } else { angle / DRIFT_UNWIND - 1.0 };
+        into.clamp(-1.0, 1.0) * self.sideslip().signum()
     }
 
     pub fn grounded_wheels(&self) -> usize {

@@ -101,8 +101,8 @@ impl Particles {
             }
         }
 
-        // Dust kicked up off-road
-        if on_road < 0.5 && speed > 15.0 && car.grounded_wheels() > 0 {
+        // Dust kicked up off the tarmac: gravel, dirt and grass
+        if on_road < 0.6 && speed > 15.0 && car.grounded_wheels() > 0 {
             self.dust_accum += dt * (speed * 0.25).min(30.0);
             while self.dust_accum >= 1.0 {
                 self.dust_accum -= 1.0;

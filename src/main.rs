@@ -42,6 +42,7 @@ mod screen;
 mod secrets;
 mod skids;
 mod spectators;
+mod stages;
 mod speedlines;
 mod terrain;
 mod track;
@@ -56,7 +57,7 @@ mod world;
 #[cfg(test)]
 mod sim_tests;
 
-use ai_cars::{AiCar, AiDriver, AiTrack};
+use ai_cars::{AiCar, AiDriver, AiTrack, Personality};
 use camera::ChaseCamera;
 use chunks::ChunkManager;
 use gpu::{DynamicMesh, Mesh};
@@ -108,24 +109,31 @@ impl Tour {
 
 /// Difficulty settings: their names and how they scale the rivals' pace.
 pub(crate) const DIFFICULTIES: [(&str, f32); 3] = [("EASY", 0.88), ("NORMAL", 1.0), ("HARD", 1.06)];
-/// Rival pace multipliers, fastest first.
-const RIVAL_PACE: [f32; 7] = [0.96, 0.945, 0.93, 0.915, 0.895, 0.88, 0.86];
-/// Each rival's side of the racing line on the straights (in 8-unit steps,
-/// see `AiDriver::line_offset`).
-const RIVAL_LINE: [f32; 7] = [0.5, -0.65, 0.3, -0.35, 0.7, -0.5, 0.15];
+/// The rivals, fastest first: pace, side of the line on the straights (in
+/// 8-unit steps, see `AiDriver::line_offset`), aggression, composure, how
+/// keen on drifting, and reaction off the line (see `Personality`).
+pub(crate) const RIVALS: [Personality; 7] = [
+    // The class of the field: quick, tidy, rarely rattled
+    Personality { pace: 0.96, line: 0.5, aggression: 0.45, composure: 0.85, drift: 0.2, reaction: 0.22 },
+    // The hard charger: dives for gaps, shuts the door, a bit ragged
+    Personality { pace: 0.945, line: -0.65, aggression: 0.9, composure: 0.45, drift: 0.5, reaction: 0.18 },
+    // The showman: drifts every slow corner it can
+    Personality { pace: 0.93, line: 0.3, aggression: 0.5, composure: 0.4, drift: 0.9, reaction: 0.3 },
+    // Smooth and steady: never drifts, gives room, hardly ever errs
+    Personality { pace: 0.915, line: -0.35, aggression: 0.3, composure: 0.9, drift: 0.0, reaction: 0.3 },
+    // The wild one: wide on the straights, elbows out, mistakes under pressure
+    Personality { pace: 0.895, line: 0.7, aggression: 0.8, composure: 0.3, drift: 0.6, reaction: 0.2 },
+    // The veteran: cautious, slow off the line, hard to rattle
+    Personality { pace: 0.88, line: -0.5, aggression: 0.2, composure: 0.75, drift: 0.1, reaction: 0.38 },
+    // The rookie: nervous with a car behind, and slow to react
+    Personality { pace: 0.86, line: 0.15, aggression: 0.4, composure: 0.2, drift: 0.3, reaction: 0.4 },
+];
 /// Cars in a race: the player and the rivals.
-pub(crate) const RACERS: usize = RIVAL_PACE.len() + 1;
+pub(crate) const RACERS: usize = RIVALS.len() + 1;
 /// Converts units/s to the km/h shown on the speedometer (1 unit = 0.5 m).
 const KMH_PER_UNIT: f32 = 1.8;
 /// Other cars' engines can be heard within this distance.
 const PASS_BY_RANGE: f32 = 150.0;
-const BOOST_TIME: f32 = 1.2;
-const BOOST_ACCEL: f32 = 45.0;
-/// A drift held at least this long (seconds) earns a burst of boost as it
-/// ends, this many seconds of boost per second of drift, up to a cap.
-const DRIFT_MIN: f32 = 0.8;
-const DRIFT_BOOST_PER_SECOND: f32 = 0.35;
-pub(crate) const DRIFT_CHARGE_MAX: f32 = 3.0;
 /// Throttle down within this long before the start signal earns a boost
 /// off the line.
 const PERFECT_START_WINDOW: f32 = 0.5;
@@ -241,8 +249,6 @@ struct Stage {
     hud_mesh: DynamicMesh,
 
     controls: Controls,
-    /// Seconds of the drift under way, paid out as boost when it ends.
-    drift_charge: f32,
     /// Seconds the throttle has been held down.
     throttle_held: f32,
     /// Seconds of fireworks left over the finish line.
@@ -251,7 +257,7 @@ struct Stage {
     /// Steering as the keys have eased it in (-1 left to 1 right).
     steer: f32,
     throttle: f32,
-    boost_timer: f32,
+    boost: boosts::Boost,
     lap_pulse: f32,
     show_map: bool,
     /// Brief HUD message: text, colour, seconds left.
@@ -288,8 +294,12 @@ impl Stage {
         let t0 = Instant::now();
         let world = World::build(&gpu);
 
+        let mut stage_roads = road::network().into_iter().flat_map(|n| n.paths.iter()).filter(|p| p.kind == road::PathKind::Gravel);
         let mut ai_tracks: Vec<AiTrack> = world.circuits.iter()
-            .map(|c| AiTrack::racing(c.points.clone(), AI_TOP_SPEED, ai_cars::RACING_ROOM))
+            .map(|c| match c.stage {
+                true => ai_cars::stage_track(stage_roads.next().expect("a road for each stage")),
+                false => AiTrack::racing(c.points.clone(), AI_TOP_SPEED, ai_cars::RACING_ROOM),
+            })
             .chain(world.road_loops.iter().map(|points| AiTrack::new(points.clone(), AI_TOP_SPEED)))
             .collect();
         // Cruising traffic on connecting roads is slower
@@ -334,19 +344,22 @@ impl Stage {
         let (pos, yaw) = at
             .or(by_train)
             .or_else(|| start_name.as_deref().and_then(trail_start))
-            .unwrap_or_else(|| track.pose(track.len() - 12, -10.0));
+            .unwrap_or_else(|| match world.circuits[start_circuit].stage {
+                true => track.pose(world.circuits[start_circuit].start_idx - 12, -6.0),
+                false => track.pose(track.len() - 12, -10.0),
+            });
         let mut player = CarPhysics::new(Vec3::new(pos.x, 0.0, pos.y), yaw);
         let camera = ChaseCamera::new(&player);
         let chunks = ChunkManager::new(&gpu, pos);
 
         let demo_driver = std::env::var_os("STUMBLER_DEMO").map(|_| {
-            let mut d = AiDriver::new(0, 1.0, 0.0, 1.0);
+            let mut d = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
             d.track_progress(&ai_tracks[start_circuit], pos);
             d
         });
 
-        let centroids: Vec<(f32, f32)> = world.circuits.iter().map(|c| (c.centre.x, c.centre.y)).collect();
-        let loops: Vec<Vec<Vec2>> = world.circuits.iter().map(|c| c.points.clone()).collect();
+        let centroids: Vec<(f32, f32)> = world.circuits.iter().filter(|c| !c.stage).map(|c| (c.centre.x, c.centre.y)).collect();
+        let loops: Vec<Vec<Vec2>> = world.circuits.iter().filter(|c| !c.stage).map(|c| c.points.clone()).collect();
         let progress = Progress::load();
         player.setup = physics::SETUPS[progress.setup.min(physics::SETUPS.len() - 1)];
         let mut collectibles = collectibles::create_collectibles();
@@ -431,13 +444,12 @@ impl Stage {
             progress,
             discover_timer: 0.0,
             controls: Controls::default(),
-            drift_charge: 0.0,
             throttle_held: 0.0,
             fireworks: 0.0,
             fireworks_accum: 0.0,
             steer: 0.0,
             throttle: 0.0,
-            boost_timer: 0.0,
+            boost: boosts::Boost::default(),
             lap_pulse: 0.0,
             show_map: false,
             banner: None,
@@ -487,10 +499,11 @@ impl Stage {
     /// after another, and line up for the first race.
     fn start_tour(&mut self, ci: usize) {
         let mut circuits = vec![ci];
-        while circuits.len() < TOUR_ROUNDS.min(self.world.circuits.len()) {
+        let venues = self.world.circuits.iter().filter(|c| !c.stage).count();
+        while circuits.len() < TOUR_ROUNDS.min(venues) {
             let here = self.world.circuits[*circuits.last().unwrap()].start();
             let next = (0..self.world.circuits.len())
-                .filter(|i| !circuits.contains(i))
+                .filter(|&i| !circuits.contains(&i) && !self.world.circuits[i].stage)
                 .min_by(|&a, &b| self.world.circuits[a].start().distance(here).total_cmp(&self.world.circuits[b].start().distance(here)))
                 .unwrap();
             circuits.push(next);
@@ -535,19 +548,20 @@ impl Stage {
         let track = &self.ai_tracks[ci];
         let first = self.cars.len();
         let scale = DIFFICULTIES[self.progress.difficulty.min(DIFFICULTIES.len() - 1)].1 * tuning::get().rival_pace;
-        for (k, &pace) in RIVAL_PACE.iter().enumerate() {
-            self.cars.push(AiCar::new(track, ci, 0, 1 + k * 2, pace * scale, RIVAL_LINE[k]));
+        for (k, style) in RIVALS.iter().enumerate() {
+            self.cars.push(AiCar::new(track, ci, 0, 1 + k * 2, Personality { pace: style.pace * scale, ..*style }));
         }
         let mut race = Race::new(ci, (first..self.cars.len()).collect());
+        race.stage = self.world.circuits[ci].stage;
         race.start(&mut self.player, &mut self.cars, track);
         self.race = Some(race);
         self.abandon_timer = 0.0;
         self.camera.snap(&self.player);
         self.skids.lift(0);
-        self.boost_timer = 0.0;
+        self.boost = boosts::Boost::default();
         self.banner = None;
         if let Some(d) = &mut self.demo_driver {
-            *d = AiDriver::new(0, 1.0, 0.0, 1.0);
+            *d = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
             d.track_progress(track, Vec2::new(self.player.pos.x, self.player.pos.z));
         }
     }
@@ -570,10 +584,10 @@ impl Stage {
         self.abandon_timer = 0.0;
         self.camera.snap(&self.player);
         self.skids.lift(0);
-        self.boost_timer = 0.0;
+        self.boost = boosts::Boost::default();
         self.banner = None;
         if let Some(d) = &mut self.demo_driver {
-            *d = AiDriver::new(0, 1.0, 0.0, 1.0);
+            *d = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
             d.track_progress(track, Vec2::new(self.player.pos.x, self.player.pos.z));
         }
     }
@@ -673,16 +687,12 @@ impl Stage {
         let ground = WorldGround;
         self.slipstreams();
         self.player.update(&ground, dt, input);
-        if self.boost_timer > 0.0 {
-            self.boost_timer -= dt;
-            if self.player.grounded_wheels() > 0 {
-                self.player.vel += self.player.heading() * BOOST_ACCEL * dt;
-            }
-        }
         if let (Some(train), Some(rail)) = (&mut self.train, railway::get()) {
             train.update(rail, dt);
         }
-        self.drift_boost(dt);
+        if self.boost.update(&mut self.player, dt) {
+            if let Some(a) = self.audio() { a.trigger_pickup(); }
+        }
         let player_pos = self.player.pos;
         for car in &mut self.cars {
             let track = &self.ai_tracks[car.track_idx];
@@ -750,7 +760,7 @@ impl Stage {
         let zoom = 1.0 + airborne * 0.3 + self.lap_pulse * 0.25;
         // Field of view kicks out under boost and in a tow; kerbs and rough
         // ground shake the view, more the faster you go
-        let kick = if self.boost_timer > 0.0 { tuning::get().fov_boost } else { 0.0 } + self.player.draft * 4.0;
+        let kick = if self.boost.timer > 0.0 { tuning::get().fov_boost } else { 0.0 } + self.player.draft * 4.0;
         self.camera.fov_kick += (kick - self.camera.fov_kick) * (1.0 - (-4.0 * dt).exp());
         let fast = (self.player.speed.abs() / 120.0).min(1.0);
         let rough = (0..4).filter(|&i| self.player.wheel_contact[i])
@@ -831,7 +841,7 @@ impl Stage {
         }
 
         // Wandering off abandons the race
-        if race.phase == Phase::Racing && race.off_track > ABANDON_DISTANCE {
+        if race.phase == Phase::Racing && race.off_track > ABANDON_DISTANCE * race.roam() {
             self.abandon_timer += dt;
         } else {
             self.abandon_timer = 0.0;
@@ -844,7 +854,7 @@ impl Stage {
                     // On the power just as the lights go: a flying start.
                     // Floor it too early and you've simply bogged down
                     if self.throttle_held > 0.0 && self.throttle_held <= PERFECT_START_WINDOW {
-                        self.boost_timer = PERFECT_START_BOOST;
+                        self.boost.timer = PERFECT_START_BOOST;
                         self.banner = Some(("PERFECT START!".into(), hud::GREEN, 2.5));
                         if let Some(a) = self.audio() { a.trigger_pickup(); }
                     }
@@ -863,8 +873,12 @@ impl Stage {
                 RaceEvent::LapInvalid => self.banner = Some(("LAP NOT COUNTED - MISSED A SECTOR".into(), hud::RED, 2.5)),
                 RaceEvent::Finished => {
                     if let Some(a) = self.game_audio.as_ref() { a.params.trigger_chime(); }
-                    if let Some(Race { phase: Phase::Finished { position, .. }, .. }) = &self.race {
+                    if let Some(Race { phase: Phase::Finished { position, total_time }, stage, .. }) = &self.race {
                         self.progress.record_finish(name, *position);
+                        // A stage's time is its record to beat
+                        if *stage && self.progress.record_lap(name, *total_time) {
+                            self.banner = Some((format!("STAGE RECORD {}", hud::format_time(*total_time)), hud::GREEN, 4.0));
+                        }
                         self.progress.save();
                         // Fireworks: a proper show for a win
                         self.fireworks = if *position == 1 { 4.0 } else { 1.5 };
@@ -955,23 +969,6 @@ impl Stage {
             let spread = Vec3::new(((k * 37) % 11) as f32 - 5.0, 0.0, ((k * 53) % 11) as f32 - 5.0) * 4.0;
             self.particles.firework(ahead + Vec3::Y * (22.0 + (k % 3) as f32 * 8.0) + spread, colours[k % colours.len()]);
         }
-    }
-
-    /// Build up drift charge while the player holds a slide; pay it out as
-    /// boost when they straighten up (not if it ended in a spin).
-    fn drift_boost(&mut self, dt: f32) {
-        if self.player.drifting && self.player.speed > 25.0 {
-            self.drift_charge = (self.drift_charge + dt).min(DRIFT_CHARGE_MAX);
-            return;
-        }
-        if self.drift_charge >= DRIFT_MIN && self.player.speed > 20.0 {
-            let side = self.player.vel.dot(self.player.rot * Vec3::X);
-            if side.atan2(self.player.speed).abs() < 0.6 {
-                self.boost_timer = self.boost_timer.max(self.drift_charge * DRIFT_BOOST_PER_SECOND);
-                if let Some(a) = self.audio() { a.trigger_pickup(); }
-            }
-        }
-        self.drift_charge = 0.0;
     }
 
     /// Trees, scenery and car-to-car contacts.
@@ -1096,9 +1093,15 @@ impl Stage {
             self.particles.burst(at, [1.0, 0.85, 0.2], 16, 12.0);
         }
 
+        // Rivals take the pads too
+        for car in &mut self.cars {
+            let p = car.physics.pos;
+            if self.world.boost_pads.iter().any(|pad| pad.contains(p.x, p.z)) {
+                car.boost.pad();
+            }
+        }
         let on_pad = self.world.boost_pads.iter().any(|pad| pad.contains(pos.x, pos.z));
-        if on_pad && self.boost_timer <= 0.0 {
-            self.boost_timer = BOOST_TIME;
+        if on_pad && self.boost.pad() {
             if let Some(a) = self.audio() { a.trigger_pickup(); }
             self.particles.burst(pos, [0.2, 0.85, 1.0], 20, 10.0);
         }
@@ -1179,7 +1182,7 @@ impl Stage {
             }
             KeyCode::KeyG => {
                 // A tour from this start line: here, then its neighbours
-                if let Some(ci) = self.race_offer() {
+                if let Some(ci) = self.race_offer().filter(|&ci| !self.world.circuits[ci].stage) {
                     self.start_tour(ci);
                 }
             }
@@ -1199,7 +1202,7 @@ impl Stage {
                 }
             }
             KeyCode::KeyT => {
-                if let Some(ci) = self.race_offer() {
+                if let Some(ci) = self.race_offer().filter(|&ci| !self.world.circuits[ci].stage) {
                     self.start_time_trial(ci);
                 }
             }

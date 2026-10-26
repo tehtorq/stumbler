@@ -341,8 +341,8 @@ enum Species {
     Snag,
 }
 
-/// Plants per cell (0..1) and which species, for a spot `ground` high.
-fn choose(x: f32, z: f32, ground: f32, roll: f32) -> Option<(Species, f32)> {
+/// Plants per cell (0..1) at a spot `ground` high.
+pub fn density(x: f32, z: f32, ground: f32) -> f32 {
     let desert = terrain::biome_desert(x, z);
     let mountain = terrain::biome_mountain(x, z);
     let forest = terrain::biome_forest(x, z);
@@ -365,9 +365,20 @@ fn choose(x: f32, z: f32, ground: f32, roll: f32) -> Option<(Species, f32)> {
     if ground > treeline + 20.0 || to_volcano < 480.0 {
         density = 0.0;
     }
-    if roll > density {
+    density
+}
+
+/// Which species, if any, for a spot `ground` high.
+fn choose(x: f32, z: f32, ground: f32, roll: f32) -> Option<(Species, f32)> {
+    if roll > density(x, z, ground) {
         return None;
     }
+    let desert = terrain::biome_desert(x, z);
+    let mountain = terrain::biome_mountain(x, z);
+    let forest = terrain::biome_forest(x, z);
+    let tundra = terrain::biome_tundra(x, z);
+    let grass = (1.0 - desert - mountain - forest - tundra).max(0.0);
+    let near_water = terrain::raw_height(x, z) < WATER_LEVEL + 6.0;
 
     // Which biome this plant belongs to: a draw weighted by the local mix,
     // so species thin out gradually across a biome edge

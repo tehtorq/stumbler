@@ -1,7 +1,65 @@
 use glam::{Vec2, vec2};
 use crate::geometry::Vertex;
+use crate::physics::CarPhysics;
 use crate::road::RoadNetwork;
 use crate::terrain::terrain_height;
+
+/// A boost pad's push, in seconds, and how hard any boost pushes (units/s²).
+pub const BOOST_TIME: f32 = 1.2;
+const BOOST_ACCEL: f32 = 45.0;
+/// A drift held at least this long (seconds) earns a burst of boost as it
+/// ends, this many seconds of boost per second of drift, up to a cap.
+pub const DRIFT_MIN: f32 = 0.8;
+const DRIFT_BOOST_PER_SECOND: f32 = 0.35;
+pub const DRIFT_CHARGE_MAX: f32 = 3.0;
+
+/// A car's boost under way and the drift charge building toward the next:
+/// the same rules for the player and the rivals.
+#[derive(Clone, Copy, Default)]
+pub struct Boost {
+    /// Seconds of boost left.
+    pub timer: f32,
+    /// Seconds of the drift under way, paid out as boost when it ends.
+    pub drift_charge: f32,
+}
+
+impl Boost {
+    /// Push `car` along while the boost lasts, build up drift charge while
+    /// it holds a slide and pay it out when it straightens up (not if it
+    /// ended in a spin). True when a drift has just paid out.
+    pub fn update(&mut self, car: &mut CarPhysics, dt: f32) -> bool {
+        if self.timer > 0.0 {
+            self.timer -= dt;
+            if car.grounded_wheels() > 0 {
+                car.vel += car.heading() * BOOST_ACCEL * dt;
+            }
+        }
+        if car.drifting && car.speed > 25.0 {
+            self.drift_charge = (self.drift_charge + dt).min(DRIFT_CHARGE_MAX);
+            return false;
+        }
+        let mut paid = false;
+        if self.drift_charge >= DRIFT_MIN && car.speed > 20.0 {
+            let side = car.vel.dot(car.rot * glam::Vec3::X);
+            if side.atan2(car.speed).abs() < 0.6 {
+                self.timer = self.timer.max(self.drift_charge * DRIFT_BOOST_PER_SECOND);
+                paid = true;
+            }
+        }
+        self.drift_charge = 0.0;
+        paid
+    }
+
+    /// Over a boost pad: a fresh boost, unless one is already under way.
+    /// True if it took.
+    pub fn pad(&mut self) -> bool {
+        let fresh = self.timer <= 0.0;
+        if fresh {
+            self.timer = BOOST_TIME;
+        }
+        fresh
+    }
+}
 
 pub struct BoostPad {
     pub pos: Vec2,   // center XZ

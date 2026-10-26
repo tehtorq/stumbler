@@ -10,20 +10,41 @@ use crate::geometry::Vertex;
 use crate::gpu::{Gpu, Mesh};
 use crate::road::{self, PathKind, RoadNetwork, ROAD_HALF_WIDTH, KERB_WIDTH};
 use crate::terrain::{self, terrain_height};
-use crate::{farms, landmarks, layout, railway, roadside, trails};
+use crate::{farms, landmarks, layout, railway, roadside, stages, trails};
 
+/// A place to race: a circuit, or a gravel stage from one place to another.
 pub struct CircuitInfo {
     pub name: &'static str,
-    /// Closed loop of evenly spaced points; index 0 is the start line.
+    /// Evenly spaced points: a closed loop for a circuit, start to end for a
+    /// stage.
     pub points: Vec<Vec2>,
     /// Outline for maps (every few points).
     pub outline: Vec<Vec2>,
     pub centre: Vec2,
+    /// A gravel stage (else a circuit).
+    pub stage: bool,
+    /// Where the start line is (0 on a circuit; a stage's grid is behind it).
+    pub start_idx: usize,
 }
 
 impl CircuitInfo {
     pub fn start(&self) -> Vec2 {
-        self.points[0]
+        self.points[self.start_idx]
+    }
+
+    /// Which way the race sets off over the start line.
+    pub fn start_dir(&self) -> Vec2 {
+        (self.points[self.start_idx + 1] - self.points[self.start_idx]).normalize_or_zero()
+    }
+
+    /// A stage's finish line (a circuit finishes where it starts).
+    pub fn finish_idx(&self) -> usize {
+        if self.stage { self.points.len() - 1 - crate::race::STAGE_RUNOFF } else { 0 }
+    }
+
+    /// Half the width a gantry over the start or finish must span.
+    fn gate_half(&self) -> f32 {
+        if self.stage { road::GRAVEL_HALF_WIDTH + 5.0 } else { GATE_HALF }
     }
 }
 
@@ -50,14 +71,18 @@ impl World {
         let network = road::install(|| build_network(layout));
         eprintln!("[timing] roads, railway, landmarks and trails {:.2}s", t0.elapsed().as_secs_f32());
 
+        // Circuits, then the gravel stages
         let circuits: Vec<CircuitInfo> = network.paths.iter()
             .filter(|p| p.circuit())
             .zip(names)
+            .chain(network.paths.iter().filter(|p| p.kind == PathKind::Gravel).zip(stages::names().iter().copied()))
             .map(|(p, name)| CircuitInfo {
                 name,
-                outline: p.points.iter().step_by(8).copied().collect(),
+                outline: p.points.iter().step_by(8).chain(p.points.last().filter(|_| !p.closed)).copied().collect(),
                 centre: p.points.iter().copied().sum::<Vec2>() / p.points.len() as f32,
                 points: p.points.clone(),
+                stage: !p.closed,
+                start_idx: if p.closed { 0 } else { crate::race::STAGE_START },
             })
             .collect();
         let roads: Vec<&road::RoadPath> = network.paths.iter().filter(|p| p.kind == PathKind::Road).collect();
@@ -74,8 +99,7 @@ impl World {
             .map(|p| p.points.iter().step_by(6).chain(p.points.last()).copied().collect())
             .collect();
 
-        let loops: Vec<Vec<Vec2>> = circuits.iter().map(|c| c.points.clone()).collect();
-        let (gate_verts, gate_idxs) = build_gates(&loops);
+        let (gate_verts, gate_idxs) = build_gates(&circuits);
         let boost_pads = boosts::create_boost_pads(network);
         let (boost_verts, boost_idxs) = boosts::build_boost_mesh(&boost_pads);
 
@@ -90,7 +114,7 @@ impl World {
         }
     }
 
-    /// The circuit whose start line is nearest `p`, with the distance.
+    /// The circuit or stage whose start line is nearest `p`, with the distance.
     pub fn nearest_start(&self, p: Vec2) -> Option<(usize, f32)> {
         self.circuits.iter().enumerate()
             .map(|(i, c)| (i, c.start().distance(p)))
@@ -106,6 +130,7 @@ pub fn build_network(layout: layout::Layout) -> RoadNetwork {
     let circuits: Vec<_> = layout.circuits.into_iter().map(|c| c.track).collect();
     let mut network = RoadNetwork::build(&circuits, &layout.roads, terrain::TERRAIN_HALF_SIZE, terrain::natural_height);
     network.add_rail(&railway::route(&network), terrain::natural_height);
+    network.add_gravel(&stages::route_all(&network), terrain::natural_height);
     let sites = landmarks::place(&network);
     // Secrets get no trail; finding them is the point
     let positions: Vec<Vec2> = sites.iter().filter(|l| !l.kind.is_secret()).map(|l| l.pos).collect();
@@ -117,13 +142,13 @@ pub fn build_network(layout: layout::Layout) -> RoadNetwork {
     network
 }
 
-/// Where the five start lights hang on circuit `pts`' gantry: in a row
+/// Where the five start lights hang on `c`'s start gantry: in a row
 /// under the banner, on the side facing the grid.
-pub fn start_lamps(pts: &[Vec2]) -> [Vec3; 5] {
-    let p0 = pts[0];
-    let dir = (pts[1] - pts[0]).normalize_or_zero();
+pub fn start_lamps(c: &CircuitInfo) -> [Vec3; 5] {
+    let p0 = c.start();
+    let dir = c.start_dir();
     let side = Vec2::new(-dir.y, dir.x);
-    let (left, right) = (p0 + side * GATE_HALF, p0 - side * GATE_HALF);
+    let (left, right) = (p0 + side * c.gate_half(), p0 - side * c.gate_half());
     let top = terrain_height(left.x, left.y).max(terrain_height(right.x, right.y)) + POLE_HEIGHT;
     std::array::from_fn(|k| {
         let p = p0 + side * (k as f32 - 2.0) * 3.8 - dir * 0.9;
@@ -135,20 +160,23 @@ const GATE_HALF: f32 = ROAD_HALF_WIDTH + KERB_WIDTH + 4.0;
 /// Tall enough for the chase camera to pass under.
 const POLE_HEIGHT: f32 = 26.0;
 
-/// Start/finish gantry over each circuit's first point: two poles, a
-/// banner, and the start lights' housings.
-fn build_gates(circuits: &[Vec<Vec2>]) -> (Vec<Vertex>, Vec<u16>) {
+/// Start/finish gantry over each circuit's first point (and over each
+/// stage's start and its finish): two poles, a banner, and at a start the
+/// lights' housings.
+fn build_gates(circuits: &[CircuitInfo]) -> (Vec<Vertex>, Vec<u16>) {
     let mut verts = Vec::new();
     let mut idxs = Vec::new();
     let pole_color: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
     let banner_color: [f32; 4] = [0.9, 0.1, 0.1, 1.0];
     let banner_stripe: [f32; 4] = [0.95, 0.95, 0.95, 1.0];
 
-    for pts in circuits {
-        let p0 = pts[0];
-        let dir = (pts[1] - pts[0]).normalize_or_zero();
+    let gates = circuits.iter().flat_map(|c| {
+        let finish = c.stage.then(|| (c, c.points[c.finish_idx()], (c.points[c.finish_idx() + 1] - c.points[c.finish_idx()]).normalize_or_zero(), false));
+        std::iter::once((c, c.start(), c.start_dir(), true)).chain(finish)
+    });
+    for (c, p0, dir, start) in gates {
         let side = Vec2::new(-dir.y, dir.x);
-        let gate_half = GATE_HALF;
+        let gate_half = c.gate_half();
         let pole_h = POLE_HEIGHT;
         let banner_h = 4.0;
 
@@ -181,7 +209,7 @@ fn build_gates(circuits: &[Vec<Vec2>]) -> (Vec<Vertex>, Vec<u16>) {
             }
         }
         // Start light housings, dark until the lamps in them come on
-        for lamp in start_lamps(pts) {
+        for lamp in start_lamps(c).into_iter().filter(|_| start) {
             crate::geometry::push_box(&mut verts, &mut idxs, lamp.x, lamp.y, lamp.z, 1.3, 1.3, 1.3, [[0.08, 0.08, 0.09, 1.0]; 6]);
         }
     }

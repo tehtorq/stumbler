@@ -241,10 +241,10 @@ impl Stage {
                 _ => None,
             };
             if let Some((count, colour)) = lit {
-                let pts = &self.world.circuits[race.circuit].points;
-                let toward_grid = (pts[0] - pts[1]).normalize_or_zero();
+                let venue = &self.world.circuits[race.circuit];
+                let toward_grid = -venue.start_dir();
                 // Filling left to right as the grid sees them
-                for lamp in crate::world::start_lamps(pts).iter().rev().take(count) {
+                for lamp in crate::world::start_lamps(venue).iter().rev().take(count) {
                     let at = *lamp + vec3(toward_grid.x, 0.0, toward_grid.y) * 1.3;
                     draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::mesh(&self.start_light_meshes[colour], Mat4::from_translation(at)) });
                 }
@@ -291,18 +291,18 @@ impl Stage {
         let speed_y = height - margin - big - line;
         h.text(width - margin, speed_y, px * 4.0, Align::Right, &kmh.to_string(), hud::WHITE);
         h.text(width - margin, speed_y + big + px * 3.0, px, Align::Right, "KM/H", hud::DIM);
-        if self.boost_timer > 0.0 {
+        if self.boost.timer > 0.0 {
             h.text(width - margin, speed_y - line * 1.5, px * 1.5, Align::Right, "BOOST!", [0.3, 0.9, 1.0, 1.0]);
         } else if self.player.draft > 0.3 {
             h.text(width - margin, speed_y - line * 1.2, px, Align::Right, "SLIPSTREAM", [0.75, 0.9, 1.0, 1.0]);
         }
         // Drift meter: fills while the slide is held, gold once it'll pay out
-        if self.drift_charge > 0.0 {
+        if self.boost.drift_charge > 0.0 {
             let w = px * 60.0;
             let x = width * 0.5 - w * 0.5;
             let y = height - margin - line * 2.5;
-            let full = self.drift_charge / crate::DRIFT_CHARGE_MAX;
-            let ready = self.drift_charge >= crate::DRIFT_MIN;
+            let full = self.boost.drift_charge / crate::boosts::DRIFT_CHARGE_MAX;
+            let ready = self.boost.drift_charge >= crate::boosts::DRIFT_MIN;
             let color = if ready { hud::GOLD } else { [0.9, 0.55, 0.3, 1.0] };
             h.text(width * 0.5, y - line * 1.4, px * 1.2, Align::Center, "DRIFT", color);
             h.rect(x, y, w, px * 2.5, hud::PANEL);
@@ -343,17 +343,28 @@ impl Stage {
         let mut y = margin;
         h.text(x, y, px, Align::Left, &title, hud::DIM);
         y += line;
-        let lap = if race.trial { format!("LAP {}", race.display_lap()) } else { format!("LAP {}/{}", race.display_lap(), race::RACE_LAPS) };
-        h.text(x, y, px * 1.5, Align::Left, &lap, hud::WHITE);
-        y += line * 1.5;
-        h.text(x, y, px, Align::Left, &format!("TIME {}", hud::format_time(race.lap_time())), hud::WHITE);
-        y += line;
-        let last = race.last_lap.map_or("-:--.--".into(), hud::format_time);
-        h.text(x, y, px, Align::Left, &format!("LAST {last}"), hud::DIM);
-        y += line;
         let record = self.progress.best_laps.get(name).copied();
         let best = race.best_lap.or(record).map_or("-:--.--".into(), hud::format_time);
-        h.text(x, y, px, Align::Left, &format!("BEST {best}"), hud::YELLOW);
+        if race.stage {
+            // A stage: how far there is to go, and the time against the record
+            let to_go = race.to_go(&self.ai_tracks[race.circuit]);
+            // (a unit is half a metre)
+            h.text(x, y, px * 1.5, Align::Left, &format!("{:.1} KM TO GO", to_go * 0.5 / 1000.0), hud::WHITE);
+            y += line * 1.5;
+            h.text(x, y, px, Align::Left, &format!("TIME {}", hud::format_time(race.clock)), hud::WHITE);
+            y += line * 2.0;
+            h.text(x, y, px, Align::Left, &format!("RECORD {best}"), hud::YELLOW);
+        } else {
+            let lap = if race.trial { format!("LAP {}", race.display_lap()) } else { format!("LAP {}/{}", race.display_lap(), race::RACE_LAPS) };
+            h.text(x, y, px * 1.5, Align::Left, &lap, hud::WHITE);
+            y += line * 1.5;
+            h.text(x, y, px, Align::Left, &format!("TIME {}", hud::format_time(race.lap_time())), hud::WHITE);
+            y += line;
+            let last = race.last_lap.map_or("-:--.--".into(), hud::format_time);
+            h.text(x, y, px, Align::Left, &format!("LAST {last}"), hud::DIM);
+            y += line;
+            h.text(x, y, px, Align::Left, &format!("BEST {best}"), hud::YELLOW);
+        }
 
         // Top right, under the frame rate: position in a race; in a time
         // trial, how each sector compares with the best lap
@@ -385,7 +396,8 @@ impl Stage {
         }
         if race.is_off_track() {
             let left = (crate::ABANDON_TIME - self.abandon_timer).max(0.0).ceil();
-            h.text(cx, height * 0.65, px * 1.5, Align::Center, &format!("RETURN TO THE CIRCUIT {left}"), hud::RED);
+            let what = if race.stage { "STAGE" } else { "CIRCUIT" };
+            h.text(cx, height * 0.65, px * 1.5, Align::Center, &format!("RETURN TO THE {what} {left}"), hud::RED);
         }
         if let Phase::Finished { position, total_time } = race.phase {
             let longest = self.tour.as_ref().and_then(|t| t.next_circuit())
@@ -397,7 +409,8 @@ impl Stage {
             let color = if position == 1 { hud::YELLOW } else { hud::WHITE };
             h.text(cx, top + line * 0.6, px * 2.5, Align::Center, &format!("FINISHED {}", hud::ordinal(position)), color);
             h.text(cx, top + line * 2.7, px, Align::Center, &format!("TOTAL {}", hud::format_time(total_time)), hud::WHITE);
-            h.text(cx, top + line * 3.7, px, Align::Center, &format!("BEST LAP {best}"), hud::YELLOW);
+            let best_label = if race.stage { "STAGE RECORD" } else { "BEST LAP" };
+            h.text(cx, top + line * 3.7, px, Align::Center, &format!("{best_label} {best}"), hud::YELLOW);
             // On a tour, the way on is the road to the next circuit
             match self.tour.as_ref().and_then(|t| t.next_circuit()) {
                 Some(next) => {
@@ -427,8 +440,11 @@ impl Stage {
         let found = self.progress.landmarks.len();
         let (secrets, places): (Vec<_>, Vec<_>) = landmarks::all().iter().partition(|l| l.kind.is_secret());
         let seen = |list: &[&landmarks::Landmark]| list.iter().filter(|l| self.progress.landmarks.contains(&l.name)).count();
+        let venues = |stage: bool| self.world.circuits.iter().filter(|c| c.stage == stage).count();
+        let found_venues = |stage: bool| self.world.circuits.iter().filter(|c| c.stage == stage && self.progress.circuits.contains(c.name)).count();
         let rows = [
-            (format!("CIRCUITS {}/{}", self.progress.circuits.len(), self.world.circuits.len()), hud::WHITE),
+            (format!("CIRCUITS {}/{}", found_venues(false), venues(false)), hud::WHITE),
+            (format!("STAGES {}/{}", found_venues(true), venues(true)), hud::WHITE),
             (format!("LANDMARKS {}/{}", seen(&places), places.len()), hud::DIM),
             (format!("SECRETS {}/{}", seen(&secrets), secrets.len()), hud::GOLD),
             (format!("PAINTS {}/{}", crate::unlocked_paints(found), crate::car::CAR_COLORS.len()), hud::DIM),
@@ -466,10 +482,11 @@ impl Stage {
             // Screen arrow: up = straight ahead, right = car's right-hand side
             let right = Vec2::new(-fwd.y, fwd.x) * -1.0;
             let dir = Vec2::new(to.dot(right), -to.dot(fwd));
-            let name = if self.progress.circuits.contains(c.name) || tour_next.is_some() { c.name } else { "UNKNOWN CIRCUIT" };
+            let unknown = if c.stage { "UNKNOWN STAGE" } else { "UNKNOWN CIRCUIT" };
+            let name = if self.progress.circuits.contains(c.name) || tour_next.is_some() { c.name } else { unknown };
             let label = match &self.tour {
-                Some(t) => format!("TOUR {}/{}: {name} {:.1} KM", t.round + 1, t.circuits.len(), dist / 1000.0),
-                None => format!("{name} {:.1} KM", dist / 1000.0),
+                Some(t) => format!("TOUR {}/{}: {name} {:.1} KM", t.round + 1, t.circuits.len(), dist * 0.5 / 1000.0),
+                None => format!("{name} {:.1} KM", dist * 0.5 / 1000.0),
             };
             let cx = width * 0.5;
             let w = HudBuilder::text_width(&label, px) + px * 16.0;
@@ -485,7 +502,8 @@ impl Stage {
             let top = height * 0.3;
             let best = self.progress.best_laps.get(name).map_or("-:--.--".into(), |&t| hud::format_time(t));
             let finish = self.progress.best_finish.get(name).map_or("-".into(), |&p| hud::ordinal(p));
-            let record = format!("BEST LAP {best}   BEST FINISH {finish}");
+            let stage = self.world.circuits[ci].stage;
+            let record = if stage { format!("STAGE RECORD {best}   BEST FINISH {finish}") } else { format!("BEST LAP {best}   BEST FINISH {finish}") };
             let difficulty = crate::DIFFICULTIES[self.progress.difficulty.min(crate::DIFFICULTIES.len() - 1)].0;
             let rivals = format!("RIVALS: {difficulty} - TAB    SETUP: {} - V", self.player.setup.name);
             let pw = HudBuilder::text_width(name, px * 2.0).max(HudBuilder::text_width(&record, px)).max(HudBuilder::text_width(&rivals, px)) + px * 16.0;
@@ -498,7 +516,13 @@ impl Stage {
                 None => "PRESS ENTER TO RACE".to_string(),
             };
             h.text(cx, top + line * 3.1, px, Align::Center, &enter, hud::WHITE);
-            let others = if self.tour.is_some() { "T FOR A TIME TRIAL" } else { "T TIME TRIAL - G FIVE-RACE TOUR" };
+            let others = if stage {
+                "GRAVEL STAGE TO THE FINISH - ANY WAY YOU CAN"
+            } else if self.tour.is_some() {
+                "T FOR A TIME TRIAL"
+            } else {
+                "T TIME TRIAL - G FIVE-RACE TOUR"
+            };
             h.text(cx, top + line * 4.1, px, Align::Center, others, hud::DIM);
             h.text(cx, top + line * 5.1, px, Align::Center, &rivals, hud::DIM);
         }
@@ -546,7 +570,7 @@ impl Stage {
         let racing = self.race.as_ref().map(|r| r.circuit);
         for (i, c) in self.world.circuits.iter().enumerate() {
             let color = if Some(i) == racing { hud::YELLOW } else if self.progress.circuits.contains(c.name) { hud::WHITE } else { [0.6, 0.6, 0.65, 0.8] };
-            hud::map_polyline(h, &view, &c.outline, true, clip, px * 1.0, color);
+            hud::map_polyline(h, &view, &c.outline, !c.stage, clip, px * 1.0, if c.stage { stage_color(color) } else { color });
         }
         let dot = |h: &mut HudBuilder, p: Vec2, s: f32, color: [f32; 4]| {
             let q = view.project(p);
@@ -607,8 +631,8 @@ impl Stage {
         for c in &self.world.circuits {
             let known = self.progress.circuits.contains(c.name);
             let color = if known { hud::WHITE } else { [0.45, 0.45, 0.5, 0.9] };
-            hud::map_polyline(h, &view, &c.outline, true, clip, px * 0.8, color);
-            let label = view.project(c.centre);
+            hud::map_polyline(h, &view, &c.outline, !c.stage, clip, px * 0.8, if c.stage { stage_color(color) } else { color });
+            let label = view.project(if c.stage { c.start() } else { c.centre });
             if known {
                 let raced = self.progress.best_finish.get(c.name);
                 let text_color = if raced == Some(&1) { hud::YELLOW } else { hud::WHITE };
@@ -626,8 +650,13 @@ impl Stage {
         let me = view.project(self.player_xz());
         h.arrow(me, view.direction(self.player.yaw()), px * 3.0, hud::RED);
         h.text(width * 0.5, px * 4.0, px * 1.5, Align::Center, "WORLD MAP", hud::WHITE);
-        h.text(width * 0.5, height - px * 10.0, px, Align::Center, "M CLOSE  YELLOW: WINS  BLUE: LANDMARKS  GOLD: SECRETS  GREY: RAILWAY", hud::DIM);
+        h.text(width * 0.5, height - px * 10.0, px, Align::Center, "M CLOSE  YELLOW: WINS  ORANGE: GRAVEL STAGES  BLUE: LANDMARKS  GOLD: SECRETS  GREY: RAILWAY", hud::DIM);
     }
+}
+
+/// Gravel stages show on the maps in a sandy orange, dimmer until found.
+fn stage_color(circuit: [f32; 4]) -> [f32; 4] {
+    if circuit == hud::YELLOW { circuit } else { [1.0, 0.6 * circuit[1] + 0.1, 0.2, circuit[3]] }
 }
 
 /// Soft discs of light on the ground under the circuit floodlights near
