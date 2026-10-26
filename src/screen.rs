@@ -39,7 +39,7 @@ pub(crate) struct TrainMeshes {
 }
 
 impl TrainMeshes {
-    pub(crate) fn new(g: &gpu::Gpu) -> Self {
+    pub(crate) fn new(g: &gpu::GpuContext) -> Self {
         let m = railway::build_meshes();
         let mesh = |(v, i): &(Vec<Vertex>, Vec<u32>)| gpu::Mesh::new(g, v, i);
         Self {

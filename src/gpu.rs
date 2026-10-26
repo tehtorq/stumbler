@@ -151,7 +151,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub fn new<I: IndexType>(gpu: &Gpu, vertices: &[Vertex], indices: &[I]) -> Self {
+    pub fn new<I: IndexType>(gpu: &GpuContext, vertices: &[Vertex], indices: &[I]) -> Self {
         let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vertices"),
             contents: bytemuck::cast_slice(vertices),
@@ -166,7 +166,7 @@ impl Mesh {
     }
 
     /// Overwrite vertex data in place (same vertex count, e.g. recolouring a car).
-    pub fn write_vertices(&self, gpu: &Gpu, vertices: &[Vertex]) {
+    pub fn write_vertices(&self, gpu: &GpuContext, vertices: &[Vertex]) {
         gpu.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(vertices));
     }
 }
@@ -179,7 +179,7 @@ pub struct DynamicMesh {
 }
 
 impl DynamicMesh {
-    pub fn new(gpu: &Gpu, label: &str) -> Self {
+    pub fn new(gpu: &GpuContext, label: &str) -> Self {
         let vertex_capacity = 4096;
         let index_capacity = 4096;
         Self {
@@ -194,7 +194,7 @@ impl DynamicMesh {
         }
     }
 
-    fn buffer(gpu: &Gpu, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    fn buffer(gpu: &GpuContext, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
@@ -203,7 +203,7 @@ impl DynamicMesh {
         })
     }
 
-    pub fn update(&mut self, gpu: &Gpu, vertices: &[Vertex], indices: &[u16]) {
+    pub fn update(&mut self, gpu: &GpuContext, vertices: &[Vertex], indices: &[u16]) {
         self.mesh.index_count = indices.len() as u32;
         if indices.is_empty() {
             return;
@@ -296,6 +296,14 @@ struct ObjectUniform {
     params: [f32; 4],
 }
 
+/// The device and queue: all that building meshes needs. Cheap to clone, so
+/// the world can load on another thread while the window keeps drawing.
+#[derive(Clone)]
+pub struct GpuContext {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
 pub struct Gpu {
     pub window: Arc<Window>,
     /// Triangles submitted in the last frame (reported by screenshot runs).
@@ -305,8 +313,7 @@ pub struct Gpu {
     /// GPU timing when profiling.
     pub timer: Option<GpuTimer>,
     surface: wgpu::Surface<'static>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    context: GpuContext,
     config: wgpu::SurfaceConfiguration,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -330,7 +337,20 @@ pub struct Gpu {
     pub capture_path: Option<PathBuf>,
 }
 
+impl std::ops::Deref for Gpu {
+    type Target = GpuContext;
+
+    fn deref(&self) -> &GpuContext {
+        &self.context
+    }
+}
+
 impl Gpu {
+    /// A handle for building meshes on another thread.
+    pub fn context(&self) -> GpuContext {
+        self.context.clone()
+    }
+
     pub async fn new(window: Arc<Window>, display: winit::event_loop::OwnedDisplayHandle) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
             Box::new(display),
@@ -488,8 +508,7 @@ impl Gpu {
         Self {
             window,
             surface,
-            device,
-            queue,
+            context: GpuContext { device, queue },
             config,
             color_view,
             depth_view,
@@ -518,8 +537,8 @@ impl Gpu {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        (self.color_view, self.depth_view) = create_render_targets(&self.device, &self.config);
+        self.surface.configure(&self.context.device, &self.config);
+        (self.color_view, self.depth_view) = create_render_targets(&self.context.device, &self.config);
     }
 
     /// Framebuffer size in pixels.
@@ -531,16 +550,23 @@ impl Gpu {
         self.config.width as f32 / self.config.height as f32
     }
 
+    /// Bring the surface in line with the window's actual size. A Resized
+    /// event may not have arrived yet, so the cached config can be stale.
+    fn reconfigure(&mut self, force: bool) {
+        let size = self.window.inner_size();
+        if force || (size.width, size.height) != (self.config.width, self.config.height) {
+            self.resize(size.width, size.height);
+        }
+    }
+
     /// Render one frame: sky, then `draws` in order.
     pub fn render(&mut self, globals: &Globals, draws: &[Draw]) {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.surface.configure(&self.device, &self.config);
-                frame
-            }
+        let (frame, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            // Still presentable: draw it, then reconfigure once it's out
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                self.reconfigure(true);
                 return;
             }
             _ => return,
@@ -548,11 +574,11 @@ impl Gpu {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Upload per-frame and per-object uniforms
-        self.queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(globals));
+        self.context.queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(globals));
         if draws.len() as u64 > self.object_capacity {
             self.object_capacity = (draws.len() as u64).next_power_of_two();
             (self.object_buffer, self.object_bind_group) =
-                create_object_buffer(&self.device, &self.object_layout, self.object_stride, self.object_capacity);
+                create_object_buffer(&self.context.device, &self.object_layout, self.object_stride, self.object_capacity);
         }
         let mut objects = vec![0u8; draws.len() * self.object_stride as usize];
         for (i, draw) in draws.iter().enumerate() {
@@ -562,10 +588,10 @@ impl Gpu {
             objects[offset..offset + size].copy_from_slice(bytemuck::bytes_of(&object));
         }
         if !objects.is_empty() {
-            self.queue.write_buffer(&self.object_buffer, 0, &objects);
+            self.context.queue.write_buffer(&self.object_buffer, 0, &objects);
         }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let mut encoder = self.context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
@@ -639,26 +665,31 @@ impl Gpu {
             }
         }
         let capture = self.capture_path.take().map(|path| (path, self.encode_capture(&mut encoder, &frame.texture)));
-        self.queue.submit([encoder.finish()]);
+        self.context.queue.submit([encoder.finish()]);
         if let Some((path, (buffer, padded_row))) = capture {
             self.save_capture(&path, &buffer, padded_row);
         }
         if let Some(t) = &mut self.timer {
-            t.after_submit(&self.device);
+            t.after_submit(&self.context.device);
         }
         // Tells winit to pace redraws by the compositor's frame callbacks
         // (Wayland), which would cap the frame rate; only wanted with vsync
         if self.config.present_mode == wgpu::PresentMode::Fifo {
             self.window.pre_present_notify();
         }
-        self.queue.present(frame);
+        self.context.queue.present(frame);
+        // Only on a size change: reconfiguring at the same size wouldn't clear
+        // it and would rebuild the swapchain every frame
+        if suboptimal {
+            self.reconfigure(false);
+        }
     }
 }
 
 impl Gpu {
     fn encode_capture(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> (wgpu::Buffer, u32) {
         let padded_row = (self.config.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = self.context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("capture"),
             size: padded_row as u64 * self.config.height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -681,7 +712,7 @@ impl Gpu {
 
     fn save_capture(&self, path: &std::path::Path, buffer: &wgpu::Buffer, padded_row: u32) {
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        if self.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        if self.context.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
             eprintln!("capture: GPU poll failed");
             return;
         }

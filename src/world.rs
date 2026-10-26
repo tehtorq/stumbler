@@ -7,7 +7,7 @@ use glam::{Vec2, Vec3};
 
 use crate::boosts::{self, BoostPad};
 use crate::geometry::Vertex;
-use crate::gpu::{Gpu, Mesh};
+use crate::gpu::{GpuContext, Mesh};
 use crate::road::{self, PathKind, RoadNetwork, ROAD_HALF_WIDTH, KERB_WIDTH};
 use crate::terrain::{self, terrain_height};
 use crate::{farms, landmarks, layout, railway, roadside, stages, trails};
@@ -62,7 +62,7 @@ pub struct World {
 }
 
 impl World {
-    pub fn build(gpu: &Gpu) -> Self {
+    pub fn build(gpu: &GpuContext) -> Self {
         // The road network must exist before anything samples terrain_height
         let t0 = std::time::Instant::now();
         let layout = layout::build(terrain::TERRAIN_HALF_SIZE);

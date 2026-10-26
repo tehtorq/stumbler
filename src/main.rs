@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use glam::{Vec2, Vec3, vec3};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{KeyEvent, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -29,6 +30,7 @@ mod landmarks;
 mod layout;
 mod noise;
 mod lights;
+mod loading;
 mod particles;
 mod physics;
 mod progress;
@@ -289,10 +291,27 @@ fn trail_start(landmark: &str) -> Option<(Vec2, f32)> {
     Some((trail.points[i], (-dir.x).atan2(-dir.y)))
 }
 
+/// The slow part of starting up, built on a loading thread while the window
+/// shows the loading screen.
+struct Loaded {
+    started: Instant,
+    world: World,
+    ai_tracks: Vec<AiTrack>,
+    cars: Vec<AiCar>,
+    traffic_count: usize,
+    start_circuit: usize,
+    train: Option<railway::Train>,
+    pos: Vec2,
+    player: CarPhysics,
+    camera: ChaseCamera,
+    chunks: ChunkManager,
+}
+
 impl Stage {
-    fn new(gpu: gpu::Gpu) -> Stage {
+    /// `status` says what's under way, for the loading screen.
+    fn load(gpu: &gpu::GpuContext, status: &Mutex<&'static str>) -> Loaded {
         let t0 = Instant::now();
-        let world = World::build(&gpu);
+        let world = World::build(gpu);
 
         let mut stage_roads = road::network().into_iter().flat_map(|n| n.paths.iter()).filter(|p| p.kind == road::PathKind::Gravel);
         let mut ai_tracks: Vec<AiTrack> = world.circuits.iter()
@@ -348,9 +367,15 @@ impl Stage {
                 true => track.pose(world.circuits[start_circuit].start_idx - 12, -6.0),
                 false => track.pose(track.len() - 12, -10.0),
             });
-        let mut player = CarPhysics::new(Vec3::new(pos.x, 0.0, pos.y), yaw);
+        let player = CarPhysics::new(Vec3::new(pos.x, 0.0, pos.y), yaw);
         let camera = ChaseCamera::new(&player);
-        let chunks = ChunkManager::new(&gpu, pos);
+        *status.lock().unwrap() = "GROWING THE COUNTRYSIDE";
+        let chunks = ChunkManager::new(gpu, pos);
+        Loaded { started: t0, world, ai_tracks, cars, traffic_count, start_circuit, train, pos, player, camera, chunks }
+    }
+
+    fn new(gpu: gpu::Gpu, loaded: Loaded) -> Stage {
+        let Loaded { started: t0, world, ai_tracks, cars, traffic_count, start_circuit, train, pos, mut player, camera, chunks } = loaded;
 
         let demo_driver = std::env::var_os("STUMBLER_DEMO").map(|_| {
             let mut d = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
@@ -1297,12 +1322,46 @@ impl Stage {
 
 #[derive(Default)]
 struct App {
+    loading: Option<Loading>,
     stage: Option<Stage>,
+}
+
+/// The window while `Stage::load` runs on its own thread.
+struct Loading {
+    gpu: gpu::Gpu,
+    screen: loading::LoadingScreen,
+    status: Arc<Mutex<&'static str>>,
+    thread: JoinHandle<Loaded>,
+    next_frame: Instant,
+}
+
+impl App {
+    /// Loading-screen events; once the world is ready, swaps in the stage.
+    fn loading_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        let Some(loading) = self.loading.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => loading.gpu.resize(size.width, size.height),
+            WindowEvent::RedrawRequested if !loading.thread.is_finished() => {
+                // About 60 frames a second leaves the CPU to the loading
+                loading.next_frame = Instant::now() + std::time::Duration::from_millis(16);
+                let status = *loading.status.lock().unwrap();
+                loading.screen.draw(&mut loading.gpu, status);
+            }
+            WindowEvent::RedrawRequested => {
+                let Loading { gpu, thread, .. } = self.loading.take().expect("loading");
+                let loaded = thread.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                self.stage = Some(Stage::new(gpu, loaded));
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.stage.is_some() {
+        if self.stage.is_some() || self.loading.is_some() {
             return;
         }
         let attributes = Window::default_attributes()
@@ -1310,10 +1369,24 @@ impl ApplicationHandler for App {
             .with_inner_size(LogicalSize::new(1280, 720));
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         let gpu = pollster::block_on(gpu::Gpu::new(window, event_loop.owned_display_handle()));
-        self.stage = Some(Stage::new(gpu));
+        // The world takes a while to build: do it on another thread so the
+        // window can show a loading screen and stay responsive meanwhile
+        let status = Arc::new(Mutex::new("LAYING OUT THE WORLD"));
+        let thread = {
+            let (context, status) = (gpu.context(), Arc::clone(&status));
+            std::thread::Builder::new()
+                .name("loading".into())
+                .spawn(move || Stage::load(&context, &status))
+                .expect("spawn loading thread")
+        };
+        let screen = loading::LoadingScreen::new(&gpu);
+        self.loading = Some(Loading { gpu, screen, status, thread, next_frame: Instant::now() });
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if self.loading.is_some() {
+            return self.loading_event(event_loop, event);
+        }
         let Some(stage) = self.stage.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -1370,7 +1443,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(loading) = &self.loading {
+            if Instant::now() >= loading.next_frame {
+                loading.gpu.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(loading.next_frame));
+        }
         if let Some(stage) = &self.stage {
             stage.gpu.window.request_redraw();
         }

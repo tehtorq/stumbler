@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::geometry::Vertex;
-use crate::gpu::{Gpu, Mesh};
+use crate::gpu::{GpuContext, Mesh};
 use crate::terrain::{self, TERRAIN_HALF_SIZE, WATER_LEVEL};
 use crate::collisions::Solid;
 use crate::{cover, props, road, trees};
@@ -259,7 +259,7 @@ pub struct ChunkManager {
 impl ChunkManager {
     /// Spawn workers and build the coarsest terrain for the whole map, plus
     /// full detail around `start`, before returning.
-    pub fn new(gpu: &Gpu, start: Vec2) -> Self {
+    pub fn new(gpu: &GpuContext, start: Vec2) -> Self {
         let jobs: Arc<Mutex<Vec<Job>>> = Arc::new(Mutex::new(Vec::new()));
         let (result_tx, results) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel::<()>();
@@ -330,7 +330,7 @@ impl ChunkManager {
         }
     }
 
-    fn accept(&mut self, gpu: &Gpu, result: JobResult) {
+    fn accept(&mut self, gpu: &GpuContext, result: JobResult) {
         match result {
             JobResult::Terrain(c, lod, chunk) => {
                 self.in_flight.remove(&Job::Terrain(c, lod));
@@ -390,7 +390,7 @@ impl ChunkManager {
     }
 
     /// Queue what's needed near the camera, upload finished meshes, drop far ones.
-    pub fn update(&mut self, gpu: &Gpu, camera: Vec3) {
+    pub fn update(&mut self, gpu: &GpuContext, camera: Vec3) {
         let p = Vec2::new(camera.x, camera.z);
 
         // Workers pop from the end, so queue nearest last
