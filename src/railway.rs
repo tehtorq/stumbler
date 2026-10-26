@@ -17,6 +17,7 @@ use glam::{Mat4, Quat, Vec2, Vec3, vec3};
 
 use crate::collisions::Solid;
 use crate::geometry::Vertex;
+use crate::layout::GRID_SPACING;
 use crate::props::Builder;
 use crate::road::{self, corner_radius, resample, PathKind, RoadNetwork, RoadPath, Structure, RAIL_HALF_WIDTH, ROAD_HALF_WIDTH};
 use crate::terrain::{self, WATER_LEVEL};
@@ -24,13 +25,13 @@ use crate::track::Track;
 
 /// Routing grid spacing.
 const CELL: f32 = 50.0;
-/// Lines keep inside this half-size.
-const EDGE: f32 = 9150.0;
 /// Where the loop runs, as a half-size: just outside the outermost circuits.
-const LOOP: f32 = 8850.0;
+const LOOP: f32 = GRID_SPACING * 2.0 + 1850.0;
+/// Lines keep inside this half-size.
+const EDGE: f32 = LOOP + 300.0;
 /// The line through the middle runs north–south along this x, in the gap
 /// between two columns of circuits.
-const THROUGH_X: f32 = 1890.0;
+const THROUGH_X: f32 = GRID_SPACING * 0.54;
 /// Lines stay this far from circuit centrelines.
 const CIRCUIT_CLEARANCE: f32 = 220.0;
 /// Tightest curve on the railway.

@@ -7,8 +7,8 @@ use crate::gpu::{self, Draw, PipelineKind};
 use crate::hud::{self, Align, HudBuilder, MapView};
 use crate::physics::{CarPhysics, Ground, WorldGround};
 use crate::race::{self, Phase};
-use crate::terrain::{solid_height, TERRAIN_HALF_SIZE};
-use crate::{birds, collectibles, landmarks, lights, railway, spectators, Stage, KMH_PER_UNIT};
+use crate::terrain::solid_height;
+use crate::{birds, collectibles, landmarks, lights, railway, spectators, waterways, Stage, KMH_PER_UNIT};
 
 /// Cars beyond this aren't drawn.
 const CAR_DRAW_DISTANCE: f32 = 900.0;
@@ -22,6 +22,9 @@ const CROSSING_DRAW_DISTANCE: f32 = 1500.0;
 const RAIL_COLOR: [f32; 4] = [0.6, 0.56, 0.66, 0.9];
 /// The train on the maps.
 const TRAIN_COLOR: [f32; 4] = [0.95, 0.75, 0.55, 1.0];
+/// Rivers and canyons on the maps (and the wild places count).
+const RIVER_COLOR: [f32; 4] = [0.35, 0.62, 1.0, 0.95];
+const CANYON_COLOR: [f32; 4] = [0.85, 0.45, 0.3, 0.95];
 /// Minimap side length, in HUD pixel units.
 const MINIMAP_SIZE: f32 = 70.0;
 /// World units from the centre to the edge of the minimap.
@@ -152,8 +155,11 @@ impl Stage {
         let (right, up) = self.camera.billboard_axes();
         let (v, i) = self.particles.build_mesh(right, up);
         self.particle_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.guide_geometry(time);
+        self.guide_mesh.update(&self.gpu, &v, &i);
         // Dev aid: STUMBLER_NO_HUD=1 for clean screenshots
-        let hud = if std::env::var_os("STUMBLER_NO_HUD").is_some() { HudBuilder::new() } else { self.build_hud(width, height) };
+        let (back, hud) = if std::env::var_os("STUMBLER_NO_HUD").is_some() { (HudBuilder::new(), HudBuilder::new()) } else { self.build_hud(width, height) };
+        self.map_mesh.update(&self.gpu, &back.verts, &back.idxs);
         self.hud_mesh.update(&self.gpu, &hud.verts, &hud.idxs);
 
         // --- Draw list (order matters for the blended pipelines) ---
@@ -261,20 +267,25 @@ impl Stage {
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.particle_mesh.mesh(), identity) });
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.speed_line_mesh.mesh(), identity) });
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.rain_mesh.mesh(), identity) });
+        draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.guide_mesh.mesh(), identity) });
+        // The maps' picture of the island goes under the rest of the HUD
+        draws.push(Draw::new(PipelineKind::Hud, self.map_mesh.mesh(), identity));
         draws.push(Draw::new(PipelineKind::Hud, self.hud_mesh.mesh(), identity));
 
         self.gpu.render(&globals, &draws);
     }
 
-    fn build_hud(&self, width: f32, height: f32) -> HudBuilder {
+    /// The HUD, and what's drawn beneath it (the maps' picture of the island).
+    fn build_hud(&self, width: f32, height: f32) -> (HudBuilder, HudBuilder) {
         let mut h = HudBuilder::new();
+        let mut back = HudBuilder::new();
         let px = (height / 720.0 * 3.0).max(2.0);
         let margin = px * 6.0;
         let line = HudBuilder::text_height(px) + px * 3.0;
 
         if self.show_map {
-            self.world_map(&mut h, width, height, px);
-            return h;
+            self.world_map(&mut back, &mut h, width, height, px);
+            return (back, h);
         }
 
         match &self.race {
@@ -323,8 +334,25 @@ impl Stage {
             }
         }
 
-        self.minimap(&mut h, height, px);
-        h
+        self.minimap(&mut back, &mut h, height, px);
+        (back, h)
+    }
+
+    /// The panel at the top of the screen: an arrow toward `at`, and `label`.
+    fn top_pointer(&self, h: &mut HudBuilder, width: f32, px: f32, at: Vec2, label: &str, color: [f32; 4]) {
+        let margin = px * 6.0;
+        let line = HudBuilder::text_height(px) + px * 3.0;
+        let to = (at - self.player_xz()).normalize_or_zero();
+        let heading = self.player.heading();
+        let fwd = Vec2::new(heading.x, heading.z);
+        // Screen arrow: up = straight ahead, right = car's right-hand side
+        let right = Vec2::new(-fwd.y, fwd.x) * -1.0;
+        let dir = Vec2::new(to.dot(right), -to.dot(fwd));
+        let cx = width * 0.5;
+        let w = HudBuilder::text_width(label, px) + px * 16.0;
+        h.rect(cx - w * 0.5, margin * 0.5, w, line * 1.6, hud::PANEL);
+        h.arrow(Vec2::new(cx - w * 0.5 + px * 6.0, margin * 0.5 + line * 0.8), dir, px * 3.0, color);
+        h.text(cx + px * 4.0, margin * 0.5 + line * 0.35, px, Align::Center, label, hud::WHITE);
     }
 
     fn race_hud(&self, h: &mut HudBuilder, race: &race::Race, width: f32, height: f32, px: f32) {
@@ -447,6 +475,7 @@ impl Stage {
             (format!("STAGES {}/{}", found_venues(true), venues(true)), hud::WHITE),
             (format!("LANDMARKS {}/{}", seen(&places), places.len()), hud::DIM),
             (format!("SECRETS {}/{}", seen(&secrets), secrets.len()), hud::GOLD),
+            (format!("WILD PLACES {}/{}", self.progress.places.len(), waterways::all().len()), RIVER_COLOR),
             (format!("PAINTS {}/{}", crate::unlocked_paints(found), crate::car::CAR_COLORS.len()), hud::DIM),
             (format!("ORBS {orbs}/{total_orbs}"), hud::YELLOW),
         ];
@@ -475,7 +504,12 @@ impl Stage {
                 .filter(|(_, d)| *d > crate::RACE_PROMPT_DISTANCE)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         });
-        if let Some((c, dist)) = target {
+        // A marker the player set takes over the pointer (bar on a tour)
+        let marker = self.marker.as_ref().filter(|_| tour_next.is_none());
+        if let Some(m) = marker {
+            let label = format!("{} {:.1} KM", m.name, m.pos.distance(p) * 0.5 / 1000.0);
+            self.top_pointer(h, width, px, m.pos, &label, MARKER_COLOR);
+        } else if let Some((c, dist)) = target {
             let to = (c.start() - p).normalize_or_zero();
             let heading = self.player.heading();
             let fwd = Vec2::new(heading.x, heading.z);
@@ -543,19 +577,28 @@ impl Stage {
     }
 
     /// Heading-up minimap in the bottom-left corner.
-    fn minimap(&self, h: &mut HudBuilder, height: f32, px: f32) {
+    fn minimap(&self, back: &mut HudBuilder, h: &mut HudBuilder, height: f32, px: f32) {
         let size = px * MINIMAP_SIZE;
         let margin = px * 6.0;
         let lo = Vec2::new(margin, height - margin - size);
         let hi = lo + Vec2::splat(size);
-        h.rect(lo.x, lo.y, size, size, hud::PANEL);
         let view = MapView {
             centre: lo + Vec2::splat(size * 0.5),
             focus: self.player_xz(),
             scale: size * 0.5 / MINIMAP_RANGE,
             yaw: Some(self.player.yaw()),
         };
+        // The land itself, a little dimmed so the lines on it stand out
+        self.world.map_image.draw(back, &view, lo, hi, 24, 0.7);
+        frame(h, lo, hi, px * 0.5, [0.0, 0.0, 0.0, 0.7]);
         let clip = (lo, hi);
+        for course in waterways::all() {
+            hud::map_polyline(h, &view, course.on_land(), false, clip, px * 1.4, course_color(course.kind));
+        }
+        // Fords: a pale bar across the river where it can be driven through
+        for &(ford, across) in waterways::fords().iter().filter(|f| f.0.distance(view.focus) < MINIMAP_RANGE * 1.5) {
+            hud::map_polyline(h, &view, &[ford - across * 70.0, ford + across * 70.0], false, clip, px * 1.0, [0.85, 0.95, 1.0, 0.95]);
+        }
         for trail in &self.world.trail_outlines {
             hud::map_polyline(h, &view, trail, false, clip, px * 0.5, TRAIL_COLOR);
         }
@@ -597,60 +640,173 @@ impl Stage {
                 dot(h, Vec2::new(c.pos.x, c.pos.z), px * 1.0, hud::RED);
             }
         }
+        // The marker: a pin if it's in view, else an arrow round the edge toward it
+        if let Some(m) = &self.marker {
+            let q = view.project(m.pos);
+            let inner = (lo + px * 3.0, hi - px * 3.0);
+            if q.cmpge(inner.0).all() && q.cmple(inner.1).all() {
+                pin(h, q, px, MARKER_COLOR);
+            } else {
+                let d = (q - view.centre).normalize_or_zero();
+                // Out from the middle to the frame
+                let reach = ((size * 0.5 - px * 3.0) / d.x.abs().max(d.y.abs()).max(1e-3)).min(size);
+                h.arrow(view.centre + d * reach, d, px * 2.2, MARKER_COLOR);
+            }
+        }
+        // North, on the rim
+        let north = (view.project(view.focus + Vec2::Y * 100.0) - view.centre).normalize_or_zero();
+        let reach = (size * 0.5 - px * 4.0) / north.x.abs().max(north.y.abs()).max(1e-3);
+        let n = view.centre + north * reach;
+        h.text(n.x, n.y - HudBuilder::text_height(px * 0.8) * 0.5, px * 0.8, Align::Center, "N", hud::WHITE);
         h.arrow(view.centre, Vec2::new(0.0, -1.0), px * 2.5, hud::RED);
     }
 
-    /// Full-screen north-up map of the whole world (M).
-    fn world_map(&self, h: &mut HudBuilder, width: f32, height: f32, px: f32) {
-        h.rect(0.0, 0.0, width, height, [0.04, 0.06, 0.1, 0.88]);
-        let size = height.min(width) * 0.86;
-        let view = MapView {
-            centre: Vec2::new(width * 0.5, height * 0.52),
-            focus: Vec2::ZERO,
-            scale: size / (TERRAIN_HALF_SIZE * 2.0),
-            yaw: None,
-        };
-        let clip = (Vec2::ZERO, Vec2::new(width, height));
+    /// Full-screen north-up map of the whole world (M): the island drawn in
+    /// its own colours, zoomable, with a cursor to set a marker.
+    fn world_map(&self, back: &mut HudBuilder, h: &mut HudBuilder, width: f32, height: f32, px: f32) {
+        let (view, lo, hi) = self.world_map_view(width, height);
+        back.rect(0.0, 0.0, width, height, [0.03, 0.05, 0.09, 0.94]);
+        self.world.map_image.draw(back, &view, lo, hi, 140, 0.85);
+        frame(h, lo, hi, px * 0.6, [0.85, 0.8, 0.65, 0.8]);
+        let clip = (lo, hi);
+        let zoom = self.map.zoom;
+        // Lines thicken a little as the map zooms in
+        let w = |base: f32| px * base * zoom.powf(0.3);
+        hud::map_polyline(h, &view, &self.world.coastline, true, clip, w(0.8), [0.9, 0.85, 0.6, 0.9]);
+        for course in waterways::all() {
+            let known = self.progress.places.contains(course.name);
+            let color = course_color(course.kind);
+            hud::map_polyline(h, &view, course.on_land(), false, clip, w(0.9), if known { color } else { [color[0], color[1], color[2], 0.45] });
+        }
+        if zoom >= 2.5 {
+            for &(ford, across) in waterways::fords() {
+                hud::map_polyline(h, &view, &[ford - across * 70.0, ford + across * 70.0], false, clip, w(0.7), [0.85, 0.95, 1.0, 0.95]);
+            }
+        }
         for trail in &self.world.trail_outlines {
-            hud::map_polyline(h, &view, trail, false, clip, px * 0.4, TRAIL_COLOR);
+            hud::map_polyline(h, &view, trail, false, clip, w(0.4), TRAIL_COLOR);
         }
         for road in &self.world.road_outlines {
-            hud::map_polyline(h, &view, road, false, clip, px * 0.7, [0.75, 0.7, 0.55, 0.8]);
+            hud::map_polyline(h, &view, road, false, clip, w(0.7), [0.95, 0.9, 0.75, 0.9]);
         }
         if let Some(rail) = railway::get() {
             for line in &rail.outlines {
-                hud::map_polyline(h, &view, line, false, clip, px * 0.6, RAIL_COLOR);
+                hud::map_polyline(h, &view, line, false, clip, w(0.6), RAIL_COLOR);
             }
             if let Some(train) = &self.train {
                 let poses = train.poses(rail);
                 let q = view.project(Vec2::new(poses[0].centre.x, poses[0].centre.z));
-                h.rect(q.x - px * 1.2, q.y - px * 1.2, px * 2.4, px * 2.4, TRAIN_COLOR);
-                h.text(q.x + px * 2.5, q.y - px * 2.0, px * 0.6, Align::Left, "TRAIN", TRAIN_COLOR);
+                if inside(q, lo, hi) {
+                    h.rect(q.x - px * 1.2, q.y - px * 1.2, px * 2.4, px * 2.4, TRAIN_COLOR);
+                    h.text(q.x + px * 2.5, q.y - px * 2.0, px * 0.6, Align::Left, "TRAIN", TRAIN_COLOR);
+                }
             }
         }
+        let label_px = px * 0.65 * zoom.powf(0.15);
         for c in &self.world.circuits {
             let known = self.progress.circuits.contains(c.name);
-            let color = if known { hud::WHITE } else { [0.45, 0.45, 0.5, 0.9] };
-            hud::map_polyline(h, &view, &c.outline, !c.stage, clip, px * 0.8, if c.stage { stage_color(color) } else { color });
+            let color = if known { hud::WHITE } else { [0.6, 0.6, 0.65, 0.9] };
+            hud::map_polyline(h, &view, &c.outline, !c.stage, clip, w(0.8), if c.stage { stage_color(color) } else { color });
             let label = view.project(if c.stage { c.start() } else { c.centre });
+            if !inside(label, lo, hi) {
+                continue;
+            }
             if known {
                 let raced = self.progress.best_finish.get(c.name);
                 let text_color = if raced == Some(&1) { hud::YELLOW } else { hud::WHITE };
-                h.text(label.x, label.y - px * 3.5, px * 0.8, Align::Center, c.name, text_color);
+                h.text(label.x, label.y - px * 3.5, label_px, Align::Center, c.name, text_color);
             } else {
-                h.text(label.x, label.y - px * 3.5, px * 0.8, Align::Center, "?", [0.6, 0.6, 0.65, 1.0]);
+                h.text(label.x, label.y - px * 3.5, label_px, Align::Center, "?", [0.75, 0.75, 0.8, 1.0]);
+            }
+        }
+        // Names of rivers and canyons found, and (zoomed in) landmarks found
+        for course in waterways::all().iter().filter(|c| self.progress.places.contains(c.name)) {
+            let land = course.on_land();
+            let mid = view.project(land[land.len() / 2]);
+            if inside(mid, lo, hi) {
+                h.text(mid.x, mid.y + px * 2.0, label_px, Align::Center, course.name, course_color(course.kind));
             }
         }
         for l in landmarks::all().iter().filter(|l| self.progress.landmarks.contains(&l.name)) {
             let q = view.project(l.pos);
-            let (mark, label) = if l.kind.is_secret() { (hud::GOLD, hud::GOLD) } else { ([0.4, 0.9, 1.0, 1.0], [0.6, 0.9, 1.0, 1.0]) };
+            if !inside(q, lo, hi) {
+                continue;
+            }
+            let (mark, label) = if l.kind.is_secret() { (hud::GOLD, hud::GOLD) } else { ([0.4, 0.9, 1.0, 1.0], [0.7, 0.93, 1.0, 1.0]) };
             h.rect(q.x - px, q.y - px, px * 2.0, px * 2.0, mark);
-            h.text(q.x + px * 2.0, q.y - px * 2.0, px * 0.6, Align::Left, &l.name, label);
+            if zoom >= 2.0 {
+                h.text(q.x + px * 2.0, q.y - px * 2.0, label_px * 0.9, Align::Left, &l.name, label);
+            }
+        }
+        // The marker, the car, and the cursor
+        if let Some(m) = &self.marker {
+            let q = view.project(m.pos);
+            if inside(q, lo, hi) {
+                pin(h, q, px * 1.3, MARKER_COLOR);
+            }
         }
         let me = view.project(self.player_xz());
-        h.arrow(me, view.direction(self.player.yaw()), px * 3.0, hud::RED);
-        h.text(width * 0.5, px * 4.0, px * 1.5, Align::Center, "WORLD MAP", hud::WHITE);
-        h.text(width * 0.5, height - px * 10.0, px, Align::Center, "M CLOSE  YELLOW: WINS  ORANGE: GRAVEL STAGES  BLUE: LANDMARKS  GOLD: SECRETS  GREY: RAILWAY", hud::DIM);
+        if inside(me, lo, hi) {
+            h.arrow(me, view.direction(self.player.yaw()), px * 3.0, hud::RED);
+        }
+        let cursor = view.project(self.map.cursor);
+        for (a, b) in [(Vec2::new(-1.0, 0.0), Vec2::new(-0.35, 0.0)), (Vec2::new(0.35, 0.0), Vec2::new(1.0, 0.0)),
+                       (Vec2::new(0.0, -1.0), Vec2::new(0.0, -0.35)), (Vec2::new(0.0, 0.35), Vec2::new(0.0, 1.0))] {
+            h.line(cursor + a * px * 5.0, cursor + b * px * 5.0, px * 0.6, hud::WHITE);
+        }
+
+        // Title, what's under the cursor, a scale bar, and how to work it
+        h.text(width * 0.5, px * 3.0, px * 1.5, Align::Center, "WORLD MAP", hud::WHITE);
+        let away = self.map.cursor.distance(self.player_xz()) * 0.5 / 1000.0;
+        let readout = match &self.marker {
+            Some(m) => format!("CURSOR {away:.1} KM AWAY    {}: {:.1} KM", m.name, m.pos.distance(self.player_xz()) * 0.5 / 1000.0),
+            None => format!("CURSOR {away:.1} KM AWAY"),
+        };
+        h.text(width * 0.5, lo.y - px * 7.0, px * 0.9, Align::Center, &readout, hud::DIM);
+        let km = [0.5, 1.0, 2.0, 5.0, 10.0].into_iter().find(|&km| km * 2000.0 * view.scale > px * 20.0).unwrap_or(10.0);
+        let bar = km * 2000.0 * view.scale;
+        let (bx, by) = (hi.x - px * 4.0 - bar, hi.y - px * 5.0);
+        h.rect(bx - px * 2.0, by - px * 6.0, bar + px * 4.0, px * 9.0, hud::PANEL);
+        h.rect(bx, by, bar, px * 0.8, hud::WHITE);
+        h.text(bx + bar * 0.5, by - px * 5.0, px * 0.7, Align::Center, &format!("{km} KM"), hud::WHITE);
+        let help = [
+            "CLICK OR ENTER: SET MARKER   RIGHT CLICK OR BACKSPACE: CLEAR   N: NEAREST UNFOUND",
+            "ARROWS: MOVE   WHEEL OR +/-: ZOOM   H: BACK TO THE CAR   M: CLOSE",
+        ];
+        for (k, text) in help.iter().enumerate() {
+            let tpx = px * ((width * 0.94) / HudBuilder::text_width(text, px)).min(0.9);
+            h.text(width * 0.5, hi.y + px * (4.0 + 7.0 * k as f32), tpx, Align::Center, text, hud::DIM);
+        }
+    }
+}
+
+/// The marker, on the maps and the HUD.
+const MARKER_COLOR: [f32; 4] = [1.0, 0.45, 0.85, 1.0];
+
+fn inside(p: Vec2, lo: Vec2, hi: Vec2) -> bool {
+    p.cmpge(lo).all() && p.cmple(hi).all()
+}
+
+/// A border `width` thick round `lo`..`hi`.
+fn frame(h: &mut HudBuilder, lo: Vec2, hi: Vec2, width: f32, color: [f32; 4]) {
+    let size = hi - lo;
+    h.rect(lo.x - width, lo.y - width, size.x + width * 2.0, width, color);
+    h.rect(lo.x - width, hi.y, size.x + width * 2.0, width, color);
+    h.rect(lo.x - width, lo.y, width, size.y, color);
+    h.rect(hi.x, lo.y, width, size.y, color);
+}
+
+/// A map pin with its point at `at`.
+fn pin(h: &mut HudBuilder, at: Vec2, px: f32, color: [f32; 4]) {
+    h.arrow(at - Vec2::Y * px * 1.6, Vec2::Y, px * 1.8, color);
+    h.rect(at.x - px * 1.5, at.y - px * 5.5, px * 3.0, px * 3.0, color);
+    h.rect(at.x - px * 0.6, at.y - px * 4.6, px * 1.2, px * 1.2, [1.0, 1.0, 1.0, 1.0]);
+}
+
+fn course_color(kind: waterways::Kind) -> [f32; 4] {
+    match kind {
+        waterways::Kind::River => RIVER_COLOR,
+        waterways::Kind::Canyon => CANYON_COLOR,
     }
 }
 

@@ -1,7 +1,19 @@
 use crate::geometry::Vertex;
 use crate::road;
 
-pub const TERRAIN_HALF_SIZE: f32 = 9500.0;
+/// How far the world's layout is spread out: the circuit grid, the biomes and
+/// the big landforms sit this many times further from the centre than they
+/// were first drawn (the coordinates below are in that original layout and
+/// scaled by `at`). Circuits, roads and the features themselves keep their size.
+pub const WORLD_SCALE: f32 = 4.0;
+pub const TERRAIN_HALF_SIZE: f32 = 9500.0 * WORLD_SCALE;
+/// The volcano's peak, in the far east.
+pub const VOLCANO: (f32, f32) = (6500.0 * WORLD_SCALE, 0.0);
+
+/// A position in the original layout, spread out to the world's scale.
+const fn at(v: f32) -> f32 {
+    v * WORLD_SCALE
+}
 pub const WATER_LEVEL: f32 = -20.0;
 
 // ── Helpers ──
@@ -55,6 +67,17 @@ fn plateau(x: f32, z: f32, cx: f32, cz: f32, r: f32, h: f32) -> f32 {
     h * edge * edge
 }
 
+/// A plateau with one long, gentle slope up to its top on the side facing
+/// (dx, dz), so it can be driven up.
+fn mesa(x: f32, z: f32, cx: f32, cz: f32, dx: f32, dz: f32, r: f32, h: f32) -> f32 {
+    let (ox, oz) = (x - cx, z - cz);
+    let along = ox * dx + oz * dz;
+    let across = ox * dz - oz * dx;
+    // Distances out on the ramp side count for a fifth, stretching that slope
+    let along = if along > 0.0 { along / 5.0 } else { along };
+    plateau(along * dx + across * dz + cx, along * dz - across * dx + cz, cx, cz, r, h)
+}
+
 /// Directional ramp: steep on one side, gentle on other.
 /// Center (cx,cz), direction (dx,dz) is the launch direction, width `w`, height `h`.
 fn ramp(x: f32, z: f32, cx: f32, cz: f32, dx: f32, dz: f32, w: f32, h: f32) -> f32 {
@@ -78,34 +101,34 @@ fn ramp(x: f32, z: f32, cx: f32, cz: f32, dx: f32, dz: f32, w: f32, h: f32) -> f
 
 pub fn biome_desert(x: f32, z: f32) -> f32 {
     // Southwest region — large arid zone
-    let cx = -5500.0;
-    let cz = -5500.0;
+    let cx = at(-5500.0);
+    let cz = at(-5500.0);
     let dist = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
-    (1.0 - dist / 4500.0).max(0.0).min(1.0)
+    (1.0 - dist / at(4500.0)).max(0.0).min(1.0)
 }
 
 pub fn biome_mountain(x: f32, z: f32) -> f32 {
     // Northern mountain range — wide band
-    let strength = ((z - 3500.0) / 3000.0).max(0.0).min(1.0);
-    let east_bias = ((x + 1000.0) / 8000.0).max(0.0).min(1.0);
+    let strength = ((z - at(3500.0)) / at(3000.0)).max(0.0).min(1.0);
+    let east_bias = ((x + at(1000.0)) / at(8000.0)).max(0.0).min(1.0);
     strength * (0.4 + 0.6 * east_bias)
 }
 
 pub fn biome_forest(x: f32, z: f32) -> f32 {
     // Northwest deep forest
-    let cx = -5000.0;
-    let cz = 4500.0;
+    let cx = at(-5000.0);
+    let cz = at(4500.0);
     let d1 = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
-    let f1 = (1.0 - d1 / 4000.0).max(0.0).min(1.0);
+    let f1 = (1.0 - d1 / at(4000.0)).max(0.0).min(1.0);
     // Secondary forest patch (west)
-    let d2 = ((x + 7000.0) * (x + 7000.0) + z * z).sqrt();
-    let f2 = (1.0 - d2 / 2500.0).max(0.0).min(1.0);
+    let d2 = ((x + at(7000.0)) * (x + at(7000.0)) + z * z).sqrt();
+    let f2 = (1.0 - d2 / at(2500.0)).max(0.0).min(1.0);
     (f1 + f2).min(1.0)
 }
 
 pub fn biome_tundra(_x: f32, z: f32) -> f32 {
     // Far north — frozen plains
-    let strength = ((z - 6500.0) / 2000.0).max(0.0).min(1.0);
+    let strength = ((z - at(6500.0)) / at(2000.0)).max(0.0).min(1.0);
     strength
 }
 
@@ -173,6 +196,12 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
 }
 
 fn terrain_height_raw(x: f32, z: f32) -> f32 {
+    crate::waterways::carve(x, z, uncarved_height(x, z))
+}
+
+/// The land before rivers and canyons are cut into it (they're laid out
+/// over this).
+pub fn uncarved_height(x: f32, z: f32) -> f32 {
     let desert = biome_desert(x, z);
     let tundra = biome_tundra(x, z);
     let base_amp = 1.0 - 0.6 * desert - 0.3 * tundra;
@@ -202,60 +231,60 @@ fn terrain_height_raw(x: f32, z: f32) -> f32 {
     let mountain_height = mtn * 90.0 * (1.0 + 0.5 * (x * 0.003).sin() * (z * 0.004 + 1.0).sin());
     let peaks = mtn * 35.0 * ((x * 0.008).sin() * (z * 0.011).sin()).max(0.0);
     let mtn_ridges = mtn * 15.0 * ((x * 0.02 + z * 0.01).sin()).abs();
-    let cliff_n = mtn * ridge(x, z, -3000.0, 5500.0, 5000.0, 5000.0, 150.0, 45.0);
-    let cliff_n2 = mtn * ridge(x, z, 1000.0, 6500.0, 6000.0, 6000.0, 120.0, 35.0);
+    let cliff_n = mtn * ridge(x, z, at(-3000.0), at(5500.0), at(5000.0), at(5000.0), 150.0, 45.0);
+    let cliff_n2 = mtn * ridge(x, z, at(1000.0), at(6500.0), at(6000.0), at(6000.0), 120.0, 35.0);
 
     // ── Desert features (southwest) ──
     let desert_floor = -20.0 * desert;
-    let mesa1 = plateau(x, z, -6000.0, -6000.0, 500.0, 45.0) * desert;
-    let mesa2 = plateau(x, z, -4500.0, -7000.0, 350.0, 35.0) * desert;
-    let mesa3 = plateau(x, z, -7000.0, -4500.0, 400.0, 40.0) * desert;
-    let canyon = ridge(x, z, -7500.0, -4000.0, -4000.0, -7500.0, 80.0, -30.0) * desert;
+    let mesa1 = plateau(x, z, at(-6000.0), at(-6000.0), 500.0, 45.0) * desert;
+    let mesa2 = plateau(x, z, at(-4500.0), at(-7000.0), 350.0, 35.0) * desert;
+    let mesa3 = plateau(x, z, at(-7000.0), at(-4500.0), 400.0, 40.0) * desert;
+    let canyon = ridge(x, z, at(-7500.0), at(-4000.0), at(-4000.0), at(-7500.0), 80.0, -30.0) * desert;
     let dunes = desert * 8.0 * (x * 0.015 + z * 0.005).sin() * (x * 0.003 - z * 0.012).sin();
     let washboard = desert * 3.0 * (x * 0.05 + z * 0.03).sin();
-    let desert_ridge1 = desert * ridge(x, z, -7000.0, -6000.0, -5000.0, -4000.0, 100.0, 25.0);
-    let desert_ridge2 = desert * ridge(x, z, -6500.0, -3500.0, -4500.0, -5500.0, 80.0, 20.0);
+    let desert_ridge1 = desert * ridge(x, z, at(-7000.0), at(-6000.0), at(-5000.0), at(-4000.0), 100.0, 25.0);
+    let desert_ridge2 = desert * ridge(x, z, at(-6500.0), at(-3500.0), at(-4500.0), at(-5500.0), 80.0, 20.0);
 
     // ── Forest (northwest) — dense rolling hills with gullies ──
     let forest_hills = forest * 20.0 * (x * 0.006 + 0.5).sin() * (z * 0.008 + 0.3).sin();
-    let gully1 = forest * ridge(x, z, -6000.0, 3000.0, -4000.0, 5000.0, 50.0, -12.0);
-    let gully2 = forest * ridge(x, z, -5500.0, 4500.0, -3500.0, 3500.0, 40.0, -10.0);
+    let gully1 = forest * ridge(x, z, at(-6000.0), at(3000.0), at(-4000.0), at(5000.0), 50.0, -12.0);
+    let gully2 = forest * ridge(x, z, at(-5500.0), at(4500.0), at(-3500.0), at(3500.0), 40.0, -10.0);
     let forest_bumps = forest * 3.0 * ((x * 0.04).sin() * (z * 0.06).sin()).max(0.0) * 4.0;
 
     // ── Tundra — gentle undulation with frozen ridges ──
     let tundra_roll = tundra * 5.0 * (x * 0.004).sin() * (z * 0.005).sin();
-    let tundra_ridge = tundra * ridge(x, z, -2000.0, 7500.0, 4000.0, 8000.0, 200.0, 20.0);
+    let tundra_ridge = tundra * ridge(x, z, at(-2000.0), at(7500.0), at(4000.0), at(8000.0), 200.0, 20.0);
 
     // ── Grassland ridgelines (center, visible from tracks) ──
     let grass_mask = (1.0 - mtn) * (1.0 - desert);
-    let grass_ridge1 = ridge(x, z, -2000.0, -1000.0, 2000.0, 500.0, 180.0, 25.0) * grass_mask;
-    let grass_ridge2 = ridge(x, z, 500.0, -3000.0, 3000.0, -1500.0, 150.0, 20.0) * grass_mask;
-    let escarpment = ridge(x, z, -1000.0, 1500.0, 4000.0, 2000.0, 100.0, 35.0) * (1.0 - mtn);
+    let grass_ridge1 = ridge(x, z, at(-2000.0), at(-1000.0), at(2000.0), at(500.0), 180.0, 25.0) * grass_mask;
+    let grass_ridge2 = ridge(x, z, at(500.0), at(-3000.0), at(3000.0), at(-1500.0), 150.0, 20.0) * grass_mask;
+    let escarpment = ridge(x, z, at(-1000.0), at(1500.0), at(4000.0), at(2000.0), 100.0, 35.0) * (1.0 - mtn);
 
     // ── Landmarks ──
     // Volcano (far east)
-    let volcano = bump(x, z, 6500.0, 0.0, 600.0, 120.0)
-                + crater(x, z, 6500.0, 0.0, 220.0, 40.0);
+    let volcano = bump(x, z, VOLCANO.0, VOLCANO.1, 600.0, 120.0)
+                + crater(x, z, VOLCANO.0, VOLCANO.1, 220.0, 40.0);
     // Crater lake (between GP and figure-8)
-    let crater_h = crater(x, z, 3500.0, -3000.0, 350.0, 40.0);
+    let crater_h = crater(x, z, at(3500.0), at(-3000.0), 350.0, 40.0);
     // Twin peaks (north center)
-    let twin1 = bump(x, z, -1000.0, 6000.0, 400.0, 100.0);
-    let twin2 = bump(x, z, -500.0, 6300.0, 350.0, 80.0);
-    let valley = ridge(x, z, -1000.0, 6000.0, -500.0, 6300.0, 100.0, -35.0);
+    let twin1 = bump(x, z, at(-1000.0), at(6000.0), 400.0, 100.0);
+    let twin2 = bump(x, z, at(-1000.0) + 500.0, at(6000.0) + 300.0, 350.0, 80.0);
+    let valley = ridge(x, z, at(-1000.0), at(6000.0), at(-1000.0) + 500.0, at(6000.0) + 300.0, 100.0, -35.0);
     // Coastal cliffs (south edge)
-    let cliff_south = ridge(x, z, -7000.0, -8500.0, 7000.0, -8500.0, 300.0, 50.0);
+    let cliff_south = ridge(x, z, at(-7000.0), at(-8500.0), at(7000.0), at(-8500.0), 300.0, 50.0);
     // Lone mountain (far west)
-    let lone_mtn = bump(x, z, -7500.0, 0.0, 500.0, 70.0);
+    let lone_mtn = bump(x, z, at(-7500.0), at(0.0), 500.0, 70.0);
     // Island hill (southeast)
-    let island = bump(x, z, 5000.0, -6000.0, 400.0, 55.0);
+    let island = bump(x, z, at(5000.0), at(-6000.0), 400.0, 55.0);
     // Great ridge (runs east-west through center-south)
-    let great_ridge = ridge(x, z, -4000.0, -3000.0, 4000.0, -2500.0, 250.0, 35.0);
+    let great_ridge = ridge(x, z, at(-4000.0), at(-3000.0), at(4000.0), at(-2500.0), 250.0, 35.0);
     // Frozen lake depression (far north)
-    let frozen_lake = bump(x, z, 2000.0, 7500.0, 500.0, -20.0);
+    let frozen_lake = bump(x, z, at(2000.0), at(7500.0), 500.0, -20.0);
     // Badlands spires (deep desert)
-    let spire1 = bump(x, z, -5800.0, -5200.0, 80.0, 50.0);
-    let spire2 = bump(x, z, -5500.0, -5600.0, 60.0, 40.0);
-    let spire3 = bump(x, z, -6200.0, -5800.0, 70.0, 45.0);
+    let spire1 = bump(x, z, at(-5800.0), at(-5200.0), 80.0, 50.0);
+    let spire2 = bump(x, z, at(-5800.0) + 300.0, at(-5200.0) - 400.0, 60.0, 40.0);
+    let spire3 = bump(x, z, at(-5800.0) - 400.0, at(-5200.0) - 600.0, 70.0, 45.0);
 
     // ── Track ramps (gentle hills on circuits) ──
     let ramps = 0.0
@@ -286,7 +315,7 @@ fn terrain_height_raw(x: f32, z: f32) -> f32 {
     // ── The Alps (far north-east): jagged ridges with snowy peaks on the skyline ──
     let alps = alps_height(x, z);
 
-    base + roughness + alps
+    let land = base + roughness + alps
         + mountain_height + peaks + mtn_ridges + cliff_n + cliff_n2
         + desert_floor + mesa1 + mesa2 + mesa3 + canyon + dunes + washboard
         + desert_ridge1 + desert_ridge2
@@ -297,13 +326,90 @@ fn terrain_height_raw(x: f32, z: f32) -> f32 {
         + cliff_south + lone_mtn + island + great_ridge
         + frozen_lake + spire1 + spire2 + spire3
         + ramps + launch_ramps
+        + scattered(x, z, desert, forest, mtn, tundra);
+    coast(x, z, land)
+}
+
+/// The sea floor out past the coast.
+const SEA_FLOOR: f32 = WATER_LEVEL - 25.0;
+/// The coast runs about this far in from the map's edge, wandering either way.
+pub const COAST: f32 = 2600.0;
+pub const COAST_WANDER: f32 = 1100.0;
+
+/// The world is an island: the land runs down into the sea before the
+/// map's edge, so there's always a shore to drive to and nowhere to fall off.
+fn coast(x: f32, z: f32, land: f32) -> f32 {
+    let out = x.abs().max(z.abs()) + (crate::noise::noise(x, z, 3200.0) - 0.5) * 2.0 * COAST_WANDER;
+    let shore = TERRAIN_HALF_SIZE - COAST;
+    let t = smooth(shore - 900.0, shore + 700.0, out);
+    land + (SEA_FLOOR - land) * t
+}
+
+/// Side of the cells that scattered landforms are dealt out on.
+const SCATTER_CELL: f32 = 1600.0;
+/// Circuit slots: the layout's grid spacing, in the original layout.
+const SLOT_SPACING: f32 = at(3500.0);
+
+/// Landforms dealt out over the whole map, one or none per cell, to suit
+/// the biome: mesas and spires in the desert, hills in the woods and
+/// grassland with the odd ridge or crater lake, hollows in the tundra.
+/// They fill the country between circuits and keep clear of the circuit
+/// slots themselves.
+fn scattered(x: f32, z: f32, desert: f32, forest: f32, mtn: f32, tundra: f32) -> f32 {
+    use crate::noise::hash;
+    // Clear of the circuits: nothing within reach of a grid slot
+    let slot = |v: f32| (v - (v / SLOT_SPACING).round() * SLOT_SPACING).abs();
+    let clear = smooth(2400.0, 3400.0, slot(x).hypot(slot(z)));
+    if clear <= 0.0 || mtn > 0.6 {
+        return 0.0;
+    }
+    let (ci, cj) = ((x / SCATTER_CELL).floor(), (z / SCATTER_CELL).floor());
+    let mut h = 0.0;
+    for dj in -1..=1 {
+        for di in -1..=1 {
+            let (i, j) = (ci + di as f32, cj + dj as f32);
+            let roll = hash(i * 1.7 + 11.0, j * 2.3 - 7.0);
+            if roll > 0.55 {
+                continue;
+            }
+            // Kept well inside the cell, so only its neighbours can reach x, z
+            let cx = (i + 0.25 + 0.5 * hash(i, j + 31.0)) * SCATTER_CELL;
+            let cz = (j + 0.25 + 0.5 * hash(i + 17.0, j)) * SCATTER_CELL;
+            let size = hash(i - 5.0, j + 9.0);
+            let pick = roll / 0.55;
+            h += if desert > 0.3 {
+                if pick < 0.6 {
+                    let a = hash(i + 3.0, j - 11.0) * std::f32::consts::TAU;
+                    mesa(x, z, cx, cz, a.cos(), a.sin(), 250.0 + 250.0 * size, 25.0 + 20.0 * size) * desert
+                } else {
+                    (bump(x, z, cx, cz, 70.0, 45.0) + bump(x, z, cx + 260.0, cz - 340.0, 60.0, 35.0)) * desert
+                }
+            } else if tundra > 0.5 {
+                bump(x, z, cx, cz, 350.0 + 250.0 * size, -18.0) * tundra
+            } else if pick < 0.12 && forest < 0.3 {
+                crater(x, z, cx, cz, 200.0 + 150.0 * size, 30.0 + 10.0 * size)
+            } else if pick < 0.3 {
+                let a = size * std::f32::consts::TAU;
+                let (dx, dz) = (a.cos() * 700.0, a.sin() * 700.0);
+                ridge(x, z, cx - dx, cz - dz, cx + dx, cz + dz, 120.0 + 60.0 * size, 18.0 + 14.0 * size)
+            } else {
+                bump(x, z, cx, cz, 300.0 + 400.0 * size, 12.0 + 25.0 * size * (1.0 - 0.5 * forest))
+            };
+        }
+    }
+    h * clear * (1.0 - mtn)
+}
+
+/// How far into the north-eastern alps (x, z) is, 0..1.
+pub fn alpine(x: f32, z: f32) -> f32 {
+    smooth(at(2800.0), at(5200.0), x) * smooth(at(5000.0), at(7000.0), z)
 }
 
 /// Extra height of the north-eastern range: crests along the ridgelines of
 /// two scales of noise, rising out of the foothills.
 fn alps_height(x: f32, z: f32) -> f32 {
     use crate::noise::noise;
-    let mask = smooth(2800.0, 5200.0, x) * smooth(5000.0, 7000.0, z);
+    let mask = alpine(x, z);
     if mask <= 0.0 {
         return 0.0;
     }
@@ -379,7 +485,7 @@ pub fn terrain_color(x: f32, z: f32, y: f32) -> [f32; 4] {
     let sand = mix3(SAND_DARK, SAND, smooth(0.3, 0.7, ripple));
 
     // Mountains: grass giving way to rock, then snow above a ragged snowline
-    let snowline = 150.0 + 40.0 * patchy(x, z, 900.0);
+    let snowline = snowline(x, z);
     let mut peak = mix3(mix3(MEADOW_DRY, FOREST_FLOOR, 0.4), ROCK, smooth(70.0, 130.0, y));
     peak = mix3(peak, SNOW, smooth(snowline - 10.0, snowline + 15.0, y));
 
@@ -394,7 +500,7 @@ pub fn terrain_color(x: f32, z: f32, y: f32) -> [f32; 4] {
     }
 
     // The volcano: dark basalt and ash, scorched red-brown round the crater
-    let to_cone = ((x - 6500.0).powi(2) + z * z).sqrt();
+    let to_cone = ((x - VOLCANO.0).powi(2) + (z - VOLCANO.1).powi(2)).sqrt();
     let volcanic = smooth(650.0, 350.0, to_cone);
     if volcanic > 0.0 {
         let ash = mix3([0.24, 0.22, 0.22], [0.36, 0.33, 0.31], smooth(0.4, 0.7, patchy(x, z, 90.0)));
@@ -442,11 +548,33 @@ fn vertex_hash(x: f32, z: f32) -> f32 {
 }
 
 /// Surface grip multiplier at world position. 1.0 = normal grass, <1 = slippery/sandy.
+/// Where the mountains' ragged snowline runs (a height).
+fn snowline(x: f32, z: f32) -> f32 {
+    150.0 + 40.0 * crate::noise::patchy(x, z, 900.0)
+}
+
+/// How snowy the ground at (x, z) is, 0..1: high mountains above the
+/// snowline, and the tundra. (Judged on the land before rivers are cut in,
+/// which laying them out needs to know.)
+pub fn snow(x: f32, z: f32) -> f32 {
+    let y = uncarved_height(x, z);
+    let mountain = biome_mountain(x, z).max(alpine(x, z));
+    (smooth(snowline(x, z), snowline(x, z) + 25.0, y) * mountain + biome_tundra(x, z) * 0.6).min(1.0)
+}
+
+/// `surface_grip` when the weather leaves grip at `wet` (1 dry, less after
+/// rain). Where it's snowy it falls as snow, and the ground is no worse.
+pub fn wet_grip(x: f32, z: f32, wet: f32) -> f32 {
+    surface_grip(x, z) * (1.0 - (1.0 - wet) * (1.0 - snow(x, z)))
+}
+
 pub fn surface_grip(x: f32, z: f32) -> f32 {
     let desert = biome_desert(x, z);
     let tundra = biome_tundra(x, z);
-    // Desert = sandy/loose (0.6 grip), tundra = icy (0.5 grip), grassland = normal (1.0)
-    1.0 - 0.4 * desert - 0.5 * tundra
+    // Desert = sandy/loose (0.6 grip), tundra = icy (0.5 grip), grassland =
+    // normal (1.0). Up among the alpine crags it's bare rock more than ice
+    let ice = tundra * (1.0 - 0.6 * alpine(x, z));
+    1.0 - 0.4 * desert - 0.5 * ice
 }
 
 pub struct TerrainChunk {
@@ -525,4 +653,28 @@ pub fn generate_terrain_chunk(x0: f32, z0: f32, size: f32, cells: usize) -> Terr
     }
 
     TerrainChunk { verts, idxs, min_y: min_y - drop, max_y }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesas_have_a_drivable_ramp_to_the_top() {
+        // The biggest and tallest the scattered mesas come, any way round
+        let (r, top) = (500.0, 45.0);
+        for k in 0..8 {
+            let a = k as f32 * 0.8;
+            let dir = glam::Vec2::new(a.cos(), a.sin());
+            let h = |d: f32| { let p = dir * d; mesa(p.x, p.y, 0.0, 0.0, dir.x, dir.y, r, top) };
+            assert!(h(r * 0.5) > top - 0.5, "the top isn't flat");
+            let steepest = (0..400).map(|s| s as f32 * 25.0).map(|d| (h(d) - h(d + 10.0)) / 10.0).fold(0.0, f32::max);
+            assert!(steepest < 0.15, "ramp {steepest:.2} steep");
+            // The other sides stay steep
+            let back = |d: f32| { let p = -dir * d; mesa(p.x, p.y, 0.0, 0.0, dir.x, dir.y, r, top) };
+            let wall = (0..50).map(|s| r + s as f32 * 5.0).map(|d| (back(d) - back(d + 5.0)) / 5.0).fold(0.0, f32::max);
+            assert!(wall > 0.3, "no steep side behind ({wall:.2})");
+        }
+    }
 }

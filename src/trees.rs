@@ -361,7 +361,7 @@ pub fn density(x: f32, z: f32, ground: f32) -> f32 {
         + tundra * 0.04
         + desert * if near_water { 0.3 } else { 0.03 };
     // Nothing grows above the treeline or on the volcano's ash
-    let to_volcano = Vec2::new(x - 6500.0, z).length();
+    let to_volcano = Vec2::new(x - terrain::VOLCANO.0, z - terrain::VOLCANO.1).length();
     if ground > treeline + 20.0 || to_volcano < 480.0 {
         density = 0.0;
     }

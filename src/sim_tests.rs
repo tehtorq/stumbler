@@ -28,8 +28,16 @@ fn roads_are_flat_across_and_match_terrain() {
             let t = path.tangent(i);
             let side = Vec2::new(-t.y, t.x);
             let centre = terrain::terrain_height(p.x, p.y);
-            // Running onto a wider path (or crossing another trail): that path owns this spot
+            // Running onto a wider path (or crossing another trail, or itself
+            // at a crossover like Suzuka's): that path owns this spot. So does
+            // the one a trail leaves, under its first few units (on a steep
+            // trail, its own slope runs across the join)
+            let crosses_itself = path.points.iter().enumerate()
+                .any(|(j, q)| i.abs_diff(j) > 40 && q.distance(*p) < hw * 2.0 + 10.0);
+            let joining = path.kind == road::PathKind::Trail && i as f32 * road::SAMPLE_SPACING < hw * 3.0;
             if net.nearest_matching(p.x, p.y, |k| k > path.kind).is_some_and(|s| s.dist < s.half_width() + hw + s.shoulder())
+                || crosses_itself
+                || joining
                 || (centre - path.heights[i]).abs() > 0.01
             {
                 continue;
@@ -1235,4 +1243,245 @@ fn driving_through_the_deep_forest_slows_you_but_doesnt_stop_you() {
     }
     assert!(total_hits >= 5, "the test lines missed the forest ({total_hits} trees)");
     assert!(worst > 0.6, "the trees held a car to {:.0}% of the distance it covers on open ground", worst * 100.0);
+}
+
+#[test]
+fn fords_can_be_driven_across() {
+    let _ = network();
+    let fords = crate::waterways::fords();
+    assert!(fords.len() > 40, "only {} fords", fords.len());
+    // A spread of them, up and down the rivers
+    for &(ford, across) in fords.iter().step_by(fords.len() / 8) {
+        let from = ford - across * 90.0;
+        let mut car = CarPhysics::new(Vec3::ZERO, 0.0);
+        car.place(&WorldGround, from.x, from.y, (-across.x).atan2(-across.y));
+        let mut worst_wet: f32 = 0.0;
+        let mut t = 0.0;
+        let dt = 1.0 / 120.0;
+        while t < 20.0 && (Vec2::new(car.pos.x, car.pos.z) - ford).dot(across) < 90.0 {
+            // Steer back onto the line straight across
+            let off = (Vec2::new(car.pos.x, car.pos.z) - ford).dot(across.perp());
+            let input = CarInput { throttle: 0.6, steer: (off * 0.05).clamp(-0.5, 0.5), ..Default::default() };
+            car.update(&WorldGround, dt, input);
+            worst_wet = worst_wet.max(car.submerged);
+            t += dt;
+        }
+        let reached = (Vec2::new(car.pos.x, car.pos.z) - ford).dot(across);
+        println!("ford at {ford}: across in {t:.1}s, wettest {worst_wet:.2}");
+        assert!(reached >= 90.0, "stuck in the ford at {ford} ({reached:.0} across after {t:.0}s)");
+        assert!(worst_wet < 0.6, "nearly sank crossing the ford at {ford} ({worst_wet:.2})");
+    }
+}
+
+/// What can be driven: on a grid over the island, the land cells a car can
+/// get to from the home circuit and back again.
+struct Reach {
+    step: f32,
+    side: usize,
+    land: Vec<bool>,
+    /// There and back.
+    drivable: Vec<bool>,
+}
+
+/// `wet`: as after rain, when every surface grips less.
+fn reach(step: f32, wet: bool) -> Reach {
+    use std::collections::VecDeque;
+    let net = network();
+    let half = terrain::TERRAIN_HALF_SIZE;
+    let side = (half * 2.0 / step) as usize;
+    let pos = |i: usize| Vec2::new((i % side) as f32 + 0.5, (i / side) as f32 + 0.5) * step - half;
+    // Height, grip and how much road, cell by cell (a row at a time in parallel)
+    let rows = crate::layout::parallel_map((0..side).collect(), |row| {
+        (0..side).map(|col| {
+            let p = pos(row * side + col);
+            let h = terrain::solid_height(p.x, p.y);
+            let rain = if wet { crate::weather::WET_GRIP } else { 1.0 };
+            (h, terrain::wet_grip(p.x, p.y, rain), road::on_road(p.x, p.y))
+        }).collect::<Vec<_>>()
+    });
+    let cells: Vec<(f32, f32, f32)> = rows.into_iter().flatten().collect();
+    let land: Vec<bool> = cells.iter().map(|c| c.0 > terrain::WATER_LEVEL - 2.0).collect();
+    // Can a car go from a to b (neighbours)? Up only as steep as it
+    // climbs; down no steeper than 1 in 1
+    let can = |a: usize, b: usize| {
+        let ((ha, ga, ra), (hb, gb, rb)) = (cells[a], cells[b]);
+        let grade = (hb - ha) / step;
+        land[a] && land[b] && grade >= -1.0 && grade <= crate::physics::steepest_climb(ga.min(gb), ra.max(rb)) * 0.95
+    };
+    // Paths are narrower than a cell, so the grid can miss them: each also
+    // links the cells it runs through (they're graded to be driven, both ways)
+    let cell_of = |p: Vec2| {
+        let (x, z) = (((p.x + half) / step) as usize, ((p.y + half) / step) as usize);
+        (x < side && z < side).then(|| z * side + x)
+    };
+    let mut along_paths: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    for path in net.paths.iter().filter(|p| p.kind != road::PathKind::Rail) {
+        let cells: Vec<usize> = path.points.iter().filter_map(|&p| cell_of(p)).collect();
+        for w in cells.windows(2).filter(|w| w[0] != w[1]) {
+            along_paths.entry(w[0]).or_default().push(w[1]);
+            along_paths.entry(w[1]).or_default().push(w[0]);
+        }
+    }
+    let neighbours = |i: usize| {
+        let (x, z) = (i % side, i / side);
+        let grid = [(x > 0).then(|| i - 1), (x + 1 < side).then(|| i + 1), (z > 0).then(|| i - side), (z + 1 < side).then(|| i + side)];
+        grid.into_iter().flatten().map(move |j| (j, false))
+            .chain(along_paths.get(&i).into_iter().flatten().map(|&j| (j, true)))
+    };
+    let start = net.paths.iter().find(|p| p.circuit()).unwrap().points[0];
+    let s = ((start.y + half) / step) as usize * side + ((start.x + half) / step) as usize;
+    let flood = |forward: bool| {
+        let mut seen = vec![false; side * side];
+        let mut queue = VecDeque::from([s]);
+        seen[s] = true;
+        while let Some(i) = queue.pop_front() {
+            for (j, path) in neighbours(i) {
+                let ok = path || if forward { can(i, j) } else { can(j, i) };
+                if !seen[j] && ok {
+                    seen[j] = true;
+                    queue.push_back(j);
+                }
+            }
+        }
+        seen
+    };
+    let (there, back) = (flood(true), flood(false));
+    let drivable = there.iter().zip(&back).map(|(a, b)| *a && *b).collect();
+    Reach { step, side, land, drivable }
+}
+
+/// Dev aid: how much of the island can be driven, and the biggest places
+/// that can't, to look at with STUMBLER_AT.
+#[test]
+#[ignore]
+fn reach_report() {
+    let wet = std::env::var_os("STUMBLER_WET").is_some();
+    let r = reach(60.0, wet);
+    let land = r.land.iter().filter(|&&l| l).count();
+    let drivable = r.drivable.iter().filter(|&&d| d).count();
+    println!("drivable: {:.1}% of {:.0} km² of land", drivable as f32 / land as f32 * 100.0, land as f32 * (r.step * 0.5 / 1000.0).powi(2));
+    // Connected patches of land that can't be driven, biggest first
+    let half = terrain::TERRAIN_HALF_SIZE;
+    let mut patch = vec![usize::MAX; r.side * r.side];
+    let mut patches: Vec<(usize, Vec2)> = Vec::new();
+    for i in 0..r.side * r.side {
+        if !r.land[i] || r.drivable[i] || patch[i] != usize::MAX {
+            continue;
+        }
+        let id = patches.len();
+        let (mut count, mut sum) = (0, Vec2::ZERO);
+        let mut stack = vec![i];
+        patch[i] = id;
+        while let Some(k) = stack.pop() {
+            count += 1;
+            sum += Vec2::new((k % r.side) as f32, (k / r.side) as f32) * r.step - half;
+            let (x, z) = (k % r.side, k / r.side);
+            for n in [(x > 0).then(|| k - 1), (x + 1 < r.side).then(|| k + 1), (z > 0).then(|| k - r.side), (z + 1 < r.side).then(|| k + r.side)].into_iter().flatten() {
+                if r.land[n] && !r.drivable[n] && patch[n] == usize::MAX {
+                    patch[n] = id;
+                    stack.push(n);
+                }
+            }
+        }
+        patches.push((count, sum / count as f32));
+    }
+    patches.sort_by(|a, b| b.0.cmp(&a.0));
+    for (count, centre) in patches.iter().take(15) {
+        let p = *centre;
+        println!("  {:6.2} km² round {:.0},{:.0}: height {:.0}, mountain {:.1}, alpine {:.1}, desert {:.1}, tundra {:.1}",
+            *count as f32 * (r.step * 0.5 / 1000.0).powi(2), p.x, p.y, terrain::raw_height(p.x, p.y),
+            terrain::biome_mountain(p.x, p.y), terrain::alpine(p.x, p.y), terrain::biome_desert(p.x, p.y), terrain::biome_tundra(p.x, p.y));
+    }
+}
+
+#[test]
+fn nearly_all_the_island_can_be_driven() {
+    // All but the sheerest alpine crags, there and back from the home
+    // circuit, after rain as much as in the dry
+    for (wet, least) in [(false, 0.97), (true, 0.97)] {
+        let r = reach(60.0, wet);
+        let land = r.land.iter().filter(|&&l| l).count();
+        let drivable = r.drivable.iter().filter(|&&d| d).count() as f32 / land as f32;
+        assert!(drivable > least, "only {:.1}% of the land can be driven (wet: {wet})", drivable * 100.0);
+    }
+}
+
+#[test]
+fn trails_can_be_climbed_even_in_the_wet() {
+    let net = network();
+    let mut steepest: f32 = 0.0;
+    for trail in net.paths.iter().filter(|p| p.kind == road::PathKind::Trail) {
+        for i in 1..trail.points.len() {
+            let p = trail.points[i];
+            let grade = (trail.heights[i] - trail.heights[i - 1]).abs() / road::SAMPLE_SPACING;
+            let grip = terrain::wet_grip(p.x, p.y, crate::weather::WET_GRIP);
+            let limit = crate::physics::steepest_climb(grip, road::on_road(p.x, p.y));
+            steepest = steepest.max(grade / limit);
+            assert!(grade < limit, "trail at {p} is {:.0}% steep, more than the {:.0}% a car climbs there in the wet)", grade * 100.0, limit * 100.0);
+        }
+    }
+    println!("steepest trail stretch: {:.0}% of what the car can climb there in the wet", steepest * 100.0);
+}
+
+/// Places worth driving to: landmarks and secrets, farms, the circuits, and
+/// the rivers and canyons.
+fn points_of_interest() -> Vec<Vec2> {
+    let net = network();
+    let mut points: Vec<Vec2> = crate::landmarks::all().iter().map(|l| l.pos).collect();
+    points.extend(crate::farms::all().iter().map(|f| f.yard));
+    for c in net.paths.iter().filter(|p| p.circuit()) {
+        points.extend(c.points.iter().step_by(50));
+    }
+    for course in crate::waterways::all() {
+        points.extend(course.on_land().iter().step_by(10));
+    }
+    points
+}
+
+/// How far from the nearest point of interest each spot of open land on a
+/// grid is: (spot, distance), skipping the sea.
+fn interest_gaps(step: f32) -> Vec<(Vec2, f32)> {
+    let points = points_of_interest();
+    let half = terrain::TERRAIN_HALF_SIZE;
+    let n = (half * 2.0 / step) as usize;
+    let spots: Vec<Vec2> = (0..n * n)
+        .map(|i| Vec2::new((i % n) as f32 + 0.5, (i / n) as f32 + 0.5) * step - half)
+        .filter(|p| terrain::raw_height(p.x, p.y) > terrain::WATER_LEVEL)
+        .collect();
+    crate::layout::parallel_map(spots.chunks(256).map(|c| c.to_vec()).collect(), |chunk| {
+        chunk.into_iter().map(|p| (p, points.iter().map(|q| q.distance(p)).fold(f32::MAX, f32::min))).collect::<Vec<_>>()
+    }).into_iter().flatten().collect()
+}
+
+/// Dev aid: how far the land is from anything to find, and the emptiest spots.
+#[test]
+#[ignore]
+fn interest_report() {
+    let mut gaps = interest_gaps(400.0);
+    gaps.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let at = |share: f32| gaps[((gaps.len() as f32 * share) as usize).min(gaps.len() - 1)].1;
+    println!("from the nearest place of interest: worst {:.0}, 1% {:.0}, 10% {:.0}, median {:.0} (units; 2 per metre)",
+        gaps[0].1, at(0.01), at(0.1), at(0.5));
+    let mut shown: Vec<Vec2> = Vec::new();
+    for &(p, d) in &gaps {
+        if shown.len() == 12 || d < 2500.0 {
+            break;
+        }
+        if shown.iter().all(|s| s.distance(p) > 4000.0) {
+            println!("  {:.0},{:.0}: {d:.0} away; height {:.0}, mountain {:.1}, alpine {:.1}, desert {:.1}, forest {:.1}, tundra {:.1}", p.x, p.y,
+                terrain::raw_height(p.x, p.y), terrain::biome_mountain(p.x, p.y), terrain::alpine(p.x, p.y), terrain::biome_desert(p.x, p.y), terrain::biome_forest(p.x, p.y), terrain::biome_tundra(p.x, p.y));
+            shown.push(p);
+        }
+    }
+}
+
+#[test]
+fn there_is_always_something_to_find_nearby() {
+    let mut gaps: Vec<f32> = interest_gaps(400.0).into_iter().map(|g| g.1).collect();
+    gaps.sort_by(|a, b| b.total_cmp(a));
+    // Never much over a couple of kilometres (two units a metre) from a
+    // landmark, a circuit, a river or a canyon; most land much nearer
+    let tenth = gaps[gaps.len() / 10];
+    assert!(gaps[0] < 5500.0, "land {:.0} from anything to find", gaps[0]);
+    assert!(tenth < 3000.0, "a tenth of the land is over {tenth:.0} from anything to find");
 }

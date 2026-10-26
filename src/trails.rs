@@ -8,14 +8,14 @@ use std::collections::{BinaryHeap, HashMap};
 use glam::Vec2;
 
 use crate::road::{ease_tight_corners, resample, PathKind, RoadNetwork, CIRCUIT_SHOULDER, ROAD_HALF_WIDTH, TRAIL_HALF_WIDTH};
-use crate::terrain::{self, TERRAIN_HALF_SIZE, WATER_LEVEL};
+use crate::terrain::{self, TERRAIN_HALF_SIZE, WATER_LEVEL, WORLD_SCALE};
 use crate::track::Track;
 
 /// Grid spacing for route finding.
 const CELL: f32 = 30.0;
 /// How far from a landmark to look for somewhere to join: a quick search
 /// first, then a wide one for whatever is left.
-const SEARCH_RADII: [f32; 2] = [3000.0, 7000.0];
+const SEARCH_RADII: [f32; 2] = [3000.0, 7000.0 * WORLD_SCALE / 2.0];
 /// Trails stop this far short of the landmark itself.
 const STOP_SHORT: f32 = 40.0;
 /// Trails keep this far from circuit centrelines, so they never cut a lap.
@@ -36,17 +36,35 @@ pub fn route_all(network: &RoadNetwork, sites: &[Vec2]) -> Vec<Track> {
     let mut order: Vec<usize> = (0..sites.len()).collect();
     order.sort_by(|&a, &b| reach(sites[a]).total_cmp(&reach(sites[b])));
 
+    // Routed in waves, a wave's worth at once: each can branch off the
+    // trails of the waves before it
+    let wave = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut existing = TrailPoints::default();
     let mut trails = Vec::new();
     for radius in SEARCH_RADII {
-        order.retain(|&i| match route(network, &existing, sites[i], radius) {
-            Some(trail) => {
-                existing.add(&trail.points_2d);
-                trails.push(trail);
-                false
+        let mut unreached = Vec::new();
+        for batch in order.chunks(wave) {
+            let routed = crate::layout::parallel_map(batch.to_vec(), |i| (i, route(network, &existing, sites[i], radius)));
+            let mut this_wave = TrailPoints::default();
+            for (i, mut trail) in routed {
+                // One that runs into another of this wave (which it couldn't
+                // see) is routed again, now able to join it
+                if trail.as_ref().is_some_and(|t| t.points_2d.iter().any(|&p| this_wave.within(p, CELL * 1.5))) {
+                    trail = route(network, &existing, sites[i], radius);
+                }
+                if let Some(t) = &trail {
+                    this_wave.add(&t.points_2d);
+                }
+                match trail {
+                    Some(trail) => {
+                        existing.add(&trail.points_2d);
+                        trails.push(trail);
+                    }
+                    None => unreached.push(i),
+                }
             }
-            None => true,
-        });
+        }
+        order = unreached;
     }
     trails
 }

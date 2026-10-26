@@ -473,6 +473,67 @@ fn build_landmark(b: &mut Builder, l: &Landmark) {
             b.solid_block(woodpile, 1.5, 1.6, 3.0, yaw, [0.55, 0.38, 0.22, 1.0], [0.6, 0.45, 0.28, 1.0]);
         }
         Kind::Village => village(b, p, seed),
+        Kind::Cove => {
+            // A jetty out over the water from a boathouse, a boat tied up at the end
+            let dir = (0..16)
+                .map(|k| Vec2::from_angle(k as f32 * std::f32::consts::TAU / 16.0))
+                .min_by(|a, b| {
+                    let h = |d: Vec2| terrain::raw_height(p.x + d.x * 60.0, p.y + d.y * 60.0);
+                    h(*a).total_cmp(&h(*b))
+                })
+                .unwrap();
+            let face = dir.x.atan2(dir.y);
+            let deck = terrain::WATER_LEVEL + 1.2;
+            for k in 0..10 {
+                let c = p + dir * (6.0 + k as f32 * 5.0);
+                let bed = terrain::raw_height(c.x, c.y);
+                b.block(vec3(c.x, deck - 0.4, c.y), 2.2, 0.4, 2.6, face, WOOD, [0.55, 0.4, 0.25, 1.0]);
+                if k % 2 == 0 && bed < deck {
+                    for s in [-1.0, 1.0] {
+                        let post = c + dir.perp() * s * 2.0;
+                        b.column(vec3(post.x, bed - 0.5, post.y), 0.3, 0.3, deck - bed + 1.2, 4, DARK);
+                    }
+                }
+            }
+            let end = p + dir * 54.0 + dir.perp() * 4.5;
+            b.block(vec3(end.x, terrain::WATER_LEVEL - 0.2, end.y), 1.1, 0.9, 3.2, face, RED, WOOD);
+            let house = p - dir * 6.0;
+            let y = ground(house, 6.0);
+            b.solid_block(vec3(house.x, y - 0.5, house.y), 5.0, 5.0, 4.0, face, [0.4, 0.5, 0.6, 1.0], WOOD);
+            b.roof(vec3(house.x, y + 4.5, house.y), 5.0, 3.0, 4.0, face, [0.3, 0.25, 0.22, 1.0]);
+        }
+        Kind::Viewpoint => {
+            // A bench facing the view, a coin telescope and a signpost
+            let y = ground(p, 4.0);
+            let r = Quat::from_rotation_y(yaw);
+            let at = |x: f32, z: f32| vec3(p.x, y, p.y) + r * vec3(x, 0.0, z);
+            b.block(at(0.0, 0.0) - Vec3::Y * 0.3, 3.0, 1.2, 0.8, yaw, WOOD, WOOD);
+            b.block(at(0.0, 0.9) + Vec3::Y * 0.9, 3.0, 1.4, 0.2, yaw, WOOD, WOOD);
+            let scope = at(5.0, -1.0);
+            b.column(scope - Vec3::Y * 0.3, 0.25, 0.2, 3.4, 6, DARK);
+            b.block(scope + Vec3::Y * 3.0, 0.4, 0.7, 1.2, yaw, [0.2, 0.45, 0.35, 1.0], DARK);
+            let sign = at(-5.0, 0.5);
+            b.column(sign - Vec3::Y * 0.3, 0.2, 0.2, 4.0, 4, WOOD);
+            b.block(sign + Vec3::Y * 3.0, 1.6, 0.9, 0.15, yaw, [0.85, 0.8, 0.65, 1.0], WOOD);
+        }
+        Kind::Summit => {
+            // A cairn of stacked stones, and a flag on a pole beside it
+            let y = ground(p, 4.0);
+            let mut top = y - 0.4;
+            for k in 0..5 {
+                let r = 2.6 - k as f32 * 0.45;
+                let wobble = vec3(hash(seed, k as f32) - 0.5, 0.0, hash(k as f32, seed) - 0.5) * 0.6;
+                b.boulder(vec3(p.x, top + r * 0.45, p.y) + wobble, r, seed + k as f32, if k % 2 == 0 { STONE } else { [0.47, 0.46, 0.44, 1.0] });
+                top += r * 0.75;
+            }
+            let pole = vec3(p.x + 4.0, ground(p + vec2(4.0, 0.0), 0.5) - 0.3, p.y);
+            b.column(pole, 0.25, 0.18, 10.0, 4, WOOD);
+            let mast = pole + Vec3::Y * 9.8;
+            let out = Quat::from_rotation_y(yaw) * vec3(4.0, 0.0, 0.0);
+            let down = Vec3::Y * 2.4;
+            b.quad(mast, mast + out, mast + out - down, mast - down, RED);
+            b.quad(mast - down, mast + out - down, mast + out, mast, RED);
+        }
         // Secrets are built by `secrets::build`
         _ => {}
     }

@@ -161,11 +161,30 @@ impl Ground for WorldGround {
     }
     fn grip(&self, x: f32, z: f32) -> f32 {
         // Less of it in the wet
-        crate::terrain::surface_grip(x, z) * crate::weather::grip()
+        crate::terrain::wet_grip(x, z, crate::weather::grip())
     }
     fn on_road(&self, x: f32, z: f32) -> f32 {
         crate::road::on_road(x, z)
     }
+}
+
+/// The steepest grade the car can drive up from a standstill (dry, balanced
+/// setup), on ground of `grip` (`terrain::surface_grip`) at `road` (as
+/// `Ground::on_road` gives it). Measured: `steepest_climb_matches_the_physics`
+/// keeps it honest. World building keeps drivable slopes under this.
+pub fn steepest_climb(grip: f32, road: f32) -> f32 {
+    const GRIPS: [f32; 4] = [0.5, 0.6, 0.8, 1.0];
+    // Rows: off the road, half on it, fully on it
+    const CLIMB: [[f32; 4]; 3] = [[0.175, 0.20, 0.30, 0.40], [0.20, 0.275, 0.375, 0.475], [0.25, 0.325, 0.45, 0.525]];
+    let along = |row: &[f32; 4]| {
+        let g = grip.clamp(0.4, 1.0);
+        let k = GRIPS.iter().position(|&x| x >= g).unwrap_or(3).max(1);
+        let t = (g - GRIPS[k - 1]) / (GRIPS[k] - GRIPS[k - 1]);
+        row[k - 1] + (row[k] - row[k - 1]) * t
+    };
+    let r = road.clamp(0.0, 1.0) * 2.0;
+    let k = (r.floor() as usize).min(1);
+    along(&CLIMB[k]) + (along(&CLIMB[k + 1]) - along(&CLIMB[k])) * (r - k as f32)
 }
 
 /// How the car is set up: more wing pressing it into the road for grip in
@@ -871,6 +890,47 @@ mod tests {
             }
         }
         panic!("never got back on its wheels: up={}", car.up());
+    }
+
+    /// A plain slope rising toward -Z (the way a car faces at yaw 0).
+    struct Incline { grade: f32, grip: f32, road: f32 }
+    impl Ground for Incline {
+        fn height(&self, _x: f32, z: f32) -> f32 { -z * self.grade }
+        fn grip(&self, _x: f32, _z: f32) -> f32 { self.grip }
+        fn on_road(&self, _x: f32, _z: f32) -> f32 { self.road }
+    }
+
+    /// Whether a car can drive up `grade` from a standstill on ground of `grip`.
+    pub(crate) fn climbs(grade: f32, grip: f32, road: f32) -> bool {
+        let ground = Incline { grade, grip, road };
+        let mut car = CarPhysics::new_on(&ground, vec3(0.0, 0.0, 0.0), 0.0);
+        for _ in 0..(12.0 * 120.0) as usize {
+            car.update(&ground, 1.0 / 120.0, CarInput { throttle: 1.0, ..Default::default() });
+        }
+        -car.pos.z > 150.0
+    }
+
+    #[test]
+    fn steepest_climb_matches_the_physics() {
+        for road in [0.0, 0.25, 0.5, 1.0] {
+            for grip in [0.5, 0.55, 0.7, 1.0] {
+                let limit = steepest_climb(grip, road);
+                assert!(climbs(limit - 0.03, grip, road), "can't climb {:.0}% at grip {grip} road {road}", (limit - 0.03) * 100.0);
+                assert!(!climbs(limit + 0.05, grip, road), "climbs well over {:.0}% at grip {grip} road {road}", limit * 100.0);
+            }
+        }
+    }
+
+    /// Dev aid: the steepest grade the car climbs on each kind of ground.
+    #[test]
+    #[ignore]
+    fn steepest_climbs() {
+        for road in [0.0, 0.5, 1.0] {
+            for grip in [1.0, 0.8, 0.6, 0.5] {
+                let steepest = (1..40).map(|k| k as f32 * 0.025).take_while(|&g| climbs(g, grip, road)).last().unwrap_or(0.0);
+                println!("road {road} grip {grip}: climbs {:.1}%", steepest * 100.0);
+            }
+        }
     }
 
     /// A beach shelving into a lake toward -Z: dry for z > 0, water (level 0) beyond.

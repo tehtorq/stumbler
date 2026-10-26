@@ -14,7 +14,8 @@ use crate::road::{ease_tight_corners, resample, PathKind, RoadNetwork, CIRCUIT_S
 use crate::terrain::{self, TERRAIN_HALF_SIZE, WATER_LEVEL};
 use crate::track::Track;
 
-/// A stage: its name and the places it winds through, start to finish.
+/// A stage: its name and the places it winds through, start to finish, in
+/// the original layout (see `StageDef::spread`).
 pub struct StageDef {
     pub name: &'static str,
     pub waypoints: &'static [[f32; 2]],
@@ -41,6 +42,17 @@ pub const STAGES: [StageDef; 3] = [
     },
 ];
 
+impl StageDef {
+    /// The waypoints in the world: the stage moves out with the layout to
+    /// stay among the same circuits, but keeps its own length and shape.
+    pub fn spread(&self) -> Vec<[f32; 2]> {
+        let n = self.waypoints.len() as f32;
+        let centre = self.waypoints.iter().fold(Vec2::ZERO, |sum, w| sum + Vec2::from(*w)) / n;
+        let shift = centre * (terrain::WORLD_SCALE - 1.0);
+        self.waypoints.iter().map(|w| (Vec2::from(*w) + shift).to_array()).collect()
+    }
+}
+
 /// Grid spacing for route finding.
 const CELL: f32 = 25.0;
 /// How far a leg may stray outside the box round its two ends.
@@ -65,7 +77,7 @@ pub fn route_all(network: &RoadNetwork) -> Vec<Track> {
     // Each stage keeps clear of those laid before it
     let mut taken = HashSet::new();
     let routed: Vec<(&'static str, Track)> = STAGES.iter().filter_map(|s| {
-        let track = route(network, &taken, s.waypoints)?;
+        let track = route(network, &taken, &s.spread())?;
         mark(&mut taken, &track.points_2d);
         Some((s.name, track))
     }).collect();

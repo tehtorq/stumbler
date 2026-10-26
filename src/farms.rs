@@ -208,7 +208,7 @@ fn suitable(farm: &Farm, network: &RoadNetwork, circuit_points: &[Vec2]) -> bool
             let l = Vec2::new(COLUMNS[0] + (COLUMNS[4] - COLUMNS[0]) * gx as f32 / 8.0, ROWS[0] - 8.0 + (ROWS[2] - ROWS[0] + 16.0) * gz as f32 / 8.0);
             let p = farm.world(l);
             let grass = 1.0 - terrain::biome_desert(p.x, p.y) - terrain::biome_forest(p.x, p.y) - terrain::biome_mountain(p.x, p.y) - terrain::biome_tundra(p.x, p.y);
-            let volcano = (p - Vec2::new(6500.0, 0.0)).length() < 1000.0;
+            let volcano = (p - Vec2::from(crate::terrain::VOLCANO)).length() < 1000.0;
             if grass < 0.6 || volcano {
                 return false;
             }

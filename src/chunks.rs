@@ -257,8 +257,8 @@ pub struct ChunkManager {
 }
 
 impl ChunkManager {
-    /// Spawn workers and build the coarsest terrain for the whole map, plus
-    /// full detail around `start`, before returning.
+    /// Spawn workers and build everything wanted around `start` before
+    /// returning.
     pub fn new(gpu: &GpuContext, start: Vec2) -> Self {
         let jobs: Arc<Mutex<Vec<Job>>> = Arc::new(Mutex::new(Vec::new()));
         let (result_tx, results) = mpsc::channel();
@@ -297,14 +297,9 @@ impl ChunkManager {
             cover: HashMap::new(),
         };
 
-        // Coarse terrain everywhere so there are never holes in the world
-        let n = chunks_per_side();
-        let coarse = LOD_CELLS.len() - 1;
-        let all: Vec<Job> = (0..n).flat_map(|z| (0..n).map(move |x| Job::Terrain(ChunkCoord(x, z), coarse))).collect();
-        let mut wanted = manager.wanted_jobs(start);
-        wanted.retain(|j| !matches!(j, Job::Terrain(_, l) if *l == coarse));
-        let mut initial = all;
-        initial.extend(wanted);
+        // Only what's in view: the map is too big to build all of up front,
+        // so even the coarsest terrain streams in with the camera
+        let initial = manager.wanted_jobs(start);
         let t0 = std::time::Instant::now();
         let count = initial.len();
         manager.submit(initial);
@@ -420,10 +415,10 @@ impl ChunkManager {
 
         let coarse = LOD_CELLS.len() - 1;
         self.terrain.retain(|&(c, lod), _| {
-            if lod == coarse {
-                return true;
-            }
             let d = c.distance(p);
+            if lod == coarse {
+                return d < DRAW_DISTANCE + EVICT_MARGIN;
+            }
             let range = LOD_RANGE[lod] + EVICT_MARGIN;
             let finer_range = if lod == 0 { 0.0 } else { LOD_RANGE[lod - 1] - EVICT_MARGIN };
             d < range && d > finer_range.max(0.0) - EVICT_MARGIN * 2.0

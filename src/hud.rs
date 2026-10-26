@@ -95,6 +95,15 @@ impl HudBuilder {
         self.idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// A quad through four screen points, each with its own colour (blended between).
+    pub fn quad_colored(&mut self, corners: [Vec2; 4], colors: [[f32; 4]; 4]) {
+        let base = self.verts.len() as u16;
+        for (p, color) in corners.into_iter().zip(colors) {
+            self.verts.push(Vertex { pos: [p.x, p.y, 0.0], color });
+        }
+        self.idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
     /// A straight line `width` pixels thick.
     pub fn line(&mut self, a: Vec2, b: Vec2, width: f32, color: [f32; 4]) {
         let d = (b - a).normalize_or_zero();
@@ -188,6 +197,19 @@ impl MapView {
         }
     }
 
+    /// The world point under screen point `s`.
+    pub fn unproject(&self, s: Vec2) -> Vec2 {
+        let d = (s - self.centre) / self.scale;
+        match self.yaw {
+            Some(yaw) => {
+                let fwd = Vec2::new(-yaw.sin(), -yaw.cos());
+                let right = Vec2::new(-yaw.cos(), yaw.sin());
+                self.focus + right * d.x + fwd * -d.y
+            }
+            None => self.focus + Vec2::new(d.x, -d.y),
+        }
+    }
+
     /// Screen direction of a world heading (for arrows).
     pub fn direction(&self, yaw: f32) -> Vec2 {
         let ahead = Vec2::new(-yaw.sin(), -yaw.cos());
@@ -196,16 +218,23 @@ impl MapView {
 }
 
 /// Draw a polyline through a map, keeping segments inside `clip` (a screen rect).
+/// Points closer on screen than the line is wide are merged, so a long road
+/// zoomed right out stays a few hundred vertices (the HUD's indices are 16-bit).
 pub fn map_polyline(h: &mut HudBuilder, view: &MapView, points: &[Vec2], closed: bool, clip: (Vec2, Vec2), width: f32, color: [f32; 4]) {
     let inside = |p: Vec2| p.x >= clip.0.x && p.y >= clip.0.y && p.x <= clip.1.x && p.y <= clip.1.y;
     let n = points.len();
     let count = if closed { n } else { n.saturating_sub(1) };
+    let Some(&first) = points.first() else { return };
+    let mut a = view.project(first);
     for i in 0..count {
-        let a = view.project(points[i]);
         let b = view.project(points[(i + 1) % n]);
+        if i + 1 < count && a.distance(b) < width {
+            continue;
+        }
         if inside(a) && inside(b) {
             h.line(a, b, width, color);
         }
+        a = b;
     }
 }
 
@@ -246,5 +275,15 @@ mod tests {
         assert_eq!(ordinal(3), "3RD");
         assert_eq!(ordinal(4), "4TH");
         assert_eq!(ordinal(11), "11TH");
+    }
+
+    #[test]
+    fn unproject_undoes_project() {
+        for yaw in [None, Some(0.0), Some(1.1), Some(-2.5)] {
+            let view = MapView { centre: Vec2::new(300.0, 200.0), focus: Vec2::new(-1500.0, 820.0), scale: 0.3, yaw };
+            for p in [Vec2::new(-1500.0, 820.0), Vec2::new(250.0, -3000.0), Vec2::new(-9000.0, 4000.0)] {
+                assert!(view.unproject(view.project(p)).distance(p) < 0.05, "{p} with yaw {yaw:?}");
+            }
+        }
     }
 }

@@ -41,6 +41,8 @@ pub const INFLUENCE: f32 = ROAD_HALF_WIDTH + CIRCUIT_SHOULDER + BLEND;
 
 /// Spacing between resampled path points.
 pub const SAMPLE_SPACING: f32 = 4.0;
+/// Steepest a dirt trail may climb, on firm ground (see `trail_grade`).
+const TRAIL_GRADE: f32 = 0.22;
 /// Corners tighter than this radius get kerbs.
 const KERB_RADIUS: f32 = 300.0;
 const GRID_CELL: f32 = 64.0;
@@ -224,9 +226,12 @@ pub fn paved(x: f32, z: f32) -> bool {
 }
 
 /// 1.0 on asphalt (or kerb), less on a trail, fading to 0.0 across the shoulder.
+/// The best surface underfoot counts: on a trail just by the railway, the
+/// trail (though the railway shapes the ground there).
 pub fn on_road(x: f32, z: f32) -> f32 {
-    match network().and_then(|n| n.nearest_ground(x, z)) {
-        Some(s) => {
+    let Some(net) = network() else { return 0.0 };
+    net.nearest_each(x, z, false).into_iter().flatten()
+        .map(|s| {
             let surface = match s.kind {
                 PathKind::Trail => TRAIL_GRIP,
                 PathKind::Gravel => GRAVEL_GRIP,
@@ -234,9 +239,8 @@ pub fn on_road(x: f32, z: f32) -> f32 {
                 _ => 1.0,
             };
             surface * (1.0 - ((s.dist - s.half_width() - KERB_WIDTH) / SHOULDER).clamp(0.0, 1.0))
-        }
-        None => 0.0,
-    }
+        })
+        .fold(0.0, f32::max)
 }
 
 impl RoadNetwork {
@@ -273,11 +277,17 @@ impl RoadNetwork {
             let mut path = build_path(&track.points_2d, track.closed, PathKind::Trail, &natural_height);
             // Where it starts: the nearest point on a road or circuit, or on an earlier trail
             let start = path.points[0];
+            // (an earlier trail's height is taken along its segments: on a
+            // steep one even neighbouring samples differ a fair bit)
             let host = self.nearest_matching(start.x, start.y, |k| k > PathKind::Trail)
                 .map(|s| (s.dist, s.height, s.half_width()))
                 .into_iter()
-                .chain(added.iter().flat_map(|t| t.points.iter().zip(&t.heights))
-                    .map(|(q, &h)| (q.distance(start), h, TRAIL_HALF_WIDTH)))
+                .chain(added.iter().flat_map(|t| (0..t.len() - 1).map(move |i| {
+                    let (a, b) = (t.points[i], t.points[i + 1]);
+                    let f = ((start - a).dot(b - a) / (b - a).length_squared().max(1e-6)).clamp(0.0, 1.0);
+                    let h = t.heights[i] + (t.heights[i + 1] - t.heights[i]) * f;
+                    (start.distance(a.lerp(b, f)), h, TRAIL_HALF_WIDTH)
+                })))
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, host_height, host_half_width)) = host {
                 let blend_start = host_half_width + KERB_WIDTH;
@@ -294,14 +304,22 @@ impl RoadNetwork {
             }
             // Where it crosses the railway, it rises or dips to meet the bed
             let reach = RAIL_HALF_WIDTH + SHOULDER;
+            let mut pinned = vec![0];
             for i in 0..path.len() {
                 let p = path.points[i];
                 if let Some(rail) = self.nearest_matching(p.x, p.y, |k| k == PathKind::Rail).filter(|r| !r.raised) {
                     let t = ((rail.dist - reach) / 120.0).clamp(0.0, 1.0);
                     let w = 1.0 - t * t * (3.0 - 2.0 * t);
                     path.heights[i] += (rail.height - path.heights[i]) * w;
+                    if t == 0.0 {
+                        pinned.push(i);
+                    }
                 }
             }
+            // Those eases can be steep: keep to a trail's grade either side
+            // of the join and the crossings
+            let rises: Vec<f32> = path.points.iter().map(|&p| SAMPLE_SPACING * trail_grade(p)).collect();
+            limit_grade(&mut path, |i| rises[i], &pinned);
             added.push(path);
         }
         self.paths.extend(added);
@@ -483,7 +501,7 @@ impl RoadNetwork {
         // Eases that overlap can add up: hold the crossings and junctions
         // where they are and limit the grade again between them
         for (rail, pins) in rails.iter_mut().zip(&pinned) {
-            limit_grade(rail, SAMPLE_SPACING * 0.03, pins);
+            limit_grade(rail, |_| SAMPLE_SPACING * 0.03, pins);
             classify_structures(rail, &natural_height);
         }
 
@@ -550,6 +568,16 @@ impl RoadNetwork {
     }
 
     fn nearest_of(&self, x: f32, z: f32, raised: bool) -> Option<RoadSample> {
+        let best = self.nearest_each(x, z, raised);
+        if let Some(s) = best.iter().rev().flatten().find(|s| s.dist <= s.half_width() + s.shoulder()) {
+            return Some(*s);
+        }
+        best.into_iter().flatten().min_by(|a, b| a.dist.total_cmp(&b.dist))
+    }
+
+    /// The nearest path of each kind (indexed by `PathKind`), leaving out
+    /// viaducts unless `raised`.
+    fn nearest_each(&self, x: f32, z: f32, raised: bool) -> [Option<RoadSample>; 5] {
         let mut best: [Option<RoadSample>; 5] = [None; 5];
         for (seg, dist, t) in self.segments_near(Vec2::new(x, z)).filter(|(seg, _, _)| raised || !seg.raised) {
             let slot = &mut best[seg.kind as usize];
@@ -557,10 +585,7 @@ impl RoadNetwork {
                 *slot = Some(RoadSample { dist, height: seg.ha + (seg.hb - seg.ha) * t, kind: seg.kind, raised: seg.raised });
             }
         }
-        if let Some(s) = best.iter().rev().flatten().find(|s| s.dist <= s.half_width() + s.shoulder()) {
-            return Some(*s);
-        }
-        best.into_iter().flatten().min_by(|a, b| a.dist.total_cmp(&b.dist))
+        best
     }
 
     /// Nearest path within `INFLUENCE` whose kind passes `matches`.
@@ -857,22 +882,23 @@ fn build_path(
 
     // Limit the gradient so mountain sections stay drivable; the terrain
     // blend turns the difference into cuttings and embankments
-    let max_rise = SAMPLE_SPACING * match kind {
+    let grade = |p: Vec2| match kind {
         PathKind::Circuit => 0.10,
         PathKind::Road => 0.15,
-        PathKind::Trail => 0.22,
+        PathKind::Trail => trail_grade(p),
         PathKind::Gravel => 0.15,
         PathKind::Rail => 0.025,
     };
+    let rises: Vec<f32> = points.iter().map(|&p| SAMPLE_SPACING * grade(p)).collect();
     for _ in 0..4 {
         for i in 1..n {
-            heights[i] = heights[i].clamp(heights[i - 1] - max_rise, heights[i - 1] + max_rise);
+            heights[i] = heights[i].clamp(heights[i - 1] - rises[i], heights[i - 1] + rises[i]);
         }
         for i in (0..n - 1).rev() {
-            heights[i] = heights[i].clamp(heights[i + 1] - max_rise, heights[i + 1] + max_rise);
+            heights[i] = heights[i].clamp(heights[i + 1] - rises[i], heights[i + 1] + rises[i]);
         }
         if closed {
-            heights[0] = heights[0].clamp(heights[n - 1] - max_rise, heights[n - 1] + max_rise);
+            heights[0] = heights[0].clamp(heights[n - 1] - rises[0], heights[n - 1] + rises[0]);
         }
     }
 
@@ -995,10 +1021,13 @@ fn level_crossings(points: &[Vec2], heights: &mut [f32], closed: bool) {
 
 /// Where the railway runs high above the natural ground it goes onto a
 /// viaduct, and where it runs deep below, into a tunnel; short stretches of
-/// either are left as embankments and cuttings.
+/// either are left as embankments and cuttings, unless they get very deep.
 fn classify_structures(path: &mut RoadPath, natural_height: &impl Fn(f32, f32) -> f32) {
     const VIADUCT_ABOVE: f32 = 12.0;
     const TUNNEL_BELOW: f32 = 30.0;
+    /// Through a sharp crest (or over a narrow gully) deeper than this, even
+    /// a short run gets a tunnel (or viaduct) rather than a huge cutting.
+    const ALWAYS_BEYOND: f32 = 40.0;
     let n = path.len();
     let gap: Vec<f32> = (0..n).map(|i| path.heights[i] - natural_height(path.points[i].x, path.points[i].y)).collect();
     for (kind, test, shortest) in [
@@ -1020,7 +1049,8 @@ fn classify_structures(path: &mut RoadPath, natural_height: &impl Fn(f32, f32) -
                 }
                 // Runs touching an open path's ends are left alone
                 let inner = path.closed || (start > 0 && i < n);
-                if inner && i - start < longest {
+                let deep = want && gap[start..i].iter().any(|g| g.abs() > ALWAYS_BEYOND);
+                if inner && i - start < longest && !deep {
                     flags[start..i].iter_mut().for_each(|f| *f = !want);
                 }
             }
@@ -1033,23 +1063,33 @@ fn classify_structures(path: &mut RoadPath, natural_height: &impl Fn(f32, f32) -
     }
 }
 
-/// Keep `path`'s grade within `max_rise` per sample, never moving the
+/// Keep `path`'s grade within `max_rise(i)` per sample, never moving the
 /// samples in `pinned`.
-fn limit_grade(path: &mut RoadPath, max_rise: f32, pinned: &[usize]) {
+fn limit_grade(path: &mut RoadPath, max_rise: impl Fn(usize) -> f32, pinned: &[usize]) {
     let n = path.len();
     let free = |i: usize| !pinned.contains(&i);
     for _ in 0..4 {
         for i in 1..n {
             if free(i) {
-                path.heights[i] = path.heights[i].clamp(path.heights[i - 1] - max_rise, path.heights[i - 1] + max_rise);
+                let rise = max_rise(i);
+                path.heights[i] = path.heights[i].clamp(path.heights[i - 1] - rise, path.heights[i - 1] + rise);
             }
         }
         for i in (0..n - 1).rev() {
             if free(i) {
-                path.heights[i] = path.heights[i].clamp(path.heights[i + 1] - max_rise, path.heights[i + 1] + max_rise);
+                let rise = max_rise(i);
+                path.heights[i] = path.heights[i].clamp(path.heights[i + 1] - rise, path.heights[i + 1] + rise);
             }
         }
     }
+}
+
+/// Steepest a trail may climb at `p`: `TRAIL_GRADE`, or less where the
+/// ground is loose or icy, with a margin under what the car can manage even
+/// after rain.
+pub fn trail_grade(p: Vec2) -> f32 {
+    let wet = crate::terrain::wet_grip(p.x, p.y, crate::weather::WET_GRIP);
+    TRAIL_GRADE.min(0.9 * crate::physics::steepest_climb(wet, TRAIL_GRIP))
 }
 
 /// Bring `path`'s height at sample `at` to `target`: flat for `flat` units

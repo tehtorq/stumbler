@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub struct Progress {
     pub circuits: HashSet<String>,
     pub landmarks: HashSet<String>,
+    /// Rivers and canyons found.
+    pub places: HashSet<String>,
     /// Best race lap per circuit, seconds.
     pub best_laps: HashMap<String, f32>,
     /// Best finishing position per circuit.
@@ -34,6 +36,7 @@ impl Progress {
             match kind {
                 "circuit" => { p.circuits.insert(rest.to_string()); }
                 "landmark" => { p.landmarks.insert(rest.to_string()); }
+                "place" => { p.places.insert(rest.to_string()); }
                 "orb" => { if let Ok(i) = rest.parse() { p.orbs.insert(i); } }
                 "paint" => { if let Ok(i) = rest.parse() { p.paint = i; } }
                 "difficulty" => { if let Ok(i) = rest.parse::<usize>() { p.difficulty = i.min(2); } }
@@ -65,6 +68,7 @@ impl Progress {
         };
         sorted("circuit", self.circuits.iter().cloned().collect());
         sorted("landmark", self.landmarks.iter().cloned().collect());
+        sorted("place", self.places.iter().cloned().collect());
         sorted("orb", self.orbs.iter().map(|i| i.to_string()).collect());
         sorted("best", self.best_laps.iter().map(|(n, v)| format!("{n} {v:.3}")).collect());
         sorted("finish", self.best_finish.iter().map(|(n, v)| format!("{n} {v}")).collect());

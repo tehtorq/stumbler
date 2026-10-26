@@ -1,5 +1,5 @@
 use crate::geometry::Vertex;
-use crate::terrain::{terrain_height, TERRAIN_HALF_SIZE};
+use crate::terrain::{terrain_height, TERRAIN_HALF_SIZE, WORLD_SCALE};
 
 pub struct Collectible {
     pub x: f32,
@@ -18,8 +18,9 @@ pub fn create_collectibles() -> Vec<Collectible> {
     let mut items = Vec::new();
     let half = TERRAIN_HALF_SIZE;
 
-    // Grid of candidates with pseudo-random jitter
-    let spacing = 650.0;
+    // Grid of candidates with pseudo-random jitter, sparser in a bigger
+    // world so there are four times as many orbs for sixteen times the land
+    let spacing = 650.0 * WORLD_SCALE / 2.0;
     let cells = (half * 2.0 / spacing) as i32;
 
     for cz in 0..cells {
@@ -27,13 +28,16 @@ pub fn create_collectibles() -> Vec<Collectible> {
             let bx = -half + cx as f32 * spacing;
             let bz = -half + cz as f32 * spacing;
 
-            // Hash to determine if this cell gets a collectible (~15% chance)
-            let h = hash(bx * 0.31 + 50.0, bz * 0.37 + 90.0);
+            // Hash to determine if this cell gets a collectible (~15% chance).
+            // Hashed on the cell's index: hashing its coordinates loses all
+            // precision far from the centre
+            let (i, j) = (cx as f32, cz as f32);
+            let h = hash(i * 0.31 + 50.0, j * 0.37 + 90.0);
             if h > 0.15 { continue; }
 
             // Jitter within cell
-            let x = bx + hash(bx, bz) * spacing * 0.8 + spacing * 0.1;
-            let z = bz + hash(bx + 7.0, bz + 3.0) * spacing * 0.8 + spacing * 0.1;
+            let x = bx + hash(i, j) * spacing * 0.8 + spacing * 0.1;
+            let z = bz + hash(i + 7.0, j + 3.0) * spacing * 0.8 + spacing * 0.1;
 
             let y = terrain_height(x, z);
             if y < -8.0 { continue; } // skip water

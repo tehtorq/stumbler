@@ -4,12 +4,12 @@
 use glam::{Vec2, vec2};
 
 use crate::road::{ease_tight_corners, resample, ROAD_HALF_WIDTH};
-use crate::terrain::{self, WATER_LEVEL};
+use crate::terrain::{self, WATER_LEVEL, WORLD_SCALE};
 use crate::track::Track;
 use crate::tracks;
 
 /// Circuits sit on an even grid this far apart, the home circuit in the middle.
-const GRID_SPACING: f32 = 3500.0;
+pub const GRID_SPACING: f32 = 3500.0 * WORLD_SCALE;
 /// Grid steps from the centre to each edge (a 5 x 5 grid).
 const GRID_REACH: i32 = 2;
 /// Grid slots left for the high mountains in the north-east.
@@ -413,7 +413,7 @@ fn connect(circuits: &[Circuit]) -> Vec<Track> {
     // Extra links: each circuit to its nearest neighbour it isn't linked to yet
     for i in 0..n {
         let has = |a: usize, b: usize, l: &[(usize, usize)]| l.iter().any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a));
-        if let Some(&(_, a, b)) = pairs.iter().find(|&&(d, a, b)| (a == i || b == i) && !has(a, b, &links) && d < 4500.0) {
+        if let Some(&(_, a, b)) = pairs.iter().find(|&&(d, a, b)| (a == i || b == i) && !has(a, b, &links) && d < GRID_SPACING * 1.3) {
             if links.iter().filter(|&&(x, y)| x == i || y == i).count() < 3 {
                 links.push((a, b));
             }
@@ -441,7 +441,7 @@ fn route_road(circuits: &[Circuit], a: usize, b: usize) -> Option<Track> {
     let seed = (a * 31 + b * 17) as f32;
 
     // Try the direct route first, then bend further and further each way
-    for bend in [0.0, 500.0, -500.0, 1000.0, -1000.0, 1600.0, -1600.0, 2400.0, -2400.0] {
+    for bend in [0.0, 500.0, -500.0, 1000.0, -1000.0, 1600.0, -1600.0, 2400.0, -2400.0].map(|b| b * WORLD_SCALE) {
         let control: Vec<Vec2> = (0..=segments)
             .map(|k| {
                 let t = k as f32 / segments as f32;

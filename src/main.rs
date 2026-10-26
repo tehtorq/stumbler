@@ -5,7 +5,7 @@ use std::time::Instant;
 use glam::{Vec2, Vec3, vec3};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -31,6 +31,8 @@ mod layout;
 mod noise;
 mod lights;
 mod loading;
+mod map;
+mod marker;
 mod particles;
 mod physics;
 mod progress;
@@ -49,6 +51,7 @@ mod speedlines;
 mod terrain;
 mod track;
 mod tuning;
+mod waterways;
 mod weather;
 mod trackside;
 mod trails;
@@ -249,6 +252,10 @@ struct Stage {
     /// even without new marks).
     skid_mesh_time: f32,
     hud_mesh: DynamicMesh,
+    /// The maps' picture of the island, under the HUD.
+    map_mesh: DynamicMesh,
+    /// Chevrons and beam guiding the way to the marker.
+    guide_mesh: DynamicMesh,
 
     controls: Controls,
     /// Seconds the throttle has been held down.
@@ -262,6 +269,9 @@ struct Stage {
     boost: boosts::Boost,
     lap_pulse: f32,
     show_map: bool,
+    map: marker::MapControl,
+    /// Where the player has asked to be guided to.
+    marker: Option<marker::Marker>,
     /// Brief HUD message: text, colour, seconds left.
     banner: Option<(String, [f32; 4], f32)>,
     fullscreen: bool,
@@ -443,6 +453,8 @@ impl Stage {
             light_pool_mesh: DynamicMesh::new(&gpu, "light pools"),
             skid_mesh_time: -1.0,
             hud_mesh: DynamicMesh::new(&gpu, "hud"),
+            map_mesh: DynamicMesh::new(&gpu, "map"),
+            guide_mesh: DynamicMesh::new(&gpu, "guide"),
             collectibles,
             flocks: birds::create_flocks(&centroids),
             wildlife: wildlife::Wildlife::new(0x5eed_1234),
@@ -477,6 +489,8 @@ impl Stage {
             boost: boosts::Boost::default(),
             lap_pulse: 0.0,
             show_map: false,
+            map: Default::default(),
+            marker: None,
             banner: None,
             fullscreen: false,
             car_color,
@@ -492,6 +506,16 @@ impl Stage {
             cpu_draw_ms: 0.0,
             gpu,
         };
+        // Dev aid: STUMBLER_MARKER=x,z sets a marker, STUMBLER_MAP_ZOOM=4 zooms
+        // the world map in on it (or the car)
+        if let Some(v) = std::env::var("STUMBLER_MARKER").ok().map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect::<Vec<f32>>()) {
+            if v.len() >= 2 {
+                stage.marker = Some(marker::Marker { pos: Vec2::new(v[0], v[1]), name: "MARKER".into() });
+            }
+        }
+        if let Some(zoom) = std::env::var("STUMBLER_MAP_ZOOM").ok().and_then(|s| s.parse::<f32>().ok()) {
+            stage.map.zoom = zoom.max(1.0);
+        }
         // Dev aid: STUMBLER_RACE=1 lines up for a race straight away
         // (STUMBLER_RACE=trial for a time trial, =tour for a tour)
         match std::env::var("STUMBLER_RACE").as_deref() {
@@ -700,6 +724,12 @@ impl Stage {
                 }
             }
         };
+        // With the map open the keys (or stick) move its cursor; the car coasts
+        if self.show_map {
+            let pad = self.gamepad.as_ref().map(|g| g.state).unwrap_or_default();
+            self.map_update(dt, Vec2::new(pad.steer, pad.throttle - pad.brake));
+            input = CarInput::default();
+        }
         // How long the throttle has been held, for judging the launch
         self.throttle_held = if input.throttle > 0.5 { self.throttle_held + dt } else { 0.0 };
         if self.race.as_ref().is_some_and(|r| r.holding()) {
@@ -733,6 +763,7 @@ impl Stage {
         self.pickups();
         self.update_race(dt);
         self.discover(dt);
+        self.check_marker();
 
         if let Some((_, _, t)) = &mut self.banner {
             *t -= dt;
@@ -937,6 +968,11 @@ impl Stage {
             {
                 self.progress.circuits.insert(c.name.to_string());
                 found = Some(format!("DISCOVERED {}", c.name));
+            }
+        }
+        if let Some((name, _)) = waterways::at(p.x, p.y) {
+            if self.progress.places.insert(name.to_string()) {
+                found = Some(format!("DISCOVERED {name}"));
             }
         }
         let mut secret = false;
@@ -1192,6 +1228,11 @@ impl Stage {
 
     /// Returns true if the game should quit.
     fn key_down(&mut self, key: KeyCode) -> bool {
+        if self.show_map {
+            if let Some(quit) = self.map_key(key) {
+                return quit;
+            }
+        }
         match key {
             KeyCode::ArrowUp | KeyCode::KeyW => self.controls.accelerate = true,
             KeyCode::ArrowDown | KeyCode::KeyS => self.controls.brake = true,
@@ -1244,7 +1285,7 @@ impl Stage {
                     }
                 }
             }
-            KeyCode::KeyM => self.show_map = !self.show_map,
+            KeyCode::KeyM => self.toggle_map(),
             KeyCode::KeyF => {
                 self.fullscreen = !self.fullscreen;
                 self.gpu.window.set_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
@@ -1406,8 +1447,14 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                stage.mouse_wheel(y);
+                if stage.show_map {
+                    stage.map_scroll(y);
+                } else {
+                    stage.mouse_wheel(y);
+                }
             }
+            WindowEvent::CursorMoved { position, .. } => stage.map_mouse(Vec2::new(position.x as f32, position.y as f32)),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => stage.map_click(button),
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
                 if let Some(last) = stage.last_frame.replace(frame_start) {
@@ -1428,7 +1475,9 @@ impl ApplicationHandler for App {
                             let n = stage.frames as f64;
                             eprintln!("profile: cpu update {:.2} ms, cpu draw {:.2} ms, gpu pass {:.2} ms (averages)", stage.cpu_update_ms / n, stage.cpu_draw_ms / n, timer.average_ms());
                         }
-                        stage.show_map |= std::env::var_os("STUMBLER_SCREENSHOT_MAP").is_some();
+                        if std::env::var_os("STUMBLER_SCREENSHOT_MAP").is_some() && !stage.show_map {
+                            stage.toggle_map();
+                        }
                         stage.gpu.capture_path = Some(path.into());
                         stage.draw();
                         event_loop.exit();

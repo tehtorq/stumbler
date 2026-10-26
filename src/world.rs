@@ -56,6 +56,10 @@ pub struct World {
     pub road_outlines: Vec<Vec<Vec2>>,
     /// Dirt trail outlines for maps.
     pub trail_outlines: Vec<Vec<Vec2>>,
+    /// The island's shoreline, for maps.
+    pub coastline: Vec<Vec2>,
+    /// The island as a picture, for maps.
+    pub map_image: crate::map::MapImage,
     pub boost_pads: Vec<BoostPad>,
     pub gate_mesh: Mesh,
     pub boost_mesh: Mesh,
@@ -99,6 +103,16 @@ impl World {
             .map(|p| p.points.iter().step_by(6).chain(p.points.last()).copied().collect())
             .collect();
 
+        // Walk in from the map's edge in every direction to the first land
+        let coastline = (0..360)
+            .filter_map(|k| {
+                let dir = Vec2::from_angle(k as f32 * std::f32::consts::TAU / 360.0);
+                let reach = terrain::TERRAIN_HALF_SIZE / dir.x.abs().max(dir.y.abs());
+                (0..200).map(|s| dir * (reach - s as f32 * 40.0))
+                    .find(|p| terrain::raw_height(p.x, p.y) > terrain::WATER_LEVEL)
+            })
+            .collect();
+
         let (gate_verts, gate_idxs) = build_gates(&circuits);
         let boost_pads = boosts::create_boost_pads(network);
         let (boost_verts, boost_idxs) = boosts::build_boost_mesh(&boost_pads);
@@ -108,6 +122,8 @@ impl World {
             road_loops,
             road_outlines,
             trail_outlines,
+            coastline,
+            map_image: crate::map::MapImage::build(),
             boost_pads,
             gate_mesh: Mesh::new(gpu, &gate_verts, &gate_idxs),
             boost_mesh: Mesh::new(gpu, &boost_verts, &boost_idxs),
@@ -131,10 +147,13 @@ pub fn build_network(layout: layout::Layout) -> RoadNetwork {
     let mut network = RoadNetwork::build(&circuits, &layout.roads, terrain::TERRAIN_HALF_SIZE, terrain::natural_height);
     network.add_rail(&railway::route(&network), terrain::natural_height);
     network.add_gravel(&stages::route_all(&network), terrain::natural_height);
-    let sites = landmarks::place(&network);
+    let mut sites = landmarks::place(&network);
     // Secrets get no trail; finding them is the point
     let positions: Vec<Vec2> = sites.iter().filter(|l| !l.kind.is_secret()).map(|l| l.pos).collect();
-    network.add_trails(&trails::route_all(&network, &positions), terrain::natural_height);
+    let trails = trails::route_all(&network, &positions);
+    // A landmark no trail could reach (boxed in by cliffs or water) isn't put up
+    sites.retain(|l| l.kind.is_secret() || trails.iter().any(|t| t.points_2d.last().is_some_and(|e| e.distance(l.pos) < 60.0)));
+    network.add_trails(&trails, terrain::natural_height);
     landmarks::install(sites, &network);
     farms::install(&network);
     roadside::install(&names, &network);

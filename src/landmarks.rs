@@ -16,6 +16,12 @@ pub enum Kind {
     StoneArch,
     Cabin,
     Village,
+    /// A cairn and flag on a mountain top, at the end of a climb.
+    Summit,
+    /// A jetty and boathouse on the island's coast.
+    Cove,
+    /// A bench and telescope, put up wherever the land is emptiest.
+    Viewpoint,
     // Secrets: no trail leads to these, only a line of cairns from the road
     StandingStones,
     SunkenTemple,
@@ -141,36 +147,55 @@ struct Rule {
     suits: fn(&RoadNetwork, Vec2) -> bool,
 }
 
-const RULES: [Rule; 14] = [
+const RULES: [Rule; 16] = [
     Rule {
-        kind: Kind::Lighthouse, max: 6, spacing: 1800.0,
-        names: &["NORTH LIGHT", "GULL POINT", "HARBOUR LIGHT", "STORM BEACON", "LAKESIDE LIGHT", "LAST LIGHT"],
+        kind: Kind::Lighthouse, max: 16, spacing: 6000.0,
+        names: &["NORTH LIGHT", "GULL POINT", "HARBOUR LIGHT", "STORM BEACON", "LAKESIDE LIGHT", "LAST LIGHT",
+            "RIVERMOUTH LIGHT", "HERON POINT", "FERRYMAN'S LAMP", "ESTUARY LIGHT", "CAPE STUMBLE", "WRECKER'S WATCH",
+            "SEAWARD LIGHT", "SALT HEAD", "TIDEMARK", "FAR CAPE"],
         suits: |n, p| shore(p) && open_ground(n, p, 1.0),
     },
     Rule {
-        kind: Kind::Windmill, max: 8, spacing: 1500.0,
-        names: &["OLD MILL", "HILLTOP MILL", "MILLER'S REST", "THREE SAILS", "BREEZY MILL", "GRINDSTONE", "MEADOW MILL", "WINDY RIDGE"],
+        kind: Kind::Windmill, max: 14, spacing: 3000.0,
+        names: &["OLD MILL", "HILLTOP MILL", "MILLER'S REST", "THREE SAILS", "BREEZY MILL", "GRINDSTONE", "MEADOW MILL", "WINDY RIDGE",
+            "FLOURBANK", "TWIN SAILS", "BARLEY MILL", "CREAKING MILL", "HARVEST MILL", "WEATHERVANE"],
         suits: |n, p| grassland(p) && open_ground(n, p, 0.25) && near_road(n, p, 700.0),
     },
     Rule {
-        kind: Kind::RadioMast, max: 6, spacing: 1800.0,
-        names: &["SUMMIT MAST", "SKYLINE TOWER", "RELAY PEAK", "HIGH SIGNAL", "STATIC POINT", "CLOUD MAST"],
+        kind: Kind::RadioMast, max: 8, spacing: 3600.0,
+        names: &["SUMMIT MAST", "SKYLINE TOWER", "RELAY PEAK", "HIGH SIGNAL", "STATIC POINT", "CLOUD MAST", "FAR RELAY", "BEACON HILL"],
         suits: |_, p| terrain::biome_mountain(p.x, p.y) > 0.3 && summit(p),
     },
     Rule {
-        kind: Kind::StoneArch, max: 6, spacing: 1200.0,
-        names: &["SAND ARCH", "SUNGATE", "WIND ARCH", "THE KEYHOLE", "DUNE BRIDGE", "RED ARCH"],
+        kind: Kind::StoneArch, max: 10, spacing: 2400.0,
+        names: &["SAND ARCH", "SUNGATE", "WIND ARCH", "THE KEYHOLE", "DUNE BRIDGE", "RED ARCH",
+            "THE NEEDLE'S EYE", "SUNSET GATE", "BONE ARCH", "THE WISHBONE"],
         suits: |n, p| terrain::biome_desert(p.x, p.y) > 0.4 && open_ground(n, p, 0.3),
     },
     Rule {
-        kind: Kind::Cabin, max: 6, spacing: 1200.0,
-        names: &["HUNTER'S CABIN", "PINE LODGE", "WOODCUTTER'S HUT", "FOX HOLLOW", "MOSSY CABIN", "TRAPPER'S REST"],
+        kind: Kind::Cabin, max: 12, spacing: 2400.0,
+        names: &["HUNTER'S CABIN", "PINE LODGE", "WOODCUTTER'S HUT", "FOX HOLLOW", "MOSSY CABIN", "TRAPPER'S REST",
+            "BEAR'S DEN", "OWL COTTAGE", "LOGGER'S CAMP", "SNOWED-IN SHACK", "RANGER'S POST", "WILLOW HUT"],
         suits: |n, p| (terrain::biome_forest(p.x, p.y) > 0.4 || terrain::biome_tundra(p.x, p.y) > 0.3) && open_ground(n, p, 0.35),
     },
     Rule {
-        kind: Kind::Village, max: 8, spacing: 2200.0,
-        names: &["LITTLE STUMBLING", "OAKBY", "NETHER CHASE", "PIT LANE END", "GRIDHAM", "APEX GREEN", "CHICANE CROSS", "SLIPSTREAM"],
+        kind: Kind::Village, max: 14, spacing: 4400.0,
+        names: &["LITTLE STUMBLING", "OAKBY", "NETHER CHASE", "PIT LANE END", "GRIDHAM", "APEX GREEN", "CHICANE CROSS", "SLIPSTREAM",
+            "UPPER STUMBLING", "BRAKEFORD", "KERBSTONE", "PADDOCK HILL", "HAIRPIN BEND", "TOW STREET"],
         suits: |n, p| grassland(p) && open_ground(n, p, 0.2) && near_road(n, p, 260.0),
+    },
+    Rule {
+        kind: Kind::Cove, max: 18, spacing: 9000.0,
+        names: &["SMUGGLER'S COVE", "LOBSTER POT BAY", "DRIFTWOOD JETTY", "GULL'S LANDING", "SANDY HOOK", "OYSTER BAY",
+            "PEBBLE STRAND", "BOATMAN'S REST", "SEAL ROCK", "WHITEWATER BAY", "ANCHOR COVE", "FISHERMAN'S WHARF", "CRAB CREEK", "LONG STRAND",
+            "MERMAID'S STEPS", "SHELL BEACH", "KELP POINT", "STORMY LANDING"],
+        suits: |n, p| by_the_sea(p) && shore(p) && open_ground(n, p, 0.25),
+    },
+    Rule {
+        kind: Kind::Summit, max: 16, spacing: 2600.0,
+        names: &["EAGLE CRAG", "HIGH TOR", "STORMCAP", "GREYBEARD", "THE NEEDLE", "WINDY PIKE", "COLD SHOULDER", "CLOUDREST",
+            "BRANDER FELL", "RAVEN HEIGHT", "SNOWCROWN", "FROSTHORN", "THE WIDOW", "KING'S SEAT", "BLUE FELL", "SKYHOOK"],
+        suits: |_, p| (terrain::biome_mountain(p.x, p.y) > 0.25 || terrain::alpine(p.x, p.y) > 0.25) && summit(p) && terrain::raw_height(p.x, p.y) > 110.0,
     },
     // ── Secrets: off the beaten track ──
     Rule {
@@ -254,6 +279,11 @@ fn shore(p: Vec2) -> bool {
 }
 
 /// Higher by `by` than the ground `radius` away all round.
+/// Out in the ring of land between the circuits and the island's coast.
+fn by_the_sea(p: Vec2) -> bool {
+    p.x.abs().max(p.y.abs()) > terrain::TERRAIN_HALF_SIZE - terrain::COAST - terrain::COAST_WANDER - 800.0
+}
+
 fn rise(p: Vec2, radius: f32, by: f32) -> bool {
     let h = terrain::raw_height(p.x, p.y);
     (0..8).all(|k| {
@@ -317,12 +347,89 @@ pub fn place(network: &RoadNetwork) -> Vec<Landmark> {
                 let d = l.pos.distance(p);
                 d < 500.0 || (l.kind == rule.kind && d < rule.spacing)
             });
-            if crowded || !(rule.suits)(network, p) {
+            // Up among the alpine peaks there are only summits
+            let alpine = rule.kind != Kind::Summit && terrain::alpine(p.x, p.y) > 0.2;
+            if crowded || alpine || !(rule.suits)(network, p) {
                 continue;
             }
             placed.push(Landmark { kind: rule.kind, pos: p, name: rule.names[count].to_string(), seed });
             count += 1;
         }
     }
+    fill_gaps(network, &candidates, &mut placed);
     placed
+}
+
+/// Land further than this from anything to find gets a viewpoint.
+const MAX_GAP: f32 = 3000.0;
+
+/// Viewpoints in the emptiest country, one at a time where the land is
+/// furthest from any landmark, circuit, river or canyon, until none is
+/// further than `MAX_GAP`. Each goes on open ground with a view.
+fn fill_gaps(network: &RoadNetwork, candidates: &[(u32, Vec2)], placed: &mut Vec<Landmark>) {
+    const FIRST: [&str; 12] = ["HIGH", "WINDY", "QUIET", "GOLDEN", "LONELY", "MISTY", "SUNNY", "STONY", "GREEN", "FAR", "OLD", "WILD"];
+    const SECOND: [&str; 8] = ["LOOKOUT", "VIEW", "PROSPECT", "OUTLOOK", "PERCH", "KNOLL", "PANORAMA", "BENCH"];
+    let mut interest: Vec<Vec2> = placed.iter().map(|l| l.pos).collect();
+    interest.extend(network.paths.iter().filter(|p| p.circuit()).flat_map(|p| p.points.iter().step_by(50).copied()));
+    interest.extend(crate::waterways::all().iter().flat_map(|c| c.on_land().iter().step_by(10).copied()));
+    // Land, where nothing to find is near yet: how far from it, and whether
+    // a viewpoint could go there
+    let land: Vec<(u32, Vec2)> = candidates.iter().copied().step_by(3)
+        .filter(|(_, p)| terrain::raw_height(p.x, p.y) > WATER_LEVEL)
+        .collect();
+    let mut gap: Vec<f32> = land.iter().map(|(_, p)| interest.iter().map(|q| q.distance(*p)).fold(f32::MAX, f32::min)).collect();
+    // 2: a rise with a view; 1: open ground at least; 0: no good
+    let site: Vec<u8> = land.iter()
+        .map(|(_, p)| if !open_ground(network, *p, 0.25) { 0 } else if rise(*p, 90.0, 1.0) { 2 } else { 1 })
+        .collect();
+    for n in 0..FIRST.len() * SECOND.len() {
+        // The emptiest land, and the best site for a viewpoint near it
+        let Some(worst) = (0..land.len()).max_by(|&a, &b| gap[a].total_cmp(&gap[b])) else { break };
+        if gap[worst] < MAX_GAP {
+            break;
+        }
+        let near = |k: &usize| site[*k] > 0 && land[*k].1.distance(land[worst].1) < MAX_GAP * 0.7;
+        let Some(best) = (0..land.len())
+            .filter(near)
+            .max_by(|&a, &b| (site[a], gap[a] as i32).cmp(&(site[b], gap[b] as i32)))
+        else {
+            // Nowhere to put one here: count this spot as seen to
+            gap[worst] = 0.0;
+            continue;
+        };
+        let (seed, p) = land[best];
+        let name = format!("{} {}", FIRST[n % FIRST.len()], SECOND[(n / FIRST.len() + n) % SECOND.len()]);
+        placed.push(Landmark { kind: Kind::Viewpoint, pos: p, name, seed });
+        for (k, (_, q)) in land.iter().enumerate() {
+            gap[k] = gap[k].min(q.distance(p));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dev aid: where each landmark of a kind is, and where its trail starts
+    /// (STUMBLER_KIND=Summit by default), to look at them with STUMBLER_AT.
+    #[test]
+    #[ignore]
+    fn landmark_spots() {
+        let net = crate::sim_tests::network();
+        let kind = std::env::var("STUMBLER_KIND").unwrap_or_else(|_| "Summit".into());
+        for l in all().iter().filter(|l| format!("{:?}", l.kind) == kind) {
+            let trail = net.paths.iter().filter(|p| p.kind == crate::road::PathKind::Trail)
+                .find(|t| t.points.last().unwrap().distance(l.pos) < 60.0);
+            let height = terrain::raw_height(l.pos.x, l.pos.y);
+            match trail {
+                Some(t) => {
+                    let climb = t.heights.last().unwrap() - t.heights[0];
+                    let steepest = t.heights.windows(2).map(|w| (w[1] - w[0]).abs() / road::SAMPLE_SPACING).fold(0.0, f32::max);
+                    println!("{} at {:.0},{:.0} height {height:.0}: trail from {:.0},{:.0}, {:.0} long, climbs {climb:.0}, steepest {:.0}%",
+                        l.name, l.pos.x, l.pos.y, t.points[0].x, t.points[0].y, t.points.len() as f32 * road::SAMPLE_SPACING, steepest * 100.0);
+                }
+                None => println!("{} at {:.0},{:.0} height {height:.0}: no trail", l.name, l.pos.x, l.pos.y),
+            }
+        }
+    }
 }
