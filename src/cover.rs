@@ -417,7 +417,7 @@ fn place(c: &mut Cover, x: f32, z: f32, seed: f32, roll: f32, landmarks: &[&land
         }
     }
     let p = Vec2::new(x, z);
-    if crate::venue::occupied(p, 1.0) {
+    if crate::venue::occupied(p, 1.0) || crate::towns::occupied(p, 1.0) {
         return;
     }
     if landmarks.iter().any(|l| l.pos.distance(p) < if l.kind == Kind::Village { 140.0 } else { 30.0 }) {

@@ -443,7 +443,7 @@ pub fn generate_trees(x0: f32, z0: f32, x1: f32, z1: f32) -> Trees {
             let seed = hash(x * 0.71, z * 1.33) * 100.0;
 
             let raw = terrain::raw_height(x, z);
-            if raw < WATER_LEVEL + 1.0 || is_near_road(x, z) || crate::farms::occupied(Vec2::new(x, z), 6.0) || crate::venue::occupied(Vec2::new(x, z), 6.0) {
+            if raw < WATER_LEVEL + 1.0 || is_near_road(x, z) || crate::farms::occupied(Vec2::new(x, z), 6.0) || crate::venue::occupied(Vec2::new(x, z), 6.0) || crate::towns::occupied(Vec2::new(x, z), 6.0) {
                 continue;
             }
             // Not on cliffs
@@ -494,6 +494,7 @@ pub fn generate_trees(x0: f32, z0: f32, x1: f32, z1: f32) -> Trees {
     }
 
     hedgerows(&mut near, &mut far, &mut trunks, Vec2::new(x0, z0), Vec2::new(x1, z1));
+    town_trees(&mut near, &mut far, &mut trunks, Vec2::new(x0, z0), Vec2::new(x1, z1));
     Trees { near: (near.verts, near.idxs), far: (far.verts, far.idxs), trunks }
 }
 
@@ -527,6 +528,23 @@ fn hedgerows(near: &mut Plants, far: &mut Plants, trunks: &mut Vec<[f32; 2]>, lo
                     bush(far, at, size, leaves, seed);
                 }
             }
+        }
+    }
+}
+
+/// The trees shading each town square whose trunks fall in [lo, hi).
+fn town_trees(near: &mut Plants, far: &mut Plants, trunks: &mut Vec<[f32; 2]>, lo: Vec2, hi: Vec2) {
+    for town in crate::towns::all() {
+        for p in town.trees() {
+            if p.x < lo.x || p.y < lo.y || p.x >= hi.x || p.y >= hi.y {
+                continue;
+            }
+            let seed = hash(p.x * 0.31, p.y * 0.77) * 100.0;
+            let at = vec3(p.x, terrain::settled(p.x, p.y), p.y);
+            let size = 0.6 + 0.15 * hash(seed, 5.0);
+            broadleaf(near, at, 16.0 * size, LEAF, seed);
+            broadleaf(far, at, 16.0 * size, LEAF, seed);
+            trunks.push([p.x, p.y]);
         }
     }
 }

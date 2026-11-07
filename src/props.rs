@@ -327,6 +327,8 @@ pub fn generate_props(lo: Vec2, hi: Vec2) -> Props {
         crate::trackside::build(&mut b, network, &inside);
         source!("farms");
         crate::farms::build(&mut b, &inside);
+        source!("towns");
+        crate::towns::build(&mut b, &inside);
         source!("railway");
         crate::railway::build_props(&mut b, &inside);
         source!("structures");
@@ -384,7 +386,7 @@ fn boulders(b: &mut Builder, lo: Vec2, hi: Vec2) {
             if hash(x * 1.3, z * 0.7) > rocky {
                 continue;
             }
-            if terrain::raw_height(x, z) < WATER_LEVEL + 0.5 || crate::farms::occupied(p, 8.0) || crate::venue::occupied(p, 4.0) {
+            if terrain::raw_height(x, z) < WATER_LEVEL + 0.5 || crate::farms::occupied(p, 8.0) || crate::venue::occupied(p, 4.0) || crate::towns::occupied(p, 8.0) {
                 continue;
             }
             if road::network().and_then(|n| n.nearest(x, z)).is_some_and(|s| s.dist < s.half_width() + 12.0) {

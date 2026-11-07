@@ -23,6 +23,8 @@ const RAIL_COLOR: [f32; 4] = [0.6, 0.56, 0.66, 0.9];
 /// The train on the maps.
 const TRAIN_COLOR: [f32; 4] = [0.95, 0.75, 0.55, 1.0];
 /// Rivers and canyons on the maps (and the wild places count).
+/// Towns on the maps, and their row in the free-roam panel.
+const TOWN_COLOR: [f32; 4] = [1.0, 0.72, 0.45, 1.0];
 const RIVER_COLOR: [f32; 4] = [0.35, 0.62, 1.0, 0.95];
 const CANYON_COLOR: [f32; 4] = [0.85, 0.45, 0.3, 0.95];
 /// Minimap side length, in HUD pixel units.
@@ -524,6 +526,7 @@ impl Stage {
         let found = self.progress.landmarks.len();
         let (secrets, places): (Vec<_>, Vec<_>) = landmarks::all().iter().partition(|l| l.kind.is_secret());
         let seen = |list: &[&landmarks::Landmark]| list.iter().filter(|l| self.progress.landmarks.contains(&l.name)).count();
+        let towns = crate::towns::all();
         let venues = |stage: bool| self.world.circuits.iter().filter(|c| c.stage == stage).count();
         let found_venues = |stage: bool| self.world.circuits.iter().filter(|c| c.stage == stage && self.progress.circuits.contains(c.name)).count();
         let rows = [
@@ -531,7 +534,8 @@ impl Stage {
             (format!("STAGES {}/{}", found_venues(true), venues(true)), hud::WHITE),
             (format!("LANDMARKS {}/{}", seen(&places), places.len()), hud::DIM),
             (format!("SECRETS {}/{}", seen(&secrets), secrets.len()), hud::GOLD),
-            (format!("WILD PLACES {}/{}", self.progress.places.len(), waterways::all().len()), RIVER_COLOR),
+            (format!("TOWNS {}/{}", towns.iter().filter(|t| self.progress.places.contains(&t.name)).count(), towns.len()), TOWN_COLOR),
+            (format!("WILD PLACES {}/{}", waterways::all().iter().filter(|c| self.progress.places.contains(c.name)).count(), waterways::all().len()), RIVER_COLOR),
             (format!("PAINTS {}/{}", crate::unlocked_paints(found), crate::car::CAR_COLORS.len()), hud::DIM),
             (format!("ORBS {orbs}/{total_orbs}"), hud::YELLOW),
         ];
@@ -680,6 +684,9 @@ impl Stage {
         for l in landmarks::all().iter().filter(|l| self.progress.landmarks.contains(&l.name)) {
             dot(h, l.pos, px * 1.2, if l.kind.is_secret() { hud::GOLD } else { [0.4, 0.9, 1.0, 1.0] });
         }
+        for t in crate::towns::all() {
+            dot(h, t.centre, px * 1.8, if self.progress.places.contains(&t.name) { TOWN_COLOR } else { [0.6, 0.6, 0.65, 0.8] });
+        }
         for item in self.collectibles.iter().filter(|c| !c.collected) {
             if Vec2::new(item.x, item.z).distance(view.focus) < 700.0 {
                 dot(h, Vec2::new(item.x, item.z), px * 0.8, hud::YELLOW);
@@ -773,6 +780,18 @@ impl Stage {
                 h.text(label.x, label.y - px * 3.5, label_px, Align::Center, c.name, text_color);
             } else {
                 h.text(label.x, label.y - px * 3.5, label_px, Align::Center, "?", [0.75, 0.75, 0.8, 1.0]);
+            }
+        }
+        // Towns: a block for each, named once you've been through
+        for t in crate::towns::all() {
+            let q = view.project(t.centre);
+            if !inside(q, lo, hi) {
+                continue;
+            }
+            let known = self.progress.places.contains(&t.name);
+            h.rect(q.x - px * 2.0, q.y - px * 2.0, px * 4.0, px * 4.0, if known { TOWN_COLOR } else { [0.6, 0.6, 0.65, 0.8] });
+            if known {
+                h.text(q.x, q.y + px * 3.0, label_px, Align::Center, &t.name, TOWN_COLOR);
             }
         }
         // Names of rivers and canyons found, and (zoomed in) landmarks found

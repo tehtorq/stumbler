@@ -58,6 +58,7 @@ mod weather;
 mod trackside;
 mod trails;
 mod tracks;
+mod towns;
 mod trees;
 mod wildlife;
 mod world;
@@ -375,7 +376,8 @@ impl Stage {
         let traffic_count = cars.len();
 
         // Start at the home circuit's line (STUMBLER_START=<circuit name> picks another,
-        // and STUMBLER_START=<landmark name> starts near the end of its trail)
+        // STUMBLER_START=<landmark name> near the end of its trail, and
+        // STUMBLER_START=<town name> at the end of its main street)
         let start_name = std::env::var("STUMBLER_START").ok();
         let start_circuit = start_name.as_ref()
             .and_then(|name| world.circuits.iter().position(|c| c.name.eq_ignore_ascii_case(name)))
@@ -407,6 +409,7 @@ impl Stage {
         let (pos, yaw) = at
             .or(by_train)
             .or_else(|| start_name.as_deref().and_then(trail_start))
+            .or_else(|| start_name.as_deref().and_then(towns::street_start))
             .unwrap_or_else(|| match world.circuits[start_circuit].stage {
                 true => track.pose(world.circuits[start_circuit].start_idx - 12, -6.0),
                 false => track.pose(track.len() - 12, -10.0),
@@ -1125,6 +1128,11 @@ impl Stage {
                 found = Some(format!("DISCOVERED {name}"));
             }
         }
+        if let Some(town) = towns::at(p) {
+            if self.progress.places.insert(town.name.clone()) {
+                found = Some(format!("WELCOME TO {}", town.name));
+            }
+        }
         let mut secret = false;
         for l in landmarks::all() {
             if !self.progress.landmarks.contains(&l.name) && l.pos.distance(p) < landmarks::DISCOVER_RADIUS {
@@ -1255,8 +1263,19 @@ impl Stage {
             .filter(|t| Vec2::new(t[0], t[1]).distance_squared(me) < 30.0 * 30.0)
             .count();
         let forest = (trees as f32 / 20.0).min(1.0);
+        // Down a town's main street the shop fronts ring, and slap the
+        // engine straight back off the nearer row
+        let street = towns::street_walls(me);
+        if let Some(wall) = street {
+            let delay = 2.0 * wall / SPEED_OF_SOUND;
+            let back = 0.22 * (1.0 - wall / 60.0).max(0.3);
+            if back > echo && delay <= audio::ECHO_LONGEST {
+                (echo, echo_delay) = (back, delay);
+            }
+        }
+        let street = if street.is_some() { 1.0 } else { 0.0 };
         // Whichever kind of space rings most says how long it rings
-        let (wet, decay) = [(stands * 0.35, 0.75), (valley * 0.3, 0.5 + 0.35 * valley), (forest * 0.16, 0.3)]
+        let (wet, decay) = [(stands * 0.35, 0.75), (valley * 0.3, 0.5 + 0.35 * valley), (forest * 0.16, 0.3), (street * 0.24, 0.45)]
             .into_iter()
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .unwrap_or((0.0, 0.0));

@@ -162,7 +162,7 @@ fn pole_at(network: &RoadNetwork, road: &RoadPath, r: usize, i: usize) -> Option
     let t = road.tangent(i);
     let side = Vec2::new(-t.y, t.x) * if hash(r as f32, 3.1) < 0.5 { 1.0 } else { -1.0 };
     let p = c + side * POLE_OFFSET;
-    if terrain::raw_height(p.x, p.y) < WATER_LEVEL + 0.5 {
+    if terrain::raw_height(p.x, p.y) < WATER_LEVEL + 0.5 || crate::towns::occupied(p, 30.0) {
         return None;
     }
     let near = |kind: PathKind, gap: f32| network.nearest_matching(p.x, p.y, |k| k == kind).is_some_and(|s| s.dist < gap);

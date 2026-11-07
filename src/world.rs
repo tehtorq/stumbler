@@ -169,6 +169,7 @@ pub fn build_network(layout: layout::Layout, known: Option<Routes>) -> RoadNetwo
     }
     network.add_trails(&routes.trails, terrain::natural_height);
     landmarks::install(routes.sites, &network);
+    crate::towns::install(&network);
     farms::install(&network);
     roadside::install(&names, &network);
     railway::install(&network);

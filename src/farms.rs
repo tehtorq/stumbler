@@ -226,6 +226,7 @@ fn suitable(farm: &Farm, network: &RoadNetwork, circuit_points: &[Vec2]) -> bool
     hi - lo < 40.0
         && circuit_points.iter().all(|c| c.distance(farm.yard) > 450.0)
         && landmarks::all().iter().all(|l| l.pos.distance(farm.yard) > 500.0)
+        && crate::towns::all().iter().all(|t| t.centre.distance(farm.yard) > 700.0 && t.centre.distance(farm.gate) > 600.0)
         && landmarks::cairns().iter().all(|c| c.distance(farm.yard) > 300.0)
 }
 
