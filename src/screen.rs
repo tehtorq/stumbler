@@ -8,7 +8,7 @@ use crate::hud::{self, Align, HudBuilder, MapView};
 use crate::physics::{CarPhysics, Ground, WorldGround};
 use crate::race::{self, Phase};
 use crate::terrain::solid_height;
-use crate::{birds, collectibles, landmarks, lights, railway, spectators, waterways, Stage, KMH_PER_UNIT};
+use crate::{birds, collectibles, landmarks, lights, railway, waterways, Stage, KMH_PER_UNIT};
 
 /// Cars beyond this aren't drawn.
 const CAR_DRAW_DISTANCE: f32 = 900.0;
@@ -117,6 +117,10 @@ impl Stage {
         let overcast = clear.dot(Vec3::splat(1.0 / 3.0)) * vec3(0.92, 0.95, 1.0) * 0.85;
         let fog_color = clear.lerp(overcast, rain);
         let fog_density = (1.0 + 1.2 * rain) / 1500.0;
+        // The sun's map is centred ahead of the camera, where the eye goes
+        let ahead = vec3(self.camera.target.x - self.camera.pos.x, 0.0, self.camera.target.z - self.camera.pos.z).normalize_or_zero();
+        let shadow_focus = self.camera.pos + ahead * gpu::SHADOW_REACH * 0.7;
+        let shadow_view_proj = shadow_matrix(sun_dir, shadow_focus);
         let globals = gpu::Globals {
             view_proj,
             inv_view_proj: view_proj.inverse(),
@@ -130,13 +134,13 @@ impl Stage {
             lights: light_uniforms.data,
             fog: [fog_color.x, fog_color.y, fog_color.z, fog_density],
             screen: [width, height, rain, self.weather.wet],
+            shadow_view_proj,
+            crowd: [self.player.pos.x, self.player.pos.z, self.excitement(), 0.0],
         };
 
         // --- Per-frame meshes ---
         let (v, i) = collectibles::build_collectible_mesh(&self.collectibles, self.camera.pos, time);
         self.collectible_mesh.update(&self.gpu, &v, &i);
-        let (v, i) = spectators::build_spectator_mesh(&self.spectators, self.camera.pos, CAR_DRAW_DISTANCE, time);
-        self.spectator_mesh.update(&self.gpu, &v, &i);
         let (v, i) = birds::build_bird_mesh(&self.flocks, time);
         self.bird_mesh.update(&self.gpu, &v, &i);
         let (v, i) = self.wildlife.build_mesh(self.camera.pos);
@@ -172,14 +176,28 @@ impl Stage {
         draws.extend(chunk_draws.foliage.iter().map(|&mesh| Draw::foliage(mesh)));
         draws.extend(chunk_draws.cover.iter().map(|&mesh| Draw::cover(mesh)));
         draws.extend(chunk_draws.glow.iter().map(|&mesh| Draw::glow(mesh)));
+        draws.extend(chunk_draws.crowd.iter().map(|&mesh| Draw::crowd(mesh)));
+        draws.extend(chunk_draws.flags.iter().map(|&mesh| Draw::flags(mesh)));
         draws.extend([
             Draw::mesh(&self.world.gate_mesh, identity),
             Draw::mesh(&self.world.boost_mesh, identity),
             Draw::mesh(self.collectible_mesh.mesh(), identity),
-            Draw::mesh(self.spectator_mesh.mesh(), identity),
             Draw::mesh(self.bird_mesh.mesh(), identity),
             Draw::mesh(self.wildlife_mesh.mesh(), identity),
         ]);
+
+        // The circuit being raced, or else the nearest within reach
+        let venue = self.race.as_ref().map(|r| r.circuit).or_else(|| {
+            self.world.circuits.iter().enumerate().filter(|(_, c)| !c.stage)
+                .map(|(i, c)| (i, c.centre.distance(Vec2::new(self.player.pos.x, self.player.pos.z))))
+                .filter(|&(_, d)| d < 2200.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        }).map(|i| {
+            let c = self.world.circuits[i].centre;
+            vec3(c.x, terrain_height_at(c), c.y)
+        });
+        self.raceday.draws(&mut draws, self.camera.pos, venue, self.race.is_some(), time);
 
         let all_cars = std::iter::once((&self.player, &self.body_mesh, self.braking))
             .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()], c.last_input.brake > 0.1 && c.physics.speed > 1.0)));
@@ -187,7 +205,12 @@ impl Stage {
             if car.pos.distance_squared(self.camera.pos) > CAR_DRAW_DISTANCE * CAR_DRAW_DISTANCE {
                 continue;
             }
-            draws.push(Draw::mesh(&self.shadow_mesh, shadow_transform(car)));
+            // The sun casts its own shadow where its map reaches; the blob
+            // stands in at night and further off
+            let sun_casts = sun_dir.y > 0.02 && car.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 0.9).powi(2);
+            if !sun_casts {
+                draws.push(Draw::mesh(&self.shadow_mesh, shadow_transform(car)));
+            }
             draws.push(Draw::mesh(body, car.body_transform()));
             if braking {
                 draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::mesh(&self.brake_light_mesh, car.body_transform()) });
@@ -272,7 +295,32 @@ impl Stage {
         draws.push(Draw::new(PipelineKind::Hud, self.map_mesh.mesh(), identity));
         draws.push(Draw::new(PipelineKind::Hud, self.hud_mesh.mesh(), identity));
 
-        self.gpu.render(&globals, &draws);
+        // With the sun down there's nothing to cast
+        let mut casters: Vec<Draw> = Vec::new();
+        if sun_dir.y > 0.02 {
+            let focus = Vec2::new(shadow_focus.x, shadow_focus.z);
+            casters.extend(self.chunks.casters(focus, shadow_view_proj).into_iter().map(|mesh| Draw::mesh(mesh, identity)));
+            let cars = std::iter::once((&self.player, &self.body_mesh))
+                .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()])));
+            for (car, body) in cars.filter(|(car, _)| car.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 1.4).powi(2)) {
+                casters.push(Draw::mesh(body, car.body_transform()));
+                casters.extend((0..4).map(|wheel| Draw::mesh(&self.wheel_mesh, car.wheel_transform(wheel))));
+            }
+        }
+        self.gpu.render(&globals, &casters, &draws);
+    }
+
+    /// How worked up the crowds are, 0..1.
+    pub(crate) fn excitement(&self) -> f32 {
+        match &self.race {
+            Some(race) => match race.phase {
+                Phase::Countdown { .. } => 0.7,
+                Phase::Racing if race.clock < 6.0 => 1.0,
+                Phase::Racing => 0.45,
+                Phase::Finished { .. } => 1.0,
+            },
+            None => 0.2,
+        }
     }
 
     /// The HUD, and what's drawn beneath it (the maps' picture of the island).
@@ -894,4 +942,20 @@ fn horizon_color(sun_elev: f32) -> Vec3 {
     let noon = vec3(0.72, 0.82, 0.92);
     let dusk = vec3(0.95, 0.55, 0.3);
     night.lerp(noon, day).lerp(dusk, sunset)
+}
+
+/// World to the sun's shadow map around `focus`. It moves in whole texels, so
+/// shadow edges stay put as the camera goes by rather than crawling.
+fn shadow_matrix(sun_dir: Vec3, focus: Vec3) -> Mat4 {
+    let up = if sun_dir.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+    let view = Mat4::look_to_lh(Vec3::ZERO, -sun_dir, up);
+    let at = view.transform_point3(focus);
+    let texel = gpu::SHADOW_REACH * 2.0 / 2048.0;
+    let (x, y) = ((at.x / texel).round() * texel, (at.y / texel).round() * texel);
+    let r = gpu::SHADOW_REACH;
+    Mat4::orthographic_lh(x - r, x + r, y - r, y + r, at.z - gpu::SHADOW_DEPTH, at.z + gpu::SHADOW_DEPTH) * view
+}
+
+fn terrain_height_at(p: Vec2) -> f32 {
+    crate::terrain::terrain_height(p.x, p.y)
 }

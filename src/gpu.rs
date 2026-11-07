@@ -17,6 +17,12 @@ use crate::geometry::Vertex;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SAMPLE_COUNT: u32 = 4;
+/// Texels a side of the sun's shadow map.
+const SHADOW_SIZE: u32 = 2048;
+/// World units from the map's middle to its edge. Must fit `shadow.wgsl`'s texel size.
+pub const SHADOW_REACH: f32 = 420.0;
+/// How far toward and away from the sun the map holds casters.
+pub const SHADOW_DEPTH: f32 = 1400.0;
 const CLEAR_COLOR: wgpu::Color = wgpu::Color { r: 0.7, g: 0.9, b: 1.0, a: 1.0 };
 
 /// Per-frame uniforms. Must match `Globals` in shaders/common.wgsl.
@@ -38,6 +44,10 @@ pub struct Globals {
     pub fog: [f32; 4],
     /// xy = framebuffer size in pixels, z = rain, w = road wetness
     pub screen: [f32; 4],
+    /// World to the sun's shadow map.
+    pub shadow_view_proj: Mat4,
+    /// xy = the car they're cheering, z = excitement 0..1, w = spare
+    pub crowd: [f32; 4],
 }
 
 /// Times the main render pass on the GPU (profiling only). Results are read
@@ -259,6 +269,10 @@ pub enum MeshKind {
     /// Smoke, dust, steam and fireflies: their own colour, dimmed at night;
     /// any channel above 1 marks a light (fireflies) shown at full strength.
     Particle = 5,
+    /// People: vertex alpha holds their rhythm (see `props::Layer`).
+    Crowd = 6,
+    /// Cloth: vertex alpha is how free it is to flap.
+    Flag = 7,
 }
 
 impl<'a> Draw<'a> {
@@ -280,6 +294,14 @@ impl<'a> Draw<'a> {
 
     pub fn glow(mesh: &'a Mesh) -> Self {
         Self { kind: MeshKind::Glow, ..Self::mesh(mesh, Mat4::IDENTITY) }
+    }
+
+    pub fn crowd(mesh: &'a Mesh) -> Self {
+        Self { kind: MeshKind::Crowd, ..Self::mesh(mesh, Mat4::IDENTITY) }
+    }
+
+    pub fn flags(mesh: &'a Mesh) -> Self {
+        Self { kind: MeshKind::Flag, ..Self::mesh(mesh, Mat4::IDENTITY) }
     }
 
     pub fn water(mesh: &'a Mesh) -> Self {
@@ -327,6 +349,9 @@ pub struct Gpu {
     object_capacity: u64,
     object_stride: u64,
 
+    shadow_view: wgpu::TextureView,
+    shadow_globals: wgpu::BindGroup,
+    caster_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
@@ -406,7 +431,48 @@ impl Gpu {
         // --- Group 0: globals ---
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals layout"),
+            entries: &[
+                uniform_entry(0, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let shadow_globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow globals layout"),
             entries: &[uniform_entry(0, false)],
+        });
+        let shadow_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow map"),
+                size: wgpu::Extent3d { width: SHADOW_SIZE, height: SHADOW_SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
         });
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -417,6 +483,15 @@ impl Gpu {
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &globals_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&shadow_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&shadow_sampler) },
+            ],
+        });
+        let shadow_globals = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow globals"),
+            layout: &shadow_globals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
         });
 
@@ -438,8 +513,10 @@ impl Gpu {
                 source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("shaders/common.wgsl"), src).into()),
             })
         };
-        let mesh_shader = shader("mesh", include_str!("shaders/mesh.wgsl"));
-        let terrain_shader = shader("terrain", include_str!("shaders/terrain.wgsl"));
+        let lit = |src: &str| format!("{}\n{src}", include_str!("shaders/shadow.wgsl"));
+        let mesh_shader = shader("mesh", &lit(include_str!("shaders/mesh.wgsl")));
+        let terrain_shader = shader("terrain", &lit(include_str!("shaders/terrain.wgsl")));
+        let caster_shader = shader("caster", include_str!("shaders/caster.wgsl"));
         let sky_shader = shader("sky", include_str!("shaders/sky.wgsl"));
         let hud_shader = shader("hud", include_str!("shaders/hud.wgsl"));
 
@@ -452,6 +529,31 @@ impl Gpu {
         };
         let mesh_layout = layout("mesh", &[Some(&globals_layout), Some(&object_layout)]);
         let globals_only = layout("globals only", &[Some(&globals_layout)]);
+
+        // The casters' pass can't have the map it's drawing bound as well
+        let caster_layout = layout("caster", &[Some(&shadow_globals_layout), Some(&object_layout)]);
+        let caster_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("caster"),
+            layout: Some(&caster_layout),
+            vertex: wgpu::VertexState {
+                module: &caster_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vertex_layout())],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState { constant: 4, slope_scale: 2.5, clamp: 0.0 },
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
 
         let builder = PipelineBuilder { device: &device, format: config.format };
         let sky_pipeline = builder.build(PipelineDesc {
@@ -519,6 +621,9 @@ impl Gpu {
             object_bind_group,
             object_capacity,
             object_stride,
+            shadow_view,
+            shadow_globals,
+            caster_pipeline,
             sky_pipeline,
             terrain_pipeline,
             mesh_pipeline,
@@ -560,7 +665,8 @@ impl Gpu {
     }
 
     /// Render one frame: sky, then `draws` in order.
-    pub fn render(&mut self, globals: &Globals, draws: &[Draw]) {
+    /// `casters` are drawn into the sun's shadow map first.
+    pub fn render(&mut self, globals: &Globals, casters: &[Draw], draws: &[Draw]) {
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             // Still presentable: draw it, then reconfigure once it's out
@@ -575,13 +681,14 @@ impl Gpu {
 
         // Upload per-frame and per-object uniforms
         self.context.queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(globals));
-        if draws.len() as u64 > self.object_capacity {
-            self.object_capacity = (draws.len() as u64).next_power_of_two();
+        let objects_needed = (draws.len() + casters.len()) as u64;
+        if objects_needed > self.object_capacity {
+            self.object_capacity = objects_needed.next_power_of_two();
             (self.object_buffer, self.object_bind_group) =
                 create_object_buffer(&self.context.device, &self.object_layout, self.object_stride, self.object_capacity);
         }
-        let mut objects = vec![0u8; draws.len() * self.object_stride as usize];
-        for (i, draw) in draws.iter().enumerate() {
+        let mut objects = vec![0u8; objects_needed as usize * self.object_stride as usize];
+        for (i, draw) in draws.iter().chain(casters).enumerate() {
             let offset = i * self.object_stride as usize;
             let object = ObjectUniform { model: draw.model, params: [draw.kind as u32 as f32, 0.0, 0.0, 0.0] };
             let size = std::mem::size_of::<ObjectUniform>();
@@ -592,6 +699,32 @@ impl Gpu {
         }
 
         let mut encoder = self.context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.caster_pipeline);
+            pass.set_bind_group(0, &self.shadow_globals, &[]);
+            for (i, draw) in casters.iter().enumerate() {
+                if draw.mesh.index_count == 0 {
+                    continue;
+                }
+                let offset = ((draws.len() + i) as u64 * self.object_stride) as u32;
+                pass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                pass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.mesh.index_buffer.slice(..), draw.mesh.index_format);
+                pass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
@@ -817,6 +950,15 @@ fn alpha_blend() -> wgpu::BlendState {
     }
 }
 
+fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRIBUTES,
+    }
+}
+
 struct PipelineDesc<'a> {
     label: &'a str,
     layout: &'a wgpu::PipelineLayout,
@@ -835,12 +977,7 @@ struct PipelineBuilder<'a> {
 
 impl PipelineBuilder<'_> {
     fn build(&self, desc: PipelineDesc) -> wgpu::RenderPipeline {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
-        let vertex_layout = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &ATTRIBUTES,
-        })];
+        let vertex_layout = [Some(vertex_layout())];
         self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(desc.label),
             layout: Some(desc.layout),

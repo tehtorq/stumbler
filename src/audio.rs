@@ -23,6 +23,8 @@ pub struct AudioParams {
     /// How hard it's raining, and how wet the road is.
     rain: AtomicU32,
     wet: AtomicU32,
+    /// How loud the crowd around you is, 0..1.
+    crowd: AtomicU32,
 }
 
 impl AudioParams {
@@ -41,7 +43,12 @@ impl AudioParams {
             other_pitch: AtomicU32::new(1.0_f32.to_bits()),
             rain: AtomicU32::new(0),
             wet: AtomicU32::new(0),
+            crowd: AtomicU32::new(0),
         }
+    }
+
+    pub fn set_crowd(&self, level: f32) {
+        self.crowd.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_rain(&self, rain: f32, wet: f32) {
@@ -165,6 +172,11 @@ struct EngineSource {
     other_lp: f32,
     rain_lp: f32,
     swish_lp: f32,
+    /// The crowd: a band of voices, their level easing toward what's set,
+    /// and a slow swell through it.
+    crowd_lp: [f32; 2],
+    crowd_level: f32,
+    crowd_time: f32,
     // Noise sources (offset for variety)
     noise_states: [u32; 5],
 }
@@ -186,6 +198,9 @@ impl EngineSource {
             other_phase: 0.0,
             other_lp: 0.0,
             rain_lp: 0.0,
+            crowd_lp: [0.0; 2],
+            crowd_level: 0.0,
+            crowd_time: 0.0,
             swish_lp: 0.0,
             noise_states: [12345, 67890, 24680, 13579, 97531],
         }
@@ -324,6 +339,21 @@ impl Iterator for EngineSource {
             0.0
         };
 
+        // ── The crowd: a roar of voices, swelling and ebbing ──
+        let crowd_target = self.params.get(&self.params.crowd);
+        self.crowd_level += (crowd_target - self.crowd_level) * (dt / 0.6).min(1.0);
+        let crowd = if self.crowd_level > 0.005 {
+            self.crowd_time += dt;
+            let n = self.noise_n(3);
+            self.crowd_lp[0] += 0.3 * (n - self.crowd_lp[0]);
+            self.crowd_lp[1] += 0.05 * (self.crowd_lp[0] - self.crowd_lp[1]);
+            let t = self.crowd_time;
+            let swell = 0.7 + 0.2 * (t * 0.55).sin() + 0.1 * (t * 1.9 + 1.3).sin();
+            (self.crowd_lp[0] - self.crowd_lp[1]) * 0.16 * self.crowd_level * swell
+        } else {
+            0.0
+        };
+
         // ── Kerbs and rough ground: a low buzz ──
         self.rumble_phase += (38.0 + speed.abs() * 0.15) * dt;
         if self.rumble_phase > 1.0 { self.rumble_phase -= 1.0; }
@@ -368,7 +398,7 @@ impl Iterator for EngineSource {
             (t * 1047.0 * std::f32::consts::TAU).sin() * 0.2 * env // C6 = 1047 Hz
         } else { 0.0 };
 
-        Some((engine + other + squeal + gravel + wind + rain_sound + buzz + thud + chime + pickup).clamp(-0.8, 0.8))
+        Some((engine + other + squeal + gravel + wind + rain_sound + crowd + buzz + thud + chime + pickup).clamp(-0.8, 0.8))
     }
 }
 

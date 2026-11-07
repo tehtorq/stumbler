@@ -51,6 +51,6 @@ impl LoadingScreen {
             screen: [width, height, 0.0, 0.0],
             ..bytemuck::Zeroable::zeroed()
         };
-        gpu.render(&globals, &[Draw::new(PipelineKind::Hud, self.mesh.mesh(), Mat4::IDENTITY)]);
+        gpu.render(&globals, &[], &[Draw::new(PipelineKind::Hud, self.mesh.mesh(), Mat4::IDENTITY)]);
     }
 }

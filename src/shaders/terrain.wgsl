@@ -19,7 +19,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let albedo = in.color.rgb;
     let normal = flat_normal(in.world_pos);
-    var lit = sun_lighting(albedo, normal);
+    var lit = sun_lighting(albedo, normal, sun_reaches(in.world_pos, normal));
 
     // Dynamic lights (headlights)
     lit += eval_lights(in.world_pos, normal, albedo);

@@ -300,7 +300,7 @@ fn fairy_ring(b: &mut Builder, p: Vec2, seed: f32) {
         let a = k as f32 * std::f32::consts::TAU / count as f32 + 0.2 * hash(seed, k as f32);
         let r = 8.0 + 0.8 * hash(k as f32, seed);
         let q = p + Vec2::new(a.cos(), a.sin()) * r;
-        let y = terrain_height(q.x, q.y) - 0.1;
+        let y = terrain::settled(q.x, q.y) - 0.1;
         let size = 0.8 + 0.7 * hash(seed + 2.0, k as f32);
         let base = vec3(q.x, y, q.y);
         b.limb(base, base + Vec3::Y * size * 1.3, size * 0.16, size * 0.12, 6, 0.0, [0.9, 0.88, 0.8, 1.0]);
@@ -309,7 +309,7 @@ fn fairy_ring(b: &mut Builder, p: Vec2, seed: f32) {
         b.cone(base + Vec3::Y * size * 1.2, size * 0.6, size * 0.55, 7, cap);
         b.glowing = false;
     }
-    let y = terrain_height(p.x, p.y);
+    let y = terrain::settled(p.x, p.y);
     b.boulder(vec3(p.x, y + 0.4, p.y), 1.4, seed, STONE);
     b.blob(vec3(p.x, y + 1.2, p.y), 0.9, 0.4, MOSS, seed);
     b.glowing = true;
@@ -372,7 +372,7 @@ fn watcher(b: &mut Builder, p: Vec2, seed: f32) {
     }
     // The hand, some way off, fingers curled up out of the sand
     let hand = w(vec3(-26.0, 0.0, 14.0));
-    let hy = terrain_height(hand.x, hand.z) - 1.0;
+    let hy = terrain::settled(hand.x, hand.z) - 1.0;
     let hw = frame(vec3(hand.x, hy, hand.z), yaw + 0.8);
     b.block(hw(Vec3::ZERO), 3.0, 4.5, 1.6, yaw + 0.8, worn, stone);
     for (k, x) in [-2.2, -0.75, 0.75, 2.2].into_iter().enumerate() {
@@ -430,7 +430,7 @@ fn great_oak(b: &mut Builder, p: Vec2, seed: f32) {
     b.block(vec3(hang.x, seat_y - 0.15, hang.z), 1.1, 0.25, 0.45, 0.0, WOOD, WOOD);
     // A bench under the tree, facing the view down the hill
     let bench = base + vec3(-7.0, 0.0, 3.0);
-    let by = terrain_height(bench.x, bench.z);
+    let by = terrain::settled(bench.x, bench.z);
     b.block(vec3(bench.x, by + 1.1, bench.z), 2.6, 0.3, 0.7, 0.4, WOOD, WOOD);
     for s in [-2.0_f32, 2.0] {
         let leg = bench + Quat::from_rotation_y(0.4) * vec3(s, 0.0, 0.0);
@@ -502,7 +502,7 @@ fn shipwreck(b: &mut Builder, p: Vec2, seed: f32) {
     // The mast snapped off, its top lying across the sand with the sail
     b.limb(w(vec3(0.0, 0.5, 2.0)), w(vec3(0.0, 9.0, 2.0)), 0.45, 0.35, 6, 0.0, OLD_WOOD);
     let fallen = o + Quat::from_rotation_y(yaw) * vec3(-9.0, 0.0, 0.0);
-    let fy = terrain_height(fallen.x, fallen.z) + 0.4;
+    let fy = terrain::settled(fallen.x, fallen.z) + 0.4;
     let along = Quat::from_rotation_y(yaw + 0.3) * Vec3::Z;
     let a = vec3(fallen.x, fy, fallen.z) - along * 8.0;
     let c = vec3(fallen.x, fy, fallen.z) + along * 8.0;
@@ -513,7 +513,7 @@ fn shipwreck(b: &mut Builder, p: Vec2, seed: f32) {
     b.tri(c - along * 3.0, c - along * 1.0 + side * 3.0 + Vec3::Y * 0.2, a + along * 5.0 + side * 4.0 + Vec3::Y * 0.3, shade(sail, 0.92));
     // An anchor half buried beside her
     let anchor = o + Quat::from_rotation_y(yaw) * vec3(7.0, 0.0, -6.0);
-    let ay = terrain_height(anchor.x, anchor.z);
+    let ay = terrain::settled(anchor.x, anchor.z);
     let iron: Col = [0.3, 0.22, 0.18, 1.0];
     b.limb(vec3(anchor.x, ay - 0.5, anchor.z), vec3(anchor.x, ay + 3.5, anchor.z) + along * 0.8, 0.25, 0.2, 5, 0.0, iron);
     b.limb(vec3(anchor.x, ay + 3.0, anchor.z) - side * 1.2, vec3(anchor.x, ay + 3.0, anchor.z) + side * 1.2, 0.18, 0.18, 5, 0.0, iron);
@@ -545,8 +545,8 @@ fn hot_spring(b: &mut Builder, p: Vec2, seed: f32) {
             // Mineral rim, ochre crust spilling over the outside
             b.limb(e0 - Vec3::Y * 0.3, e1 - Vec3::Y * 0.3, 0.55, 0.55, 5, 0.0, rim);
             let (q0, q1) = (Vec2::new(c.x + a0.cos() * (r + 2.0), c.y + a0.sin() * (r + 2.0)), Vec2::new(c.x + a1.cos() * (r + 2.0), c.y + a1.sin() * (r + 2.0)));
-            let o0 = vec3(q0.x, terrain_height(q0.x, q0.y) - 0.3, q0.y);
-            let o1 = vec3(q1.x, terrain_height(q1.x, q1.y) - 0.3, q1.y);
+            let o0 = vec3(q0.x, terrain::settled(q0.x, q0.y) - 0.3, q0.y);
+            let o1 = vec3(q1.x, terrain::settled(q1.x, q1.y) - 0.3, q1.y);
             b.quad(e0 + Vec3::Y * 0.1, e1 + Vec3::Y * 0.1, o1, o0, if j % 2 == 0 { crust } else { shade(crust, 0.9) });
         }
     }

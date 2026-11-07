@@ -443,7 +443,7 @@ pub fn generate_trees(x0: f32, z0: f32, x1: f32, z1: f32) -> Trees {
             let seed = hash(x * 0.71, z * 1.33) * 100.0;
 
             let raw = terrain::raw_height(x, z);
-            if raw < WATER_LEVEL + 1.0 || is_near_road(x, z) || crate::farms::occupied(Vec2::new(x, z), 6.0) {
+            if raw < WATER_LEVEL + 1.0 || is_near_road(x, z) || crate::farms::occupied(Vec2::new(x, z), 6.0) || crate::venue::occupied(Vec2::new(x, z), 6.0) {
                 continue;
             }
             // Not on cliffs
@@ -462,7 +462,7 @@ pub fn generate_trees(x0: f32, z0: f32, x1: f32, z1: f32) -> Trees {
             let ground = terrain_height(x, z);
             let Some((species, dry)) = choose(x, z, ground, hash(x * 1.9, z * 0.7)) else { continue };
 
-            let at = vec3(x, ground, z);
+            let at = vec3(x, terrain::settled(x, z), z);
             let size = 0.75 + 0.5 * hash(seed, 0.5);
             let snow = if species == Species::Pine || species == Species::Spruce {
                 (terrain::biome_tundra(x, z) * 1.2 + ((ground - 110.0) / 40.0).clamp(0.0, 1.0)).min(1.0)
@@ -514,7 +514,7 @@ fn hedgerows(near: &mut Plants, far: &mut Plants, trunks: &mut Vec<[f32; 2]>, lo
                     continue;
                 }
                 let seed = hash(p.x * 0.31, p.y * 0.77) * 100.0;
-                let at = vec3(p.x, terrain_height(p.x, p.y), p.y);
+                let at = vec3(p.x, terrain::settled(p.x, p.y), p.y);
                 if hash(seed, 4.0) < 0.035 {
                     let size = 0.8 + 0.4 * hash(seed, 5.0);
                     broadleaf(near, at, 16.0 * size, LEAF, seed);

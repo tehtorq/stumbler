@@ -638,6 +638,32 @@ pub struct TerrainChunk {
     pub max_y: f32,
 }
 
+/// Height of the ground as drawn at (x, z) on the chunk grid of cell `step`:
+/// the triangles, which cut corners `terrain_height` doesn't.
+pub fn mesh_surface(x: f32, z: f32, step: f32) -> f32 {
+    let o = -TERRAIN_HALF_SIZE;
+    let (u, v) = ((x - o) / step, (z - o) / step);
+    let (iu, iv) = (u.floor(), v.floor());
+    let (fu, fv) = (u - iu, v - iv);
+    let at = |du: f32, dv: f32| terrain_mesh_height(o + (iu + du) * step, o + (iv + dv) * step, step);
+    let (tl, tr, bl, br) = (at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0));
+    if cell_flipped(o + iu * step, o + iv * step, step) {
+        // Split top-right to bottom-left
+        if fu + fv <= 1.0 { tl + fu * (tr - tl) + fv * (bl - tl) } else { br + (1.0 - fu) * (bl - br) + (1.0 - fv) * (tr - br) }
+    } else if fu >= fv {
+        tl + fu * (tr - tl) + fv * (br - tr)
+    } else {
+        tl + fv * (bl - tl) + fu * (br - bl)
+    }
+}
+
+/// Where something can stand at (x, z) and be sure of touching the ground:
+/// the lowest of the true surface and the ground as drawn up close and from
+/// further off. Whatever goes on this never hangs in the air.
+pub fn settled(x: f32, z: f32) -> f32 {
+    terrain_height(x, z).min(mesh_surface(x, z, 12.5)).min(mesh_surface(x, z, 25.0))
+}
+
 /// Whether the terrain cell with corner (x, z) on a grid of `step` splits
 /// along its other diagonal (top-right to bottom-left).
 pub fn cell_flipped(x: f32, z: f32, step: f32) -> bool {

@@ -11,7 +11,7 @@ use crate::hud::{glyph, GLYPH_H, GLYPH_W};
 use crate::landmarks;
 use crate::props::{ground, hash, Builder};
 use crate::road::{PathKind, RoadNetwork, RoadPath, SAMPLE_SPACING, TRAIL_HALF_WIDTH};
-use crate::terrain::{self, terrain_height, WATER_LEVEL};
+use crate::terrain::{self, WATER_LEVEL};
 
 const POLE_WOOD: [f32; 4] = [0.36, 0.27, 0.2, 1.0];
 const WIRE: [f32; 4] = [0.12, 0.12, 0.13, 1.0];
@@ -173,7 +173,7 @@ fn pole_at(network: &RoadNetwork, road: &RoadPath, r: usize, i: usize) -> Option
     {
         return None;
     }
-    Some((vec3(p.x, terrain_height(p.x, p.y) - 0.5, p.y), vec3(side.x, 0.0, side.y)))
+    Some((vec3(p.x, terrain::settled(p.x, p.y) - 0.5, p.y), vec3(side.x, 0.0, side.y)))
 }
 
 fn telegraph_pole(b: &mut Builder, base: Vec3, across: Vec3) {

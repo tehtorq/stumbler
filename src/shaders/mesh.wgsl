@@ -22,6 +22,8 @@ const WATER: f32 = 2.0;
 const COVER: f32 = 3.0;
 const GLOW: f32 = 4.0;
 const PARTICLE: f32 = 5.0;
+const CROWD: f32 = 6.0;
+const FLAG: f32 = 7.0;
 /// Ground cover sinks away between these distances from the camera
 /// (the chunk streamer loads it out to COVER_RANGE, a little beyond).
 const COVER_FADE: vec2<f32> = vec2<f32>(560.0, 740.0);
@@ -78,6 +80,37 @@ fn vs_main(in: VertexIn) -> VertexOut {
         world_pos.z += wind * 0.6 * sway_weight;
     }
 
+    // A crowd on its feet: everyone bounces to their own rhythm, harder as
+    // the race heats up and the nearer the car; arms go up on top of that,
+    // and now and then a wave runs round the stand
+    if (is_kind(kind, CROWD)) {
+        let t = globals.wind_time;
+        let arm = in.color.a >= 0.5;
+        let phase = fract(in.color.a * 2.0);
+        let near = 1.0 - smoothstep(30.0, 260.0, distance(world_pos.xz, globals.crowd.xy));
+        let energy = clamp(globals.crowd.z + near * 0.8, 0.12, 1.0);
+        let beat = sin(t * (5.5 + phase * 3.5) + phase * 40.0);
+        var lift = max(beat, 0.0) * 0.55 * energy;
+        let wave = sin((world_pos.x + world_pos.z) * 0.035 - t * 1.6);
+        lift += pow(max(wave, 0.0), 12.0) * 0.9 * globals.crowd.z;
+        world_pos.y += lift;
+        if (arm) {
+            world_pos.y += (0.2 + beat * 0.45) * energy + pow(max(wave, 0.0), 12.0) * 0.5 * globals.crowd.z;
+        }
+        let lean = sin(t * 1.3 + phase * 30.0) * 0.1 * energy;
+        world_pos.x += lean;
+    }
+
+    // Cloth ripples along its length, out toward the free edge
+    if (is_kind(kind, FLAG)) {
+        let t = globals.wind_time;
+        let along = world_pos.x * 0.7 + world_pos.z * 0.7;
+        let flap = sin(t * 7.0 + along * 1.4) * 0.45 + sin(t * 11.0 + along * 2.3) * 0.2;
+        world_pos.x += flap * in.color.a;
+        world_pos.z -= flap * 0.7 * in.color.a;
+        world_pos.y += sin(t * 5.0 + along) * 0.25 * in.color.a;
+    }
+
     // Water swells out in the deep and lies still at the shore
     if (is_kind(kind, WATER)) {
         world_pos.y += wave_height(world_pos.xz, globals.wind_time) * 0.7 * in.color.a;
@@ -85,7 +118,8 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
     var out: VertexOut;
     out.clip = globals.view_proj * world_pos;
-    out.color = vec4<f32>(in.color.rgb, select(in.color.a, 1.0, foliage));
+    let animated = is_kind(kind, CROWD) || is_kind(kind, FLAG);
+    out.color = vec4<f32>(in.color.rgb, select(in.color.a, 1.0, foliage || animated));
     out.world_pos = world_pos.xyz;
     out.kind = kind;
     return out;
@@ -96,7 +130,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn shade_water(in: VertexOut, normal: vec3<f32>) -> vec4<f32> {
     let depth = in.color.a;
     let day = day_factor();
-    var lit = sun_lighting(in.color.rgb, normal);
+    var lit = sun_lighting(in.color.rgb, normal, 1.0);
 
     let to_eye = normalize(globals.cam_pos - in.world_pos);
     let facing = max(dot(normal, to_eye), 0.0);
@@ -130,12 +164,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (is_kind(in.kind, WATER)) {
         return shade_water(in, normal);
     }
-    var lit = sun_lighting(in.color.rgb, normal);
+    let sun = sun_reaches(in.world_pos, normal);
+    var lit = sun_lighting(in.color.rgb, normal, sun);
     if (is_kind(in.kind, FOLIAGE) || is_kind(in.kind, COVER)) {
         // Leaves let some sunlight through, so backlit trees glow a little
         // instead of going black
         let through = max(dot(-normal, globals.sun_dir), 0.0);
-        lit += in.color.rgb * vec3<f32>(0.85, 0.95, 0.55) * (0.15 + 0.35 * through) * day_factor();
+        lit += in.color.rgb * vec3<f32>(0.85, 0.95, 0.55) * (0.15 + 0.35 * through) * day_factor() * (0.5 + 0.5 * sun);
     }
     if (is_kind(in.kind, GLOW)) {
         // A faint inner light by day, shining out after dark, and slowly pulsing

@@ -411,8 +411,15 @@ fn place(c: &mut Cover, x: f32, z: f32, seed: f32, roll: f32, landmarks: &[&land
         if s.dist < s.half_width() + road::KERB_WIDTH + 1.0 {
             return;
         }
+        // The grass inside a circuit's barriers is kept mown
+        if s.kind == road::PathKind::Circuit && s.dist < crate::trackside::BARRIER_OFFSET + 3.0 {
+            return;
+        }
     }
     let p = Vec2::new(x, z);
+    if crate::venue::occupied(p, 1.0) {
+        return;
+    }
     if landmarks.iter().any(|l| l.pos.distance(p) < if l.kind == Kind::Village { 140.0 } else { 30.0 }) {
         return;
     }

@@ -23,6 +23,11 @@ const LOD_RANGE: [f32; 4] = [900.0, 1800.0, 3400.0, f32::MAX];
 pub const DRAW_DISTANCE: f32 = 4200.0;
 /// Trees, roads and props load within this distance.
 const DETAIL_RANGE: f32 = 2600.0;
+/// People and flags are too small to make out beyond this distance.
+const CROWD_DISTANCE: f32 = 900.0;
+/// Scenery built in a chunk may stand this far outside it: stands and pits
+/// are anchored by their middle.
+const VISIBLE_MARGIN: f32 = 110.0;
 /// Grass, flowers and other small plants load within this distance (they
 /// shrink away before the edge; see `COVER_FADE` in the mesh shader).
 const COVER_RANGE: f32 = 750.0;
@@ -91,6 +96,8 @@ struct DetailData {
     foliage_far: Option<(Vec<Vertex>, Vec<u32>)>,
     glow: Option<(Vec<Vertex>, Vec<u32>)>,
     water: Option<(Vec<Vertex>, Vec<u32>)>,
+    crowd: Option<(Vec<Vertex>, Vec<u32>)>,
+    flags: Option<(Vec<Vertex>, Vec<u32>)>,
     tree_positions: Vec<[f32; 2]>,
     solids: Vec<Solid>,
     min_y: f32,
@@ -136,10 +143,12 @@ fn build_detail(c: ChunkCoord) -> DetailData {
     let solids = props.solids;
     meshes.push(props.mesh);
     let glow = (!props.glow.0.is_empty()).then_some(props.glow);
+    let crowd = (!props.crowd.0.is_empty()).then_some(props.crowd);
+    let flags = (!props.flags.0.is_empty()).then_some(props.flags);
     meshes.retain(|(v, _)| !v.is_empty());
 
     let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
-    for (v, _) in meshes.iter().chain(&foliage).chain(&glow) {
+    for (v, _) in meshes.iter().chain(&foliage).chain(&glow).chain(&crowd).chain(&flags) {
         for vert in v {
             min_y = min_y.min(vert.pos[1]);
             max_y = max_y.max(vert.pos[1]);
@@ -152,7 +161,7 @@ fn build_detail(c: ChunkCoord) -> DetailData {
         max_y = max_y.max(WATER_LEVEL + 1.5);
     }
 
-    DetailData { meshes, foliage, foliage_far, glow, water, tree_positions, solids, min_y, max_y }
+    DetailData { meshes, foliage, foliage_far, glow, water, crowd, flags, tree_positions, solids, min_y, max_y }
 }
 
 /// Water surface over the wet cells of the chunk at `lo`, on the finest
@@ -225,6 +234,8 @@ struct DetailEntry {
     foliage_far: Option<Mesh>,
     glow: Option<Mesh>,
     water: Option<Mesh>,
+    crowd: Option<Mesh>,
+    flags: Option<Mesh>,
     tree_positions: Vec<[f32; 2]>,
     solids: Vec<Solid>,
     min_y: f32,
@@ -243,6 +254,9 @@ pub struct ChunkDraws<'a> {
     /// Things that glow after dark.
     pub glow: Vec<&'a Mesh>,
     pub water: Vec<&'a Mesh>,
+    /// People, and flags and bunting, moved by the shaders.
+    pub crowd: Vec<&'a Mesh>,
+    pub flags: Vec<&'a Mesh>,
 }
 
 pub struct ChunkManager {
@@ -339,7 +353,9 @@ impl ChunkManager {
                 let foliage_far = d.foliage_far.as_ref().map(|(v, i)| Mesh::new(gpu, v, i));
                 let glow = d.glow.as_ref().map(|(v, i)| Mesh::new(gpu, v, i));
                 let water = d.water.as_ref().map(|(v, i)| Mesh::new(gpu, v, i));
-                self.detail.insert(c, DetailEntry { meshes, foliage, foliage_far, glow, water, tree_positions: d.tree_positions, solids: d.solids, min_y: d.min_y, max_y: d.max_y });
+                let crowd = d.crowd.as_ref().map(|(v, i)| Mesh::new(gpu, v, i));
+                let flags = d.flags.as_ref().map(|(v, i)| Mesh::new(gpu, v, i));
+                self.detail.insert(c, DetailEntry { meshes, foliage, foliage_far, glow, water, crowd, flags, tree_positions: d.tree_positions, solids: d.solids, min_y: d.min_y, max_y: d.max_y });
             }
             JobResult::Cover(c, tiles) => {
                 self.in_flight.remove(&Job::Cover(c));
@@ -471,11 +487,38 @@ impl ChunkManager {
                         }
                     }
                     out.water.extend(detail.water.iter());
+                    if d < CROWD_DISTANCE {
+                        out.crowd.extend(detail.crowd.iter());
+                        out.flags.extend(detail.flags.iter());
+                    }
                 }
             }
         }
         // Water is see-through: far to near blends best
         out.water.reverse();
+        out
+    }
+
+    /// What casts shadows in the sun's view `light`, around `p`.
+    pub fn casters(&self, p: Vec2, light: Mat4) -> Vec<&Mesh> {
+        let reach = (crate::gpu::SHADOW_REACH * 1.5 / CHUNK_SIZE).ceil() as i32 + 1;
+        let n = chunks_per_side();
+        let here = ChunkCoord::containing(p.x, p.y);
+        let mut out = Vec::new();
+        for z in (here.1 - reach).max(0)..=(here.1 + reach).min(n - 1) {
+            for x in (here.0 - reach).max(0)..=(here.0 + reach).min(n - 1) {
+                let c = ChunkCoord(x, z);
+                // A step coarser than up close: shadows blur the difference
+                let lod = (1..LOD_CELLS.len()).chain([0]).find_map(|lod| self.terrain.get(&(c, lod)));
+                if let Some(t) = lod.filter(|t| visible(light, c, t.min_y, t.max_y)) {
+                    out.push(&t.mesh);
+                }
+                if let Some(d) = self.detail.get(&c).filter(|d| visible(light, c, d.min_y, d.max_y)) {
+                    out.extend(d.meshes.iter());
+                    out.extend(d.foliage_far.iter().chain(&d.foliage).take(1));
+                }
+            }
+        }
         out
     }
 
@@ -498,7 +541,7 @@ impl ChunkManager {
 
 /// Is any part of the chunk's bounding box inside the view frustum?
 fn visible(view_proj: Mat4, c: ChunkCoord, min_y: f32, max_y: f32) -> bool {
-    box_visible(view_proj, c.origin(), c.origin() + Vec2::splat(CHUNK_SIZE), min_y, max_y)
+    box_visible(view_proj, c.origin() - VISIBLE_MARGIN, c.origin() + Vec2::splat(CHUNK_SIZE + VISIBLE_MARGIN), min_y, max_y)
 }
 
 /// Is any part of the box [lo, hi] x [min_y, max_y] inside the view frustum?
@@ -542,7 +585,7 @@ pub(crate) fn chunk_digest(mut eat: impl FnMut(&[u8])) {
             }
         }
         if let JobResult::Detail(_, d) = run_job(Job::Detail(c)) {
-            d.meshes.iter().chain(&d.foliage).chain(&d.foliage_far).chain(&d.glow).chain(&d.water).for_each(|m| mesh(&mut eat, m));
+            d.meshes.iter().chain(&d.foliage).chain(&d.foliage_far).chain(&d.glow).chain(&d.water).chain(&d.crowd).chain(&d.flags).for_each(|m| mesh(&mut eat, m));
             eat(bytemuck::cast_slice(&d.tree_positions));
         }
         if let JobResult::Cover(_, tiles) = run_job(Job::Cover(c)) {

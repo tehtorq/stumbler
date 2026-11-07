@@ -227,7 +227,7 @@ fn build_gates(circuits: &[CircuitInfo]) -> (Vec<Vertex>, Vec<u16>) {
         let ry = terrain_height(right.x, right.y);
         let top = ly.max(ry) + pole_h;
 
-        for (pos, ground) in [(left, ly), (right, ry)] {
+        for (pos, ground) in [(left, terrain::settled(left.x, left.y)), (right, terrain::settled(right.x, right.y))] {
             crate::geometry::push_box(
                 &mut verts, &mut idxs,
                 pos.x, (ground + top) * 0.5, pos.y,
@@ -253,6 +253,21 @@ fn build_gates(circuits: &[CircuitInfo]) -> (Vec<Vertex>, Vec<u16>) {
         for lamp in start_lamps(c).into_iter().filter(|_| start) {
             crate::geometry::push_box(&mut verts, &mut idxs, lamp.x, lamp.y, lamp.z, 1.3, 1.3, 1.3, [[0.08, 0.08, 0.09, 1.0]; 6]);
         }
+        // The circuit's name across the banner, both faces (a stage's finish says so)
+        let name = if start { c.name } else { "FINISH" };
+        let mut b = crate::props::Builder::default();
+        let middle = vec3_of(p0, top - banner_h * 0.5);
+        for face in [-dir, dir] {
+            let at = middle + vec3_of(face, 0.0) * 0.62;
+            crate::trackside::panel(&mut b, at, face, gate_half - 2.0, banner_h * 0.5 - 0.3, (name, banner_color, banner_stripe));
+        }
+        let base = verts.len() as u16;
+        verts.extend(b.verts);
+        idxs.extend(b.idxs.iter().map(|&i| base + i as u16));
     }
     (verts, idxs)
+}
+
+fn vec3_of(p: Vec2, y: f32) -> Vec3 {
+    Vec3::new(p.x, y, p.y)
 }

@@ -38,6 +38,7 @@ mod physics;
 mod progress;
 mod props;
 mod race;
+mod raceday;
 mod railway;
 mod rescue;
 mod road;
@@ -46,12 +47,12 @@ mod routes;
 mod screen;
 mod secrets;
 mod skids;
-mod spectators;
 mod stages;
 mod speedlines;
 mod terrain;
 mod track;
 mod tuning;
+mod venue;
 mod waterways;
 mod weather;
 mod trackside;
@@ -195,6 +196,8 @@ struct Stage {
     world: World,
     /// The island as a picture, for maps.
     map_image: map::MapImage,
+    /// What moves over the circuits: the airship, balloons, helicopter.
+    raceday: raceday::RaceDay,
     chunks: ChunkManager,
     /// Circuits first (same indices as `world.circuits`), then road loops.
     ai_tracks: Vec<AiTrack>,
@@ -220,7 +223,6 @@ struct Stage {
     /// Fishes the player out of lakes.
     rescue: rescue::WaterRescue,
     wildlife_mesh: DynamicMesh,
-    spectators: Vec<spectators::Spectator>,
     sway_events: Vec<SwayEvent>,
     /// The quickest lap driven on each circuit this session (by circuit
     /// index): its time and the recording raced against as a ghost.
@@ -245,7 +247,6 @@ struct Stage {
     braking: bool,
     collectible_mesh: DynamicMesh,
     bird_mesh: DynamicMesh,
-    spectator_mesh: DynamicMesh,
     particle_mesh: DynamicMesh,
     skid_mesh: DynamicMesh,
     speed_line_mesh: DynamicMesh,
@@ -326,9 +327,10 @@ impl Stage {
     fn load(gpu: &gpu::GpuContext, status: &Mutex<&'static str>) -> Loaded {
         let t0 = Instant::now();
         let world = World::build(gpu);
-        // Comes up alongside the rest. It shows the farms, so not before
-        // `World::build` has placed them
-        let map_image = std::thread::spawn(map::MapImage::build);
+        // Race day at every circuit is laid out first: the chunks wait on it.
+        // The map's picture comes up alongside them (it shows the farms, so
+        // not before `World::build` has placed them)
+        let venues = std::thread::spawn(|| road::network().map(venue::prepare));
 
         let mut stage_roads = road::network().into_iter().flat_map(|n| n.paths.iter()).filter(|p| p.kind == road::PathKind::Gravel);
         let racing: Vec<_> = world.circuits.iter()
@@ -388,6 +390,8 @@ impl Stage {
         let player = CarPhysics::new(Vec3::new(pos.x, 0.0, pos.y), yaw);
         let camera = ChaseCamera::new(&player);
         *status.lock().unwrap() = "GROWING THE COUNTRYSIDE";
+        let _ = venues.join();
+        let map_image = std::thread::spawn(map::MapImage::build);
         let chunks = ChunkManager::new(gpu, pos);
         let map_image = map_image.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         Loaded { started: t0, world, map_image, ai_tracks, cars, traffic_count, start_circuit, train, pos, player, camera, chunks }
@@ -403,7 +407,6 @@ impl Stage {
         });
 
         let centroids: Vec<(f32, f32)> = world.circuits.iter().filter(|c| !c.stage).map(|c| (c.centre.x, c.centre.y)).collect();
-        let loops: Vec<Vec<Vec2>> = world.circuits.iter().filter(|c| !c.stage).map(|c| c.points.clone()).collect();
         let progress = Progress::load();
         player.setup = physics::SETUPS[progress.setup.min(physics::SETUPS.len() - 1)];
         let mut collectibles = collectibles::create_collectibles();
@@ -455,7 +458,6 @@ impl Stage {
             train,
             collectible_mesh: DynamicMesh::new(&gpu, "collectibles"),
             bird_mesh: DynamicMesh::new(&gpu, "birds"),
-            spectator_mesh: DynamicMesh::new(&gpu, "spectators"),
             particle_mesh: DynamicMesh::new(&gpu, "particles"),
             skid_mesh: DynamicMesh::new(&gpu, "skid marks"),
             speed_line_mesh: DynamicMesh::new(&gpu, "speed lines"),
@@ -469,7 +471,7 @@ impl Stage {
             wildlife: wildlife::Wildlife::new(0x5eed_1234),
             rescue: rescue::WaterRescue::default(),
             wildlife_mesh: DynamicMesh::new(&gpu, "wildlife"),
-            spectators: spectators::create_spectators(&loops),
+            raceday: raceday::RaceDay::new(&gpu),
             world,
             map_image,
             chunks,
@@ -800,6 +802,7 @@ impl Stage {
             a.set_sliding(slide);
             a.set_throttle(self.throttle);
             a.set_rain(self.weather.rain, self.weather.wet);
+            a.set_crowd(venue::crowd_near(Vec2::new(self.player.pos.x, self.player.pos.z)) * (0.35 + 0.65 * self.excitement()));
             a.set_rumble(self.camera.rumble);
             let rear = self.player.wheel_contact_pos[2];
             a.set_paved(road::paved(rear.x, rear.z));
@@ -884,6 +887,7 @@ impl Stage {
             }
         }
         self.celebrate(dt);
+        self.raceday.follow(self.player.pos, self.player.heading(), dt);
         self.particles.emit_ambient(self.camera.pos, self.day_factor(), dt);
         self.secret_atmosphere(dt);
         self.particles.update(dt);
@@ -917,6 +921,8 @@ impl Stage {
         for event in events {
             match event {
                 RaceEvent::Go => {
+                    // The crowd's away with them
+                    self.fireworks = self.fireworks.max(1.6);
                     // On the power just as the lights go: a flying start.
                     // Floor it too early and you've simply bogged down
                     if self.throttle_held > 0.0 && self.throttle_held <= PERFECT_START_WINDOW {

@@ -87,7 +87,7 @@ impl Crossing {
         let across = Vec2::new(-self.road_dir.y, self.road_dir.x);
         [1.0, -1.0].map(|s| {
             let post = self.pos.truncate_xz() + self.road_dir * s * 17.0 + across * s * (ROAD_HALF_WIDTH + 2.5);
-            let y = terrain::terrain_height(post.x, post.y);
+            let y = terrain::settled(post.x, post.y);
             (vec3(post.x, y + 2.6, post.y), vec3(-across.x * s, 0.0, -across.y * s), vec3(self.road_dir.x * s, 0.0, self.road_dir.y * s))
         })
     }

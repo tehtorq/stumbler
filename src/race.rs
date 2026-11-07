@@ -10,6 +10,9 @@ pub const COUNTDOWN: f32 = 3.0;
 /// Path points between grid slots (4 units each): the cars stagger left and
 /// right, so each is two of these behind the one in front on its side.
 const GRID_SPACING: usize = 5;
+/// The grid as it's painted: samples between boxes, and each row's offset.
+pub const GRID_STEP: usize = GRID_SPACING;
+pub const GRID_WIDE: f32 = 8.0;
 /// A gravel stage's start line is this many path points along its road,
 /// with the grid behind it.
 pub const STAGE_START: usize = 3 + GRID_SPACING * 9;

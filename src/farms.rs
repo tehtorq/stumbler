@@ -404,11 +404,11 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
             if !inside(p) {
                 continue;
             }
-            let base = vec3(p.x, crate::terrain::terrain_height(p.x, p.y) - 0.3, p.y);
+            let base = vec3(p.x, crate::terrain::settled(p.x, p.y) - 0.3, p.y);
             b.block(base, 0.18, 1.7, 0.18, yaw, FENCE, FENCE);
             if k < steps {
                 let q = at(along + (to - from) / steps as f32, ROWS[0]);
-                let next = vec3(q.x, crate::terrain::terrain_height(q.x, q.y) - 0.3, q.y);
+                let next = vec3(q.x, crate::terrain::settled(q.x, q.y) - 0.3, q.y);
                 for h in [0.75, 1.4] {
                     b.limb(base + Vec3::Y * h, next + Vec3::Y * h, 0.08, 0.08, 4, 0.0, FENCE);
                 }
@@ -419,7 +419,7 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
     // A mailbox on a post by the road
     let p = at(TRACK + 4.0, 46.0);
     if inside(p) {
-        let base = vec3(p.x, crate::terrain::terrain_height(p.x, p.y) - 0.3, p.y);
+        let base = vec3(p.x, crate::terrain::settled(p.x, p.y) - 0.3, p.y);
         b.block(base, 0.12, 1.4, 0.12, yaw, FENCE, FENCE);
         b.block(base + Vec3::Y * 1.4, 0.35, 0.45, 0.55, yaw, [0.2, 0.3, 0.55, 1.0], [0.2, 0.3, 0.55, 1.0]);
     }

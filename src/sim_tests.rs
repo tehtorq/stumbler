@@ -377,25 +377,6 @@ fn hard_offroad_driving_keeps_cars_on_their_wheels() {
     assert!(tipped < 10.0, "tipped over for {tipped:.1}s in total");
 }
 
-/// Height of the terrain mesh at (x, z) for a chunk grid of cell `step`,
-/// interpolated over the same triangles the mesh uses.
-fn terrain_mesh_at(x: f32, z: f32, step: f32) -> f32 {
-    let o = -terrain::TERRAIN_HALF_SIZE;
-    let (u, v) = ((x - o) / step, (z - o) / step);
-    let (iu, iv) = (u.floor(), v.floor());
-    let (fu, fv) = (u - iu, v - iv);
-    let at = |du: f32, dv: f32| terrain::terrain_mesh_height(o + (iu + du) * step, o + (iv + dv) * step, step);
-    let (tl, tr, bl, br) = (at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0));
-    if terrain::cell_flipped(o + iu * step, o + iv * step, step) {
-        // Split top-right to bottom-left
-        if fu + fv <= 1.0 { tl + fu * (tr - tl) + fv * (bl - tl) } else { br + (1.0 - fu) * (bl - br) + (1.0 - fv) * (tr - br) }
-    } else if fu >= fv {
-        tl + fu * (tr - tl) + fv * (br - tr)
-    } else {
-        tl + fv * (bl - tl) + fu * (br - bl)
-    }
-}
-
 /// How well the terrain mesh at cell size `step` fits around the roads:
 /// (% of road surface points with grass more than 0.25 above them,
 ///  % of road edge points standing more than 1.5 above the grass).
@@ -418,7 +399,7 @@ fn road_fit(step: f32) -> (f32, f32) {
                     continue;
                 }
                 let surface = terrain::terrain_height(q.x, q.y);
-                let mesh = terrain_mesh_at(q.x, q.y, step);
+                let mesh = terrain::mesh_surface(q.x, q.y, step);
                 points += 1;
                 covered += (mesh > surface + 0.25) as usize;
                 if off.abs() == hw {
@@ -1573,5 +1554,108 @@ fn smash_survey() {
     println!("{:.0} km driven, {} smashes ({:.2}/km), {hard} over 3g, {climbable} on grades under 45%", km, events.len(), events.len() as f32 / km);
     for e in events.iter().take(14) {
         println!("  at {:3.0}: {:4.1}g, underside {:6.0}, grade ahead {:3.0}%/{:3.0}%", e.0, e.1, e.2, e.3 * 100.0, e.4 * 100.0);
+    }
+}
+
+/// Every prop on the island against the terrain as drawn. Things stacked on
+/// each other only count once: in each small patch of ground, whatever is
+/// lowest has to touch. Per source: feet, how many float, worst gap and where.
+fn ground_audit(step: f32) -> Vec<(&'static str, usize, usize, f32, Vec2)> {
+    network();
+    let n = crate::chunks::chunks_per_side();
+    let size = crate::chunks::CHUNK_SIZE;
+    let half = terrain::TERRAIN_HALF_SIZE;
+    let rows: Vec<i32> = (0..n).collect();
+    let tallies = crate::layout::parallel_map(rows, |z| {
+        let mut tally: std::collections::BTreeMap<&'static str, (usize, usize, f32, Vec2)> = Default::default();
+        for x in 0..n {
+            let lo = Vec2::new(x as f32 * size - half, z as f32 * size - half);
+            let mut lowest: std::collections::HashMap<(i32, i32), (Vec3, f32, &'static str)> = Default::default();
+            for (base, r, source) in crate::props::generate_props(lo, lo + Vec2::splat(size)).feet {
+                if source == "deck" || (base.y - terrain::terrain_height(base.x, base.z)).abs() > 6.0 {
+                    continue;
+                }
+                let e = lowest.entry(((base.x / 3.0).floor() as i32, (base.z / 3.0).floor() as i32)).or_insert((base, r, source));
+                if base.y < e.0.y {
+                    *e = (base, r, source);
+                }
+            }
+            for (base, r, source) in lowest.into_values() {
+                let surface = [(0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)].iter()
+                    .map(|&(dx, dz)| terrain::mesh_surface(base.x + dx, base.z + dz, step))
+                    .fold(f32::MAX, f32::min);
+                let e = tally.entry(source).or_default();
+                e.0 += 1;
+                let gap = base.y - surface;
+                if gap > 0.1 {
+                    e.1 += 1;
+                    if gap > e.2 {
+                        e.2 = gap;
+                        e.3 = Vec2::new(base.x, base.z);
+                    }
+                }
+            }
+        }
+        tally
+    });
+    let mut total: std::collections::BTreeMap<&'static str, (usize, usize, f32, Vec2)> = Default::default();
+    for row in tallies {
+        for (k, v) in row {
+            let e = total.entry(k).or_default();
+            e.0 += v.0;
+            e.1 += v.1;
+            if v.2 > e.2 {
+                e.2 = v.2;
+                e.3 = v.3;
+            }
+        }
+    }
+    total.into_iter().map(|(k, v)| (k, v.0, v.1, v.2, v.3)).collect()
+}
+
+/// Dev aid: how well props sit on the terrain as drawn, near and further off.
+#[test]
+#[ignore]
+fn ground_report() {
+    for (name, step) in [("near", 12.5), ("mid", 25.0)] {
+        for (source, feet, floating, worst, at) in ground_audit(step) {
+            println!("{name:4} {source:11} {feet:7} feet, {floating:6} floating ({:4.1}%), worst {worst:.2} at {at}", floating as f32 * 100.0 / feet as f32);
+        }
+    }
+}
+
+/// What's built round the circuits, by `Builder::tag`.
+const TRACKSIDE: [&str; 11] = ["trackside", "floodlights", "tyres", "boards", "barriers", "bridge", "pits", "stands", "camps", "marshals", "fair"];
+
+#[test]
+fn props_touch_the_ground_as_drawn() {
+    // Elsewhere what's left is overhangs and viaducts, which are meant to be
+    // off the ground; everything trackside stands on it
+    for (source, feet, floating, worst, at) in ground_audit(12.5) {
+        if TRACKSIDE.contains(&source) {
+            assert!(floating as f32 / feet as f32 <= 0.001, "{floating} of {feet} {source} feet float, worst {worst:.2} at {at}");
+        }
+    }
+}
+
+
+/// Where a circuit crosses itself there's no bridge: both passes meet at one
+/// height, so neither runs into the other's embankment.
+#[test]
+fn circuit_crossings_meet_level() {
+    let net = network();
+    for (k, path) in net.paths.iter().filter(|p| p.circuit()).enumerate() {
+        let n = path.points.len();
+        for i in (0..n).step_by(2) {
+            for j in (i + 80..n).step_by(2).filter(|&j| n - (j - i) >= 80) {
+                if path.points[i].distance(path.points[j]) < road::ROAD_HALF_WIDTH {
+                    let gap = (path.heights[i] - path.heights[j]).abs();
+                    assert!(gap < 1.0, "circuit {k}: passes at {} cross {gap:.1} apart in height", path.points[i]);
+                }
+            }
+        }
+        // ...and the rise out of a crossing keeps to a circuit's grade
+        let (i, steepest) = (0..n).map(|i| (i, (path.heights[(i + 1) % n] - path.heights[i]).abs() / road::SAMPLE_SPACING)).fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        assert!(steepest < 0.105, "circuit {k}: a {:.0}% step in the road at {}", steepest * 100.0, path.points[i]);
     }
 }

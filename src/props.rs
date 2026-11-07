@@ -8,7 +8,7 @@ use glam::{Quat, Vec2, Vec3, vec3};
 use crate::collisions::Solid;
 use crate::geometry::Vertex;
 use crate::landmarks::{self, Kind, Landmark};
-use crate::road::{self, KERB_WIDTH, ROAD_HALF_WIDTH};
+use crate::road::{self, KERB_WIDTH};
 use crate::terrain::{self, terrain_height, TERRAIN_HALF_SIZE, WATER_LEVEL};
 
 const STONE: [f32; 4] = [0.55, 0.53, 0.5, 1.0];
@@ -21,8 +21,23 @@ const WOOD: [f32; 4] = [0.45, 0.3, 0.18, 1.0];
 const ROOF_COLORS: [[f32; 4]; 4] = [[0.7, 0.25, 0.15, 1.0], [0.45, 0.25, 0.2, 1.0], [0.35, 0.37, 0.42, 1.0], [0.6, 0.35, 0.15, 1.0]];
 const WALL_COLORS: [[f32; 4]; 4] = [[0.92, 0.88, 0.78, 1.0], [0.85, 0.82, 0.75, 1.0], [0.95, 0.93, 0.9, 1.0], [0.82, 0.72, 0.6, 1.0]];
 
+/// A base this close to the ground is taken to be standing on it (see
+/// `Builder::planted`).
+const PLANT_REACH: f32 = 0.8;
 /// Boulders smaller than this are left for cars to drive through.
 const SOLID_BOULDER: f32 = 3.0;
+
+/// Where geometry goes, by how the shaders move it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Layer {
+    /// Still.
+    #[default]
+    Plain,
+    /// People: vertex alpha is half their phase, plus a half on arms.
+    Crowd,
+    /// Cloth: vertex alpha is how far it's free to flap.
+    Flag,
+}
 
 /// Accumulates props geometry with simple primitives, plus the colliders
 /// for anything a car shouldn't drive through.
@@ -36,11 +51,58 @@ pub struct Builder {
     pub glow_idxs: Vec<u32>,
     /// While set, new geometry goes to the glow buffers.
     pub glowing: bool,
+    /// Geometry the shaders animate (see `Layer`).
+    pub crowd_verts: Vec<Vertex>,
+    pub crowd_idxs: Vec<u32>,
+    pub flag_verts: Vec<Vertex>,
+    pub flag_idxs: Vec<u32>,
+    /// Which buffers new geometry goes to, when it isn't `glowing`.
+    pub layer: Layer,
+    /// While set, anything based at ground level reaches down to the ground
+    /// as drawn, wherever it happens to stand (see `planted`).
+    pub planting: bool,
+    /// Where things meet the ground, for `ground_audit`: base, radius, source.
+    #[cfg(test)]
+    pub feet: Vec<(Vec3, f32, &'static str)>,
+    #[cfg(test)]
+    pub source: &'static str,
 }
 
 impl Builder {
+    /// `p`, brought down to the ground as drawn if it's meant to be standing
+    /// on it: on a slope, one corner of a block has further to reach than
+    /// another, and the drawn triangles cut corners off the true surface.
+    fn planted(&self, p: Vec3) -> Vec3 {
+        if self.planting && (p.y - terrain_height(p.x, p.z)).abs() < PLANT_REACH {
+            vec3(p.x, p.y.min(terrain::settled(p.x, p.z) - 0.15), p.z)
+        } else {
+            p
+        }
+    }
+
+    /// Name what's being built, for `ground_audit`.
+    pub fn tag(&mut self, _source: &'static str) {
+        #[cfg(test)]
+        { self.source = _source; }
+    }
+
+    /// Note a base resting on the ground (see `ground_audit`).
+    fn foot(&mut self, _base: Vec3, _radius: f32) {
+        #[cfg(test)]
+        if self.layer == Layer::Plain {
+            self.feet.push((_base, _radius, self.source));
+        }
+    }
+
     fn buffers(&mut self) -> (&mut Vec<Vertex>, &mut Vec<u32>) {
-        if self.glowing { (&mut self.glow_verts, &mut self.glow_idxs) } else { (&mut self.verts, &mut self.idxs) }
+        if self.glowing {
+            return (&mut self.glow_verts, &mut self.glow_idxs);
+        }
+        match self.layer {
+            Layer::Plain => (&mut self.verts, &mut self.idxs),
+            Layer::Crowd => (&mut self.crowd_verts, &mut self.crowd_idxs),
+            Layer::Flag => (&mut self.flag_verts, &mut self.flag_idxs),
+        }
     }
 
     pub fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
@@ -48,6 +110,16 @@ impl Builder {
         let base = verts.len() as u32;
         for p in [a, b, c, d] {
             verts.push(Vertex { pos: p.into(), color });
+        }
+        idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// A quad of cloth, each corner with its own freedom to flap.
+    pub fn cloth(&mut self, corners: [Vec3; 4], free: [f32; 4], color: [f32; 3]) {
+        let (verts, idxs) = self.buffers();
+        let base = verts.len() as u32;
+        for (p, a) in corners.into_iter().zip(free) {
+            verts.push(Vertex { pos: p.into(), color: [color[0], color[1], color[2], a] });
         }
         idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -65,6 +137,10 @@ impl Builder {
     #[allow(clippy::too_many_arguments)]
     pub fn limb(&mut self, a: Vec3, b: Vec3, r0: f32, r1: f32, sides: usize, twist: f32, color: [f32; 4]) {
         let axis = (b - a).normalize_or_zero();
+        let a = if axis.y > 0.7 { self.planted(a) } else { a };
+        if axis.y > 0.7 {
+            self.foot(a, r0);
+        }
         let rot = Quat::from_rotation_arc(Vec3::Y, axis);
         let ring = |c: Vec3, r: f32, k: usize| {
             let t = std::f32::consts::TAU * k as f32 / sides as f32 + twist;
@@ -116,9 +192,10 @@ impl Builder {
         let r = Quat::from_rotation_y(yaw);
         let c = |x: f32, y: f32, z: f32| bottom + r * vec3(x, y, z);
         let (x, z, h) = (half_x, half_z, height);
-        let corners = [c(-x, 0.0, -z), c(x, 0.0, -z), c(x, 0.0, z), c(-x, 0.0, z)];
+        let corners = [c(-x, 0.0, -z), c(x, 0.0, -z), c(x, 0.0, z), c(-x, 0.0, z)].map(|p| self.planted(p));
         let tops = [c(-x, h, -z), c(x, h, -z), c(x, h, z), c(-x, h, z)];
         for k in 0..4 {
+            self.foot(corners[k], 0.0);
             let n = (k + 1) % 4;
             self.quad(corners[k], corners[n], tops[n], tops[k], side);
         }
@@ -150,6 +227,11 @@ impl Builder {
 
     /// Tapered prism (cylinder-ish) from `bottom` up.
     pub fn column(&mut self, bottom: Vec3, r0: f32, r1: f32, height: f32, sides: usize, color: [f32; 4]) {
+        let foot = self.planted(bottom);
+        if foot.y < bottom.y {
+            self.limb(foot, bottom, r0, r0, sides, 0.0, color);
+        }
+        self.foot(foot, r0);
         let ring = |r: f32, y: f32, k: usize| {
             let a = std::f32::consts::TAU * (k % sides) as f32 / sides as f32;
             bottom + vec3(a.cos() * r, y, a.sin() * r)
@@ -164,6 +246,7 @@ impl Builder {
     }
 
     pub fn cone(&mut self, bottom: Vec3, radius: f32, height: f32, sides: usize, color: [f32; 4]) {
+        self.foot(bottom, radius);
         let apex = bottom + Vec3::Y * height;
         for k in 0..sides {
             let a0 = std::f32::consts::TAU * k as f32 / sides as f32;
@@ -203,7 +286,7 @@ pub fn hash(x: f32, z: f32) -> f32 {
 pub fn ground(p: Vec2, radius: f32) -> f32 {
     [vec2(radius, radius), vec2(-radius, radius), vec2(radius, -radius), vec2(-radius, -radius), Vec2::ZERO]
         .iter()
-        .map(|o| terrain_height(p.x + o.x, p.y + o.y))
+        .map(|o| terrain::settled(p.x + o.x, p.y + o.y))
         .fold(f32::MAX, f32::min)
 }
 
@@ -216,26 +299,44 @@ pub struct Props {
     pub mesh: (Vec<Vertex>, Vec<u32>),
     pub glow: (Vec<Vertex>, Vec<u32>),
     pub solids: Vec<Solid>,
+    /// What the shaders animate (see `Layer`).
+    pub crowd: (Vec<Vertex>, Vec<u32>),
+    pub flags: (Vec<Vertex>, Vec<u32>),
+    #[cfg(test)]
+    pub feet: Vec<(Vec3, f32, &'static str)>,
 }
 
 /// All props whose anchor point lies in [lo, hi).
 pub fn generate_props(lo: Vec2, hi: Vec2) -> Props {
-    let mut b = Builder::default();
+    let mut b = Builder { planting: true, ..Default::default() };
     let inside = |p: Vec2| p.x >= lo.x && p.y >= lo.y && p.x < hi.x && p.y < hi.y;
 
+    // Names what's being built, for `ground_audit`
+    macro_rules! source {
+        ($name:expr) => {
+            #[cfg(test)]
+            { b.source = $name; }
+        };
+    }
+    source!("boulders");
     boulders(&mut b, lo, hi);
     if let Some(network) = road::network() {
+        source!("roadside");
         crate::roadside::build(&mut b, network, &inside);
+        source!("trackside");
         crate::trackside::build(&mut b, network, &inside);
+        source!("farms");
         crate::farms::build(&mut b, &inside);
+        source!("railway");
         crate::railway::build_props(&mut b, &inside);
+        source!("structures");
         for path in &network.paths {
             raised_road_supports(&mut b, path, &inside);
-            if path.circuit() && inside(path.points[0]) {
-                grandstands(&mut b, path);
-            }
         }
+        source!("trackside");
+        crate::venue::build(&mut b, network, &inside);
     }
+    source!("landmarks");
     for landmark in landmarks::all().iter().filter(|l| inside(l.pos)) {
         if landmark.kind.is_secret() {
             crate::secrets::build(&mut b, landmark);
@@ -246,7 +347,15 @@ pub fn generate_props(lo: Vec2, hi: Vec2) -> Props {
     for &c in landmarks::cairns().iter().filter(|&&c| inside(c)) {
         cairn(&mut b, c);
     }
-    Props { mesh: (b.verts, b.idxs), glow: (b.glow_verts, b.glow_idxs), solids: b.solids }
+    Props {
+        mesh: (b.verts, b.idxs),
+        glow: (b.glow_verts, b.glow_idxs),
+        solids: b.solids,
+        crowd: (b.crowd_verts, b.crowd_idxs),
+        flags: (b.flag_verts, b.flag_idxs),
+        #[cfg(test)]
+        feet: b.feet,
+    }
 }
 
 /// A little stack of flat stones, largest at the bottom.
@@ -275,7 +384,7 @@ fn boulders(b: &mut Builder, lo: Vec2, hi: Vec2) {
             if hash(x * 1.3, z * 0.7) > rocky {
                 continue;
             }
-            if terrain::raw_height(x, z) < WATER_LEVEL + 0.5 || crate::farms::occupied(p, 8.0) {
+            if terrain::raw_height(x, z) < WATER_LEVEL + 0.5 || crate::farms::occupied(p, 8.0) || crate::venue::occupied(p, 4.0) {
                 continue;
             }
             if road::network().and_then(|n| n.nearest(x, z)).is_some_and(|s| s.dist < s.half_width() + 12.0) {
@@ -341,7 +450,14 @@ fn raised_road_supports(b: &mut Builder, path: &road::RoadPath, inside: &impl Fn
         let yaw = (-t.x).atan2(-t.y);
         for s in [-1.0, 1.0] {
             let Some(a) = post(i, s) else { continue };
+            // Bolted to the deck, not stood on the ground
+            #[cfg(test)]
+            { b.source = "deck"; }
+            b.planting = false;
             b.block(a, 0.25, 1.4, 0.25, yaw, RAIL, RAIL);
+            b.planting = true;
+            #[cfg(test)]
+            { b.source = "structures"; }
             // The rail runs post to post, following the bend
             if i + 2 < n || path.closed {
                 if let Some(c) = post(i + 2, s) {
@@ -357,32 +473,6 @@ fn raised_road_supports(b: &mut Builder, path: &road::RoadPath, inside: &impl Fn
             }
             // Pier cap, kept well under the deck so it can't poke through on a slope
             b.block(vec3(p.x, path.heights[i] - 4.0, p.y), hw - 3.0, 1.8, 2.5, yaw, CONCRETE, CONCRETE);
-        }
-    }
-}
-
-/// Stepped grandstands either side of the start line.
-fn grandstands(b: &mut Builder, path: &road::RoadPath) {
-    let p0 = path.points[0];
-    let t = path.tangent(0);
-    let side = vec2(-t.y, t.x);
-    let yaw = (-t.x).atan2(-t.y);
-    for s in [-1.0_f32, 1.0] {
-        for along in [-55.0_f32, 55.0] {
-            let centre = p0 + t * along + side * s * (ROAD_HALF_WIDTH + KERB_WIDTH + 24.0);
-            let base_y = ground(centre, 20.0);
-            // Rows step up away from the track
-            for row in 0..4 {
-                let offset = side * s * (row as f32 * 3.0);
-                let c = centre + offset;
-                let seat = if row % 2 == 0 { [0.25, 0.4, 0.75, 1.0] } else { [0.85, 0.85, 0.88, 1.0] };
-                b.solid_block(vec3(c.x, base_y, c.y), 1.6, 2.0 + row as f32 * 2.0, 30.0, yaw, CONCRETE, seat);
-            }
-            // Roof on posts
-            let back = centre + side * s * 10.0;
-            b.solid_block(vec3(back.x, base_y, back.y), 0.5, 13.0, 30.0, yaw, DARK, DARK);
-            let roof = centre + side * s * 4.5;
-            b.block(vec3(roof.x, base_y + 13.0, roof.y), 6.5, 0.6, 31.0, yaw, RED, RED);
         }
     }
 }

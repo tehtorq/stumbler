@@ -874,9 +874,7 @@ fn build_path(
 
     // Where a circuit crosses itself (Suzuka's figure of eight) there's no
     // bridge, so both passes meet at one height; then re-smooth either side
-    if kind == PathKind::Circuit {
-        level_crossings(&points, &mut heights, closed);
-    }
+    let held = if kind == PathKind::Circuit { level_crossings(&points, &mut heights, closed) } else { vec![false; n] };
 
     // Limit the gradient so mountain sections stay drivable; the terrain
     // blend turns the difference into cuttings and embankments
@@ -888,14 +886,20 @@ fn build_path(
         PathKind::Rail => 0.025,
     };
     let rises: Vec<f32> = points.iter().map(|&p| SAMPLE_SPACING * grade(p)).collect();
+    // A crossing's level stretch holds its height: the slope out of it is
+    // spread along the approach instead of pulling the two passes apart
     for _ in 0..4 {
         for i in 1..n {
-            heights[i] = heights[i].clamp(heights[i - 1] - rises[i], heights[i - 1] + rises[i]);
+            if !held[i] {
+                heights[i] = heights[i].clamp(heights[i - 1] - rises[i], heights[i - 1] + rises[i]);
+            }
         }
         for i in (0..n - 1).rev() {
-            heights[i] = heights[i].clamp(heights[i + 1] - rises[i], heights[i + 1] + rises[i]);
+            if !held[i] {
+                heights[i] = heights[i].clamp(heights[i + 1] - rises[i], heights[i + 1] + rises[i]);
+            }
         }
-        if closed {
+        if closed && !held[0] {
             heights[0] = heights[0].clamp(heights[n - 1] - rises[0], heights[n - 1] + rises[0]);
         }
     }
@@ -967,10 +971,12 @@ fn round_vertical_curves(heights: &mut Vec<f32>, closed: bool, radius: i32) {
 /// Make the passes through any place a closed path crosses itself (or runs
 /// so close the surfaces overlap) level with each other: flat at their
 /// average height through the overlap, eased back over the approach.
-fn level_crossings(points: &[Vec2], heights: &mut [f32], closed: bool) {
+/// Returns the samples levelled, which must then be held at that height.
+fn level_crossings(points: &[Vec2], heights: &mut [f32], closed: bool) -> Vec<bool> {
     let n = points.len();
+    let mut held = vec![false; n];
     if !closed || n < 200 {
-        return;
+        return held;
     }
     let near_along = (300.0 / SAMPLE_SPACING) as usize;
     // Anywhere the two flattened surfaces (road and shoulder) would overlap
@@ -1004,6 +1010,9 @@ fn level_crossings(points: &[Vec2], heights: &mut [f32], closed: bool) {
         }
     }
     for (i, j) in crossings {
+        // Only where the roads really cross must the levelling hold; passes
+        // that merely run close have room to part
+        let crosses = points[i].distance(points[j]) < ROAD_HALF_WIDTH;
         let target = (heights[i] + heights[j]) * 0.5;
         for centre in [i, j] {
             // Flat at the shared height through the overlap, blending back
@@ -1012,9 +1021,11 @@ fn level_crossings(points: &[Vec2], heights: &mut [f32], closed: bool) {
                 let k = (centre as i32 + o).rem_euclid(n as i32) as usize;
                 let t = (1.0 - (o.abs() - flat).max(0) as f32 / (ease + 1) as f32).clamp(0.0, 1.0);
                 heights[k] += (target - heights[k]) * t * t * (3.0 - 2.0 * t);
+                held[k] |= crosses && o.abs() <= flat;
             }
         }
     }
+    held
 }
 
 /// Where the railway runs high above the natural ground it goes onto a
