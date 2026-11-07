@@ -1531,3 +1531,47 @@ fn world_fingerprint() {
     eprintln!("fingerprint: chunks {:016x}", chunks.0);
     eprintln!("fingerprint: map {:016x}", map.0);
 }
+
+/// Dev aid: flat out across open country from all over the map, counting
+/// the times the car smashes into the ground rather than driving up it.
+#[test]
+#[ignore]
+fn smash_survey() {
+    network();
+    let dt = 1.0 / 60.0;
+    let starts: Vec<(Vec2, f32)> = (0..400).map(|i| {
+        let f = i as f32;
+        (Vec2::new((f * 0.618034).fract() * 50000.0 - 25000.0, (f * 0.7548777).fract() * 50000.0 - 25000.0), f * 2.4)
+    }).filter(|(p, _)| terrain::raw_height(p.x, p.y) > terrain::WATER_LEVEL + 3.0).collect();
+    let runs = crate::layout::parallel_map(starts, |(p, yaw)| {
+        let mut car = CarPhysics::new_on(&WorldGround, Vec3::new(p.x, 0.0, p.y), yaw);
+        let forward = car.forward();
+        car.vel = forward * 95.0;
+        let mut events = Vec::new();
+        let (mut distance, mut was, mut cool) = (0.0, car.vel, 0);
+        for _ in 0..(14.0 / dt) as usize {
+            let at = car.pos;
+            let grade = |d: f32| (terrain::solid_height(at.x + forward.x * d, at.z + forward.z * d) - terrain::solid_height(at.x, at.z)) / d;
+            car.update(&WorldGround, dt, CarInput { throttle: 1.0, ..Default::default() });
+            distance += car.vel.length() * dt;
+            let lost = was.length() - car.vel.length();
+            let g = lost / dt / crate::physics::GRAVITY;
+            cool = (cool as i32 - 1).max(0);
+            if car.scrape > 0.0 && g > 1.5 && cool == 0 && car.submerged == 0.0 {
+                events.push((was.length(), g, car.scrape, grade(4.0), grade(12.0)));
+                cool = 30;
+            }
+            was = car.vel;
+            if car.submerged > 0.0 { break; }
+        }
+        (distance, events)
+    });
+    let km: f32 = runs.iter().map(|r| r.0).sum::<f32>() * 0.0005;
+    let events: Vec<_> = runs.iter().flat_map(|r| r.1.iter()).collect();
+    let hard = events.iter().filter(|e| e.1 > 3.0).count();
+    let climbable = events.iter().filter(|e| e.4 < 0.45).count();
+    println!("{:.0} km driven, {} smashes ({:.2}/km), {hard} over 3g, {climbable} on grades under 45%", km, events.len(), events.len() as f32 / km);
+    for e in events.iter().take(14) {
+        println!("  at {:3.0}: {:4.1}g, underside {:6.0}, grade ahead {:3.0}%/{:3.0}%", e.0, e.1, e.2, e.3 * 100.0, e.4 * 100.0);
+    }
+}

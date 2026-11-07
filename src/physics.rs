@@ -22,11 +22,16 @@ const DRAG: f32 = 0.06;
 const DOWNFORCE: f32 = 0.03;
 
 // --- Suspension ---
-const SPRING_REST: f32 = 1.5;
-const SPRING_K: f32 = 900.0;
-const SPRING_DAMP: f32 = 90.0;
-const BUMP_STOP_K: f32 = 9000.0;
-const ANTI_ROLL: f32 = 500.0;
+const SPRING_REST: f32 = 1.8;
+const SPRING_K: f32 = 760.0;
+const SPRING_DAMP: f32 = 85.0;
+/// Most force the dampers can make (either way): sharp hits blow them off,
+/// so the wheel soaks up the blow instead of passing it to the body.
+const DAMPER_LIMIT: f32 = 1600.0;
+/// Rubber stops at the end of the travel: they firm up the further they're pressed.
+const BUMP_STOP_AT: f32 = 1.35;
+const BUMP_STOP_K: f32 = 7000.0;
+const ANTI_ROLL: f32 = 420.0;
 
 // --- Tyres ---
 const TYRE_MU: f32 = 1.3;
@@ -121,6 +126,13 @@ const SUBMERGE_DEPTH: f32 = 2.6;
 const BODY_K: f32 = 6000.0;
 const BODY_DAMP: f32 = 300.0;
 const BODY_MU: f32 = 0.6;
+/// Right way up, the underside skims: it gives more and drags less than a
+/// roof or a door, and the blow of first touching a slope is capped, so it
+/// lifts the nose to climb rather than stopping the car against the hill.
+const SKID_K: f32 = 3000.0;
+const SKID_DAMP: f32 = 150.0;
+const SKID_DAMP_LIMIT: f32 = 1200.0;
+const SKID_MU: f32 = 0.15;
 const BODY_CORNERS: [[f32; 3]; 8] = [
     [-2.1, -1.2, -4.6], [2.1, -1.2, -4.6], [-2.1, -1.2, 4.1], [2.1, -1.2, 4.1],
     [-1.4, 1.25, -0.3], [1.4, 1.25, -0.3], [-1.4, 1.25, 1.6], [1.4, 1.25, 1.6],
@@ -175,7 +187,7 @@ impl Ground for WorldGround {
 pub fn steepest_climb(grip: f32, road: f32) -> f32 {
     const GRIPS: [f32; 4] = [0.5, 0.6, 0.8, 1.0];
     // Rows: off the road, half on it, fully on it
-    const CLIMB: [[f32; 4]; 3] = [[0.175, 0.20, 0.30, 0.40], [0.20, 0.275, 0.375, 0.475], [0.25, 0.325, 0.45, 0.525]];
+    const CLIMB: [[f32; 4]; 3] = [[0.175, 0.20, 0.30, 0.425], [0.20, 0.275, 0.375, 0.525], [0.25, 0.325, 0.475, 0.55]];
     let along = |row: &[f32; 4]| {
         let g = grip.clamp(0.4, 1.0);
         let k = GRIPS.iter().position(|&x| x >= g).unwrap_or(3).max(1);
@@ -251,6 +263,9 @@ pub struct CarPhysics {
     /// Set from outside each frame.
     pub draft: f32,
     pub setup: Setup,
+    /// How hard the underside is pressed into the ground this step
+    /// (force, 0 clear of it).
+    pub scrape: f32,
 }
 
 impl CarPhysics {
@@ -280,6 +295,7 @@ impl CarPhysics {
             travel_turn: 0.0,
             draft: 0.0,
             setup: SETUPS[0],
+            scrape: 0.0,
         };
         car.place(ground, start_pos.x, start_pos.z, start_yaw);
         car
@@ -401,9 +417,9 @@ impl CarPhysics {
             self.wheel_compression[i] = compression.min(SPRING_REST);
             self.wheel_contact[i] = true;
 
-            let mut f = SPRING_K * compression + SPRING_DAMP * comp_vel;
-            if compression > SPRING_REST * 0.9 {
-                f += BUMP_STOP_K * (compression - SPRING_REST * 0.9);
+            let mut f = SPRING_K * compression + (SPRING_DAMP * comp_vel).clamp(-DAMPER_LIMIT, DAMPER_LIMIT);
+            if compression > BUMP_STOP_AT {
+                f += BUMP_STOP_K * (compression - BUMP_STOP_AT).powi(2);
             }
             loads[i] = f.max(0.0);
             contacts[i] = mount - up * dist;
@@ -552,6 +568,7 @@ impl CarPhysics {
 
         // --- Body contacts: landings on the chassis, roofs after flips ---
         let mut deepest = 0.0_f32;
+        self.scrape = 0.0;
         for corner in BODY_CORNERS {
             let p = self.pos + self.rot * Vec3::from(corner);
             let h = ground.height(p.x, p.z);
@@ -563,9 +580,15 @@ impl CarPhysics {
             let n = ground.normal(p.x, p.z);
             let v = self.vel + self.ang_vel.cross(p - self.pos);
             let vn = v.dot(n);
-            let fn_mag = (BODY_K * pen - BODY_DAMP * vn).max(0.0);
+            let skids = up.dot(n) > 0.5;
+            let fn_mag = if skids {
+                SKID_K * pen + (-vn * SKID_DAMP).clamp(0.0, SKID_DAMP_LIMIT)
+            } else {
+                (BODY_K * pen - BODY_DAMP * vn).max(0.0)
+            };
+            self.scrape += fn_mag;
             let vt = v - n * vn;
-            let friction = -vt.normalize_or_zero() * (BODY_MU * fn_mag).min(vt.length() * CAR_MASS / dt * 0.25);
+            let friction = -vt.normalize_or_zero() * (if skids { SKID_MU } else { BODY_MU } * fn_mag).min(vt.length() * CAR_MASS / dt * 0.25);
             apply(n * fn_mag + friction, p, &mut force, &mut torque);
         }
 
@@ -1024,6 +1047,115 @@ mod tests {
         let (released, countered) = (straighten(0.0), straighten(1.0));
         assert!(released < 1.2, "still drifting {released:.1}s after letting go");
         assert!(countered < released, "counter-steering ({countered:.2}s) should be quicker than letting go ({released:.2}s)");
+    }
+
+    /// A level run-up, then a slope rising toward -Z, easing in over `blend`
+    /// units (0 = a sharp crease).
+    struct Foothill { grade: f32, blend: f32 }
+    impl Ground for Foothill {
+        fn height(&self, _x: f32, z: f32) -> f32 {
+            let d = -z;
+            if d <= 0.0 { return 0.0; }
+            if d < self.blend { return self.grade * d * d / (2.0 * self.blend); }
+            self.grade * (d - self.blend * 0.5)
+        }
+        fn grip(&self, _x: f32, _z: f32) -> f32 { 1.0 }
+        fn on_road(&self, _x: f32, _z: f32) -> f32 { 0.0 }
+    }
+
+    /// Hit a `grade` hill at `speed` with the throttle down: (speed lost to
+    /// by 30 units up the slope, peak underside force, worst deceleration in
+    /// g, ends upright).
+    fn hit_hill(grade: f32, blend: f32, speed: f32) -> (f32, f32, f32, bool) {
+        let g = Foothill { grade, blend };
+        let mut car = CarPhysics::new_on(&g, vec3(0.0, 0.0, 60.0), 0.0);
+        run(&mut car, &g, 0.5, CarInput::default());
+        car.pos.z = 60.0;
+        car.vel = car.forward() * speed;
+        let dt = 1.0 / 240.0;
+        let (mut peak, mut worst) = (0.0_f32, 0.0_f32);
+        let mut last = car.vel;
+        let mut kept = 0.0;
+        for _ in 0..(3.0 / dt) as usize {
+            car.update(&g, dt, throttle(1.0));
+            peak = peak.max(car.scrape);
+            let decel = car.vel.length() - last.length();
+            worst = worst.min(decel / dt);
+            if kept == 0.0 && car.pos.z < -30.0 { kept = car.vel.length(); }
+            last = car.vel;
+        }
+        (speed - kept, peak, -worst / GRAVITY, car.up().y > 0.5)
+    }
+
+    /// Dev aid: how the car takes the foot of a hill.
+    #[test]
+    #[ignore]
+    fn hill_telemetry() {
+        for blend in [0.0, 6.0, 15.0, 30.0] {
+            for grade in [0.2, 0.3, 0.4, 0.5, 0.7] {
+                let row: Vec<String> = [40.0, 70.0, 100.0, 140.0].iter().map(|&v| {
+                    let (lost, peak, g, up) = hit_hill(grade, blend, v);
+                    format!("{:5.1}/{:6.0}/{:4.1}g{}", lost, peak, g, if up { " " } else { "!" })
+                }).collect();
+                println!("blend {blend:4} grade {grade:.1}: {}", row.join("  "));
+            }
+        }
+    }
+
+    /// Dev aid: how much the body moves on its springs.
+    #[test]
+    #[ignore]
+    fn suspension_telemetry() {
+        let dt = 1.0 / 240.0;
+        let pitch = |c: &CarPhysics| c.forward().y.asin().to_degrees();
+        let roll = |c: &CarPhysics| (c.rot * Vec3::X).y.asin().to_degrees();
+        let at_rest = CarPhysics::new_on(&Flat, Vec3::ZERO, 0.0);
+        println!("static comp {:.3}, ride height {:.2}", at_rest.wheel_compression[0], at_rest.pos.y);
+        let mut car = CarPhysics::new_on(&Flat, Vec3::ZERO, 0.0);
+        let mut most = 0.0_f32;
+        for _ in 0..(1.5 / dt) as usize { car.update(&Flat, dt, throttle(1.0)); most = most.max(pitch(&car)); }
+        println!("squat under power: {most:.2} deg");
+        let mut car = CarPhysics::new_on(&Flat, Vec3::ZERO, 0.0);
+        car.vel = car.forward() * 120.0;
+        let mut most = 0.0_f32;
+        for _ in 0..(1.5 / dt) as usize { car.update(&Flat, dt, CarInput { brake: 1.0, ..Default::default() }); most = most.min(pitch(&car)); }
+        println!("dive under braking: {most:.2} deg");
+        for v in [50.0, 80.0, 110.0] {
+            let mut car = CarPhysics::new_on(&Flat, Vec3::ZERO, 0.0);
+            car.vel = car.forward() * v;
+            let (mut most, mut steady) = (0.0_f32, 0.0);
+            for _ in 0..(3.0 / dt) as usize {
+                car.update(&Flat, dt, CarInput { steer: 1.0, throttle: 0.5, ..Default::default() });
+                most = most.max(roll(&car).abs());
+                steady = roll(&car).abs();
+            }
+            println!("roll at {v}: peak {most:.2} deg, steady {steady:.2} deg, wheels {:?}", car.wheel_compression.map(|c| (c * 100.0).round() / 100.0));
+        }
+        // Over a rough patch: how much the wheels and body move
+        struct Bumps;
+        impl Ground for Bumps {
+            fn height(&self, x: f32, z: f32) -> f32 { 1.5 * (x * 0.05 + 0.8).sin() * (z * 0.06 + 1.2).sin() + 0.8 * (x * 0.09 + 2.1).sin() * (z * 0.11 + 0.4).sin() }
+            fn grip(&self, _x: f32, _z: f32) -> f32 { 1.0 }
+            fn on_road(&self, _x: f32, _z: f32) -> f32 { 0.0 }
+        }
+        for v in [40.0, 80.0, 120.0] {
+            let mut car = CarPhysics::new_on(&Bumps, Vec3::ZERO, 0.0);
+            car.vel = car.forward() * v;
+            let mut comp = Vec::new();
+            let mut air = 0;
+            let n = (6.0 / dt) as usize;
+            let mut p = Vec::new();
+            for _ in 0..n {
+                car.update(&Bumps, dt, throttle(0.6));
+                comp.push(car.wheel_compression[0]);
+                p.push(pitch(&car));
+                if car.grounded_wheels() == 0 { air += 1; }
+            }
+            let (lo, hi) = (comp.iter().cloned().fold(9.0, f32::min), comp.iter().cloned().fold(0.0, f32::max));
+            let mean = p.iter().sum::<f32>() / n as f32;
+            let rms = (p.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+            println!("bumps at {v}: wheel travel {lo:.2}..{hi:.2}, pitch rms {rms:.2} deg, airborne {:.1}%", air as f32 * 100.0 / n as f32);
+        }
     }
 
     /// Dev aid: handling numbers on flat tarmac.
