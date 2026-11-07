@@ -120,6 +120,18 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.clip = globals.view_proj * world_pos;
     let animated = is_kind(kind, CROWD) || is_kind(kind, FLAG);
     out.color = vec4<f32>(in.color.rgb, select(in.color.a, 1.0, foliage || animated));
+
+    // Cameras held up in the stands: a flash here and there, a ripple of
+    // them as the car goes by, more when the race is close
+    if (is_kind(kind, CROWD) && in.color.a >= 0.5) {
+        let near = 1.0 - smoothstep(20.0, 180.0, distance(world_pos.xz, globals.crowd.xy));
+        let chance = 0.0008 + near * near * 0.05 * (0.4 + globals.crowd.z);
+        let slot = floor(globals.wind_time * 12.0);
+        let roll = fract(sin(fract(in.color.a * 2.0) * 9173.1 + slot * 12.9898) * 43758.547);
+        if (roll < chance) {
+            out.color = vec4<f32>(3.0, 3.0, 2.9, 1.0);
+        }
+    }
     out.world_pos = world_pos.xyz;
     out.kind = kind;
     return out;
@@ -159,6 +171,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let light = max(in.color.r, max(in.color.g, in.color.b)) > 1.0;
         let tone = select(in.color.rgb * (0.3 + 0.7 * day_factor()), min(in.color.rgb, vec3<f32>(1.0)), light);
         return vec4<f32>(apply_fog(tone, in.world_pos), in.color.a);
+    }
+    if (is_kind(in.kind, CROWD) && in.color.r > 2.0) {
+        return vec4<f32>(apply_fog(vec3<f32>(1.0, 1.0, 0.96), in.world_pos), 1.0);
     }
     let normal = flat_normal(in.world_pos);
     if (is_kind(in.kind, WATER)) {

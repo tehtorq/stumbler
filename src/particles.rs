@@ -25,6 +25,9 @@ struct Particle {
     gravity: f32,
     /// Air resistance (share of speed lost per second).
     drag: f32,
+    /// Flat flecks turning over as they fall (turns per second, 0 for none):
+    /// they flash wide and edge-on.
+    tumble: f32,
 }
 
 pub struct Particles {
@@ -38,6 +41,7 @@ pub struct Particles {
     spray_accum: f32,
     ambient_accum: f32,
     place_accum: f32,
+    scrape_accum: f32,
 }
 
 impl Particles {
@@ -52,6 +56,7 @@ impl Particles {
             spray_accum: 0.0,
             ambient_accum: 0.0,
             place_accum: 0.0,
+            scrape_accum: 0.0,
         }
     }
 
@@ -93,7 +98,7 @@ impl Particles {
                     self.smoke_accum[i] -= 1.0;
                     let vel = vec3(self.spread(2.0), 2.0 + self.rand() * 2.0, self.spread(2.0)) + car.vel * 0.1;
                     let grey = 0.78 + self.rand() * 0.12;
-                    self.push(Particle { gravity: 1.0, drag: 1.5,
+                    self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                         pos: at, vel, life: 1.0, decay: 0.6, size: 1.0, growth: 2.2,
                         color: [grey, grey, grey * 1.02], alpha: 0.45,
                     });
@@ -111,7 +116,7 @@ impl Particles {
                 let ground = terrain_height(mount.x, mount.z);
                 let vel = vec3(self.spread(3.0), 1.5 + self.rand() * 2.5, self.spread(3.0)) - car.vel * 0.05;
                 let shade = 0.85 + self.rand() * 0.15;
-                self.push(Particle { gravity: 1.0, drag: 1.5,
+                self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                     pos: vec3(mount.x, ground + 0.3, mount.z), vel, life: 1.0, decay: 0.8, size: 0.9, growth: 1.8,
                     color: [0.62 * shade, 0.52 * shade, 0.38 * shade], alpha: 0.5,
                 });
@@ -125,11 +130,30 @@ impl Particles {
                 self.exhaust_accum -= 1.0;
                 let at = car.pos + car.rot * vec3(0.8, -0.9, 4.4);
                 let vel = car.rot * vec3(self.spread(0.5), 0.8, 3.0) + car.vel * 0.6;
-                self.push(Particle { gravity: 1.0, drag: 1.5,
+                self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                     pos: at, vel, life: 1.0, decay: 1.6, size: 0.4, growth: 1.0,
                     color: [0.45, 0.45, 0.48], alpha: 0.35,
                 });
             }
+        }
+    }
+
+    /// A backfire: a spit of flame from the exhaust and a wisp of smoke.
+    pub fn backfire(&mut self, car: &CarPhysics) {
+        let at = car.pos + car.rot * vec3(0.8, -0.9, 4.4);
+        let out = car.rot * Vec3::Z;
+        for k in 0..7 {
+            let hot = k < 5;
+            let vel = out * (6.0 + self.rand() * 8.0) + vec3(self.spread(1.5), self.rand() * 1.5, self.spread(1.5)) + car.vel;
+            let (color, size, decay, alpha) = if hot {
+                ([2.4, 1.0 + self.rand() * 0.6, 0.25], 0.25 + self.rand() * 0.2, 7.0 + self.rand() * 4.0, 1.0)
+            } else {
+                ([0.3, 0.3, 0.32], 0.35, 1.8, 0.4)
+            };
+            self.push(Particle { tumble: 0.0,
+                pos: at, vel, life: 1.0, decay, size, growth: if hot { -0.5 } else { 1.2 },
+                color, alpha, gravity: -1.0, drag: 3.0,
+            });
         }
     }
 
@@ -158,12 +182,68 @@ impl Particles {
                 let vel = vec3(self.spread(4.0), up, self.spread(4.0)) - car.vel * (0.1 + self.rand() * 0.15);
                 let shade = 0.6 + self.rand() * 0.35;
                 let (decay, size) = (1.0 + self.rand() * 0.6, 0.25 + self.rand() * 0.35);
-                self.push(Particle {
+                self.push(Particle { tumble: 0.0,
                     pos: at + Vec3::Y * 0.3, vel, life: 1.0, decay, size, growth: 0.0,
                     color: [base[0] * shade, base[1] * shade, base[2] * shade], alpha: 1.0,
                     gravity: 45.0, drag: 0.4,
                 });
             }
+        }
+    }
+
+    /// A comet's tail of sparks off the underside where it grinds along a
+    /// road (bottoming out over a crest, landing a jump), or grit off the
+    /// ground anywhere else.
+    pub fn scrape(&mut self, car: &CarPhysics, paved: bool, dt: f32) {
+        let speed = car.vel.length();
+        if car.scrape < 150.0 || speed < 8.0 {
+            self.scrape_accum = 0.0;
+            return;
+        }
+        let rate = (car.scrape / 25.0).min(80.0) * (speed / 30.0).min(1.5);
+        self.scrape_accum += dt * rate;
+        let back = -car.vel / speed;
+        while self.scrape_accum >= 1.0 {
+            self.scrape_accum -= 1.0;
+            let fling = speed * (0.35 + self.rand() * 0.35);
+            let vel = back * fling + vec3(self.spread(3.0), 1.5 + self.rand() * 4.0, self.spread(3.0)) + car.vel;
+            let at = car.scrape_at + Vec3::Y * 0.15;
+            if paved {
+                let heat = self.rand() * 0.5;
+                let (decay, size) = (3.0 + self.rand() * 2.0, 0.12 + self.rand() * 0.08);
+                self.push(Particle { tumble: 0.0,
+                    pos: at, vel, life: 1.0, decay, size, growth: -0.05,
+                    color: [2.2, 1.1 + heat, 0.35], alpha: 1.0,
+                    gravity: 28.0, drag: 1.2,
+                });
+            } else {
+                let shade = 0.35 + self.rand() * 0.2;
+                self.push(Particle { tumble: 0.0,
+                    pos: at, vel: vel * 0.5, life: 1.0, decay: 1.6, size: 0.3, growth: 0.4,
+                    color: [shade, shade * 0.9, shade * 0.75], alpha: 0.7,
+                    gravity: 12.0, drag: 1.5,
+                });
+            }
+        }
+    }
+
+    /// Paper streamers fluttering down over the winner: bright flecks shot
+    /// up from either side of the car that drift and tumble as they fall.
+    pub fn confetti(&mut self, at: Vec3, heading: Vec3, count: usize) {
+        const COLOURS: [[f32; 3]; 6] = [[1.0, 0.2, 0.25], [1.0, 0.85, 0.15], [0.2, 0.55, 1.0], [0.25, 0.9, 0.4], [1.0, 1.0, 1.0], [0.95, 0.4, 0.9]];
+        let side = vec3(heading.z, 0.0, -heading.x).normalize_or_zero();
+        for k in 0..count {
+            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let from = at + side * s * (6.0 + self.rand() * 4.0) + heading * self.spread(10.0);
+            let vel = side * -s * (3.0 + self.rand() * 6.0) + vec3(self.spread(3.0), 14.0 + self.rand() * 10.0, self.spread(3.0));
+            let colour = COLOURS[(self.rand() * COLOURS.len() as f32) as usize % COLOURS.len()];
+            let tumble = 1.5 + self.rand() * 2.5;
+            let (decay, size) = (0.18 + self.rand() * 0.1, 0.22 + self.rand() * 0.12);
+            self.push(Particle { tumble,
+                pos: from, vel, life: 1.0, decay, size, growth: 0.0,
+                color: colour, alpha: 1.0,
+                gravity: 9.0, drag: 1.4,
+            });
         }
     }
 
@@ -181,7 +261,7 @@ impl Particles {
             let at = car.wheel_contact_pos[wheel] + Vec3::Y * 0.6;
             let vel = vec3(self.spread(2.5), 1.5 + self.rand() * 2.0, self.spread(2.5)) + car.vel * 0.55;
             let shade = 0.82 + self.rand() * 0.1;
-            self.push(Particle {
+            self.push(Particle { tumble: 0.0,
                 pos: at, vel, life: 1.0, decay: 1.7, size: 0.7, growth: 2.6,
                 color: [shade, shade * 1.02, shade * 1.05], alpha: 0.16 * wet,
                 gravity: 1.0, drag: 2.5,
@@ -195,7 +275,7 @@ impl Particles {
             let vel = vec3(self.spread(1.0), self.rand() * 0.7 + 0.3, self.spread(1.0)) * speed;
             let heat = self.rand() * 0.4;
             let decay = 2.2 + self.rand();
-            self.push(Particle {
+            self.push(Particle { tumble: 0.0,
                 pos: at, vel, life: 1.0, decay, size: 0.18, growth: 0.0,
                 color: [2.0, 1.2 + heat, 0.4], alpha: 1.0,
                 gravity: 30.0, drag: 0.6,
@@ -209,7 +289,7 @@ impl Particles {
             let vel = vec3(self.spread(1.0), self.rand() * 0.8 + 0.4, self.spread(1.0)) * speed;
             let shade = 0.7 + self.rand() * 0.4;
             let (decay, size) = (0.7 + self.rand() * 0.4, 0.3 + self.rand() * 0.2);
-            self.push(Particle {
+            self.push(Particle { tumble: 0.0,
                 pos: at, vel, life: 1.0, decay, size, growth: 0.0,
                 color: [color[0] * shade, color[1] * shade, color[2] * shade], alpha: 1.0,
                 gravity: 45.0, drag: 0.3,
@@ -223,7 +303,7 @@ impl Particles {
             let dir = vec3(self.spread(1.0), self.spread(1.0), self.spread(1.0)).normalize_or_zero();
             let vel = dir * (14.0 + self.rand() * 8.0);
             let decay = 0.7 + self.rand() * 0.3;
-            self.push(Particle {
+            self.push(Particle { tumble: 0.0,
                 pos: at, vel, life: 1.0, decay, size: 0.9, growth: -0.4,
                 color, alpha: 1.0, gravity: 6.0, drag: 1.2,
             });
@@ -234,7 +314,7 @@ impl Particles {
     pub fn burst(&mut self, at: Vec3, color: [f32; 3], count: usize, speed: f32) {
         for _ in 0..count {
             let vel = vec3(self.spread(1.0), self.rand() * 0.8 + 0.2, self.spread(1.0)) * speed;
-            self.push(Particle { gravity: 1.0, drag: 1.5, pos: at, vel, life: 1.0, decay: 1.4, size: 0.5, growth: 0.3, color, alpha: 0.9 });
+            self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5, pos: at, vel, life: 1.0, decay: 1.4, size: 0.5, growth: 0.3, color, alpha: 0.9 });
         }
     }
 
@@ -247,7 +327,7 @@ impl Particles {
                 let pos = camera + vec3(self.spread(40.0), 10.0 + self.spread(5.0), self.spread(40.0));
                 let vel = vec3(2.0 + self.spread(1.5), -1.5 + self.spread(0.5), self.spread(1.0));
                 let tint = self.rand() * 0.2;
-                self.push(Particle { gravity: 1.0, drag: 1.5,
+                self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                     pos, vel, life: 1.0, decay: 0.25, size: 0.35, growth: 0.0,
                     color: [0.75 + tint, 0.5 + tint * 0.5, 0.15], alpha: 0.9,
                 });
@@ -256,7 +336,7 @@ impl Particles {
                 let z = camera.z + self.spread(30.0);
                 let pos = vec3(x, terrain_height(x, z) + 1.0 + self.rand() * 2.0, z);
                 let vel = vec3(self.spread(1.0), self.spread(0.5), self.spread(1.0));
-                self.push(Particle { gravity: 1.0, drag: 1.5,
+                self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                     pos, vel, life: 1.0, decay: 0.35, size: 0.25, growth: 0.0,
                     color: [0.9, 1.3, 0.4], alpha: 0.9,
                 });
@@ -271,7 +351,7 @@ impl Particles {
             let vel = vec3(self.spread(1.0) * 6.0, 6.0 + self.rand() * (6.0 + speed * 0.12), self.spread(1.0) * 6.0);
             let white = 0.85 + self.rand() * 0.15;
             let pos = at + vec3(self.spread(2.0), 0.0, self.spread(2.0));
-            self.push(Particle { gravity: 1.0, drag: 1.5,
+            self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                 pos,
                 vel, life: 1.0, decay: 0.9, size: 0.6, growth: 0.8,
                 color: [white * 0.9, white, white], alpha: 0.75,
@@ -286,7 +366,7 @@ impl Particles {
             self.place_accum -= 1.0;
             let pos = vec3(at.x + self.spread(1.5), surface + 0.2, at.z + self.spread(1.5));
             let size = 0.25 + self.rand() * 0.2;
-            self.push(Particle { gravity: 1.0, drag: 1.5,
+            self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                 pos, vel: vec3(0.0, 0.8, 0.0), life: 1.0, decay: 1.6, size, growth: 0.3,
                 color: [0.8, 0.92, 0.95], alpha: 0.7,
             });
@@ -303,7 +383,7 @@ impl Particles {
             let pos = vec3(x, terrain_height(x, z) + 0.8 + self.rand() * 4.0, z);
             let vel = vec3(self.spread(0.8), 0.3 + self.spread(0.3), self.spread(0.8));
             let warm = self.rand() * 0.2;
-            self.push(Particle { gravity: 1.0, drag: 1.5,
+            self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                 pos, vel, life: 1.0, decay: 0.22, size: 0.22, growth: 0.0,
                 color: [0.95 + warm, 1.4, 0.45 + warm], alpha: 0.95,
             });
@@ -318,7 +398,7 @@ impl Particles {
             let pos = centre + vec3(self.spread(radius), 0.5, self.spread(radius));
             let vel = vec3(1.0 + self.spread(0.6), 2.0 + self.rand() * 1.5, self.spread(0.6));
             let grey = 0.88 + self.rand() * 0.1;
-            self.push(Particle { gravity: 1.0, drag: 1.5,
+            self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
                 pos, vel, life: 1.0, decay: 0.18, size: 1.2, growth: 1.6,
                 color: [grey, grey, grey * 1.02], alpha: 0.3,
             });
@@ -329,7 +409,7 @@ impl Particles {
     pub fn chimney_smoke(&mut self, at: Vec3, drift: Vec3) {
         let vel = drift + vec3(self.spread(1.5), 7.0 + self.rand() * 3.0, self.spread(1.5));
         let grey = 0.55 + self.rand() * 0.25;
-        self.push(Particle { gravity: 1.0, drag: 1.5,
+        self.push(Particle { tumble: 0.0, gravity: 1.0, drag: 1.5,
             pos: at, vel, life: 1.0, decay: 0.3, size: 1.4, growth: 2.0,
             color: [grey, grey, grey * 1.03], alpha: 0.45,
         });
@@ -360,8 +440,15 @@ impl Particles {
             let color = [p.color[0], p.color[1], p.color[2], alpha];
             let base = verts.len() as u16;
             verts.push(Vertex { pos: p.pos.into(), color });
+            // A tumbling fleck narrows to its edge and back as it turns over
+            let (wide, tall) = if p.tumble > 0.0 {
+                let turn = p.life * p.tumble * std::f32::consts::TAU;
+                (turn.cos().abs().max(0.15), turn.sin().abs().max(0.4))
+            } else {
+                (1.0, 1.0)
+            };
             for &(cx, cy) in &corners {
-                verts.push(Vertex { pos: (p.pos + (right * cx + up * cy) * p.size).into(), color });
+                verts.push(Vertex { pos: (p.pos + (right * cx * wide + up * cy * tall) * p.size).into(), color });
             }
             for k in 0..HEX_SIDES as u16 {
                 idxs.extend_from_slice(&[base, base + 1 + k, base + 1 + (k + 1) % HEX_SIDES as u16]);

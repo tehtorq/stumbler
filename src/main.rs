@@ -267,11 +267,21 @@ struct Stage {
     /// Seconds of fireworks left over the finish line.
     fireworks: f32,
     fireworks_accum: f32,
+    confetti_accum: f32,
+    /// Seconds left of the exhaust crackling after a lift at high revs,
+    /// the time to the next pop, and last frame's throttle to spot the lift.
+    crackle: f32,
+    pop_timer: f32,
+    last_throttle: f32,
     /// Steering as the keys have eased it in (-1 left to 1 right).
     steer: f32,
     throttle: f32,
     boost: boosts::Boost,
     lap_pulse: f32,
+    /// The crowd's roar after you take a place (1 fading to 0), and the
+    /// place you were in last frame.
+    cheer: f32,
+    last_place: usize,
     show_map: bool,
     map: marker::MapControl,
     /// Where the player has asked to be guided to.
@@ -496,10 +506,16 @@ impl Stage {
             throttle_held: 0.0,
             fireworks: 0.0,
             fireworks_accum: 0.0,
+            confetti_accum: 0.0,
+            crackle: 0.0,
+            pop_timer: 0.0,
+            last_throttle: 0.0,
             steer: 0.0,
             throttle: 0.0,
             boost: boosts::Boost::default(),
             lap_pulse: 0.0,
+            cheer: 0.0,
+            last_place: 0,
             show_map: false,
             map: Default::default(),
             marker: None,
@@ -804,6 +820,7 @@ impl Stage {
             a.set_rain(self.weather.rain, self.weather.wet);
             a.set_crowd(venue::crowd_near(Vec2::new(self.player.pos.x, self.player.pos.z)) * (0.35 + 0.65 * self.excitement()));
             a.set_rumble(self.camera.rumble);
+            a.set_scrape((self.player.scrape / 2500.0).min(1.0) * (self.player.vel.length() / 25.0).min(1.0));
             let rear = self.player.wheel_contact_pos[2];
             a.set_paved(road::paved(rear.x, rear.z));
             // The nearest car close by, louder the closer, its note rising
@@ -826,6 +843,7 @@ impl Stage {
         // --- Camera ---
         let airborne = 1.0 - self.player.grounded_wheels() as f32 / 4.0;
         self.lap_pulse = (self.lap_pulse - dt).max(0.0);
+        self.cheer = (self.cheer - dt * 0.4).max(0.0);
         let zoom = 1.0 + airborne * 0.3 + self.lap_pulse * 0.25;
         // Field of view kicks out under boost and in a tow; kerbs and rough
         // ground shake the view, more the faster you go
@@ -863,6 +881,23 @@ impl Stage {
         let wet = self.weather.wet;
         let rear = self.player.wheel_contact_pos[2];
         self.particles.spray(&self.player, wet, road::paved(rear.x, rear.z), dt);
+        let under = self.player.scrape_at;
+        self.particles.scrape(&self.player, road::paved(under.x, under.z), dt);
+        // Off the throttle at high revs, the exhaust crackles and spits
+        if self.last_throttle > 0.7 && self.throttle < 0.2 && self.player.speed > 45.0 {
+            self.crackle = 0.35 + 0.3 * (now * 3.7).fract();
+            self.pop_timer = 0.03;
+        }
+        self.last_throttle = self.throttle;
+        if self.crackle > 0.0 {
+            self.crackle -= dt;
+            self.pop_timer -= dt;
+            if self.pop_timer <= 0.0 {
+                self.pop_timer = 0.06 + 0.12 * (now * 7.31).fract();
+                self.particles.backfire(&self.player);
+                if let Some(a) = self.audio() { a.trigger_pop(); }
+            }
+        }
         self.skids.update(0, &self.player, paved, now);
         for (k, car) in self.cars.iter().enumerate() {
             let near = car.physics.pos.distance_squared(self.camera.pos);
@@ -872,6 +907,8 @@ impl Stage {
                 self.particles.rubble(&car.physics, paved, ground_color, dt);
                 let rear = car.physics.wheel_contact_pos[2];
                 self.particles.spray(&car.physics, wet, road::paved(rear.x, rear.z), dt);
+                let under = car.physics.scrape_at;
+                self.particles.scrape(&car.physics, road::paved(under.x, under.z), dt);
             }
             if near < 500.0 * 500.0 {
                 self.skids.update(k + 1, &car.physics, paved, now);
@@ -888,6 +925,19 @@ impl Stage {
         }
         self.celebrate(dt);
         self.raceday.follow(self.player.pos, self.player.heading(), dt);
+        // The starter waves the field away, then the chequered flag as you
+        // come round to finish
+        let wave = self.race.as_ref().map_or(0.0, |r| match r.phase {
+            Phase::Countdown { .. } => 0.0,
+            Phase::Racing if r.clock < 4.0 => 1.0,
+            Phase::Racing => {
+                let last = !r.trial && r.laps_done + 1 == race::RACE_LAPS;
+                let line = self.world.circuits[r.circuit].start();
+                if last && line.distance(self.player_xz()) < 350.0 { 1.0 } else { 0.0 }
+            }
+            Phase::Finished { .. } => 1.0,
+        });
+        self.raceday.cue_starter(wave, dt);
         self.particles.emit_ambient(self.camera.pos, self.day_factor(), dt);
         self.secret_atmosphere(dt);
         self.particles.update(dt);
@@ -902,6 +952,11 @@ impl Stage {
         race.record(self.player.pos, self.player.rot);
         race.check_direction(Vec2::new(self.player.vel.x, self.player.vel.z), track, dt);
         let final_lap = !race.trial && race.laps_done + 1 == race::RACE_LAPS;
+        // Making up a place brings the crowd to its feet
+        if race.phase == Phase::Racing && race.position < self.last_place {
+            self.cheer = 1.0;
+        }
+        self.last_place = race.position;
         // Keep the quickest lap this session on each circuit as its ghost
         if let Some((time, frames)) = race.completed_lap.take() {
             if self.ghosts.get(&race.circuit).is_none_or(|g| time < g.0) {
@@ -954,6 +1009,8 @@ impl Stage {
                         self.progress.save();
                         // Fireworks: a proper show for a win
                         self.fireworks = if *position == 1 { 4.0 } else { 1.5 };
+                        let heading = self.player.heading();
+                        self.particles.confetti(self.player.pos + heading * 12.0 + Vec3::Y * 2.0, heading, 220);
                         let (ci, position) = (race_circuit, *position);
                         self.score_tour_round(ci, position);
                     }
@@ -1036,8 +1093,14 @@ impl Stage {
             return;
         }
         self.fireworks -= dt;
+        // Ticker tape drifting down over the road just ahead, to drive through
+        let heading = self.player.heading();
+        self.confetti_accum += dt * 70.0;
+        let count = self.confetti_accum as usize;
+        self.confetti_accum -= count as f32;
+        self.particles.confetti(self.player.pos + heading * 25.0 + Vec3::Y * 4.0, heading, count);
         // Up ahead, where you're looking as you cross the line
-        let ahead = self.player.pos + self.player.heading() * 140.0;
+        let ahead = self.player.pos + heading * 140.0;
         self.fireworks_accum += dt * 2.5;
         while self.fireworks_accum >= 1.0 {
             self.fireworks_accum -= 1.0;

@@ -44,7 +44,7 @@ impl CircuitInfo {
     }
 
     /// Half the width a gantry over the start or finish must span.
-    fn gate_half(&self) -> f32 {
+    pub fn gate_half(&self) -> f32 {
         if self.stage { road::GRAVEL_HALF_WIDTH + 5.0 } else { GATE_HALF }
     }
 }

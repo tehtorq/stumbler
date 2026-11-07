@@ -198,6 +198,9 @@ impl Stage {
             vec3(c.x, terrain_height_at(c), c.y)
         });
         self.raceday.draws(&mut draws, self.camera.pos, venue, self.race.is_some(), time);
+        if let Some(c) = self.race.as_ref().map(|r| &self.world.circuits[r.circuit]).filter(|c| !c.stage) {
+            self.raceday.starter_draws(&mut draws, self.camera.pos, c.start(), c.start_dir(), c.gate_half());
+        }
 
         let all_cars = std::iter::once((&self.player, &self.body_mesh, self.braking))
             .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()], c.last_input.brake > 0.1 && c.physics.speed > 1.0)));
@@ -316,7 +319,12 @@ impl Stage {
             Some(race) => match race.phase {
                 Phase::Countdown { .. } => 0.7,
                 Phase::Racing if race.clock < 6.0 => 1.0,
-                Phase::Racing => 0.45,
+                // Up on their feet as you take each lap or a place, and
+                // louder still on the last lap
+                Phase::Racing => {
+                    let last = !race.trial && race.laps_done + 1 == crate::race::RACE_LAPS;
+                    (if last { 0.65 } else { 0.45 } + self.lap_pulse.max(self.cheer) * 0.55).min(1.0)
+                }
                 Phase::Finished { .. } => 1.0,
             },
             None => 0.2,

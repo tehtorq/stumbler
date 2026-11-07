@@ -304,6 +304,11 @@ impl<'a> Draw<'a> {
         Self { kind: MeshKind::Flag, ..Self::mesh(mesh, Mat4::IDENTITY) }
     }
 
+    /// Flag cloth placed by `model` (for cloth that moves as a whole).
+    pub fn flags_at(mesh: &'a Mesh, model: Mat4) -> Self {
+        Self { kind: MeshKind::Flag, ..Self::mesh(mesh, model) }
+    }
+
     pub fn water(mesh: &'a Mesh) -> Self {
         Self { kind: MeshKind::Water, ..Self::mesh(mesh, Mat4::IDENTITY) }
     }

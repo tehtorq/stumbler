@@ -25,6 +25,11 @@ pub struct AudioParams {
     wet: AtomicU32,
     /// How loud the crowd around you is, 0..1.
     crowd: AtomicU32,
+    /// The underside grinding on the ground, 0..1, and whether it's on
+    /// tarmac (a metallic rasp) or not (a dull scour).
+    scrape: AtomicU32,
+    /// An exhaust backfire's countdown (seconds left of the pop).
+    pop: AtomicU32,
 }
 
 impl AudioParams {
@@ -44,11 +49,21 @@ impl AudioParams {
             rain: AtomicU32::new(0),
             wet: AtomicU32::new(0),
             crowd: AtomicU32::new(0),
+            scrape: AtomicU32::new(0),
+            pop: AtomicU32::new(0),
         }
     }
 
     pub fn set_crowd(&self, level: f32) {
         self.crowd.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_scrape(&self, level: f32) {
+        self.scrape.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn trigger_pop(&self) {
+        self.pop.store(POP_LENGTH.to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_rain(&self, rain: f32, wet: f32) {
@@ -141,6 +156,9 @@ const GEAR_TOPS: [f32; 6] = [38.0, 64.0, 90.0, 115.0, 140.0, 175.0];
 
 /// Engine revs (0..1) at `speed`: each gear runs from a little above idle
 /// up to the red line, then the next one picks up lower down.
+/// How long a backfire pop rings (seconds).
+const POP_LENGTH: f32 = 0.07;
+
 fn engine_revs(speed: f32) -> f32 {
     let gear = GEAR_TOPS.iter().position(|&top| speed < top).unwrap_or(GEAR_TOPS.len() - 1);
     let low = if gear == 0 { 0.0 } else { GEAR_TOPS[gear - 1] * 0.75 };
@@ -177,6 +195,8 @@ struct EngineSource {
     crowd_lp: [f32; 2],
     crowd_level: f32,
     crowd_time: f32,
+    scrape_lp: [f32; 2],
+    scrape_level: f32,
     // Noise sources (offset for variety)
     noise_states: [u32; 5],
 }
@@ -202,6 +222,8 @@ impl EngineSource {
             crowd_level: 0.0,
             crowd_time: 0.0,
             swish_lp: 0.0,
+            scrape_lp: [0.0; 2],
+            scrape_level: 0.0,
             noise_states: [12345, 67890, 24680, 13579, 97531],
         }
     }
@@ -354,6 +376,33 @@ impl Iterator for EngineSource {
             0.0
         };
 
+        // ── The underside grinding along: a rasp of high noise on tarmac,
+        //    a duller scour on dirt ──
+        let scrape_target = self.params.get(&self.params.scrape);
+        self.scrape_level += (scrape_target - self.scrape_level) * (dt / 0.03).min(1.0);
+        let grind = if self.scrape_level > 0.005 {
+            let n = self.noise_n(4);
+            let (fast, slow) = if paved { (0.7, 0.25) } else { (0.25, 0.04) };
+            self.scrape_lp[0] += fast * (n - self.scrape_lp[0]);
+            self.scrape_lp[1] += slow * (self.scrape_lp[0] - self.scrape_lp[1]);
+            (self.scrape_lp[0] - self.scrape_lp[1]) * 0.3 * self.scrape_level
+        } else {
+            0.0
+        };
+
+        // ── Exhaust backfire: a sharp crack over a low thump ──
+        let pop_left = self.params.get(&self.params.pop);
+        let pop = if pop_left > 0.0 {
+            self.params.pop.store((pop_left - dt).max(0.0).to_bits(), Ordering::Relaxed);
+            let t = POP_LENGTH - pop_left;
+            let env = (pop_left / POP_LENGTH).powi(3);
+            let crack = self.noise_n(2) * (1.0 - t / 0.015).max(0.0);
+            let thump = (t * 70.0 * std::f32::consts::TAU).sin();
+            (crack * 0.35 + thump * 0.3) * env
+        } else {
+            0.0
+        };
+
         // ── Kerbs and rough ground: a low buzz ──
         self.rumble_phase += (38.0 + speed.abs() * 0.15) * dt;
         if self.rumble_phase > 1.0 { self.rumble_phase -= 1.0; }
@@ -398,7 +447,7 @@ impl Iterator for EngineSource {
             (t * 1047.0 * std::f32::consts::TAU).sin() * 0.2 * env // C6 = 1047 Hz
         } else { 0.0 };
 
-        Some((engine + other + squeal + gravel + wind + rain_sound + crowd + buzz + thud + chime + pickup).clamp(-0.8, 0.8))
+        Some((engine + other + squeal + gravel + wind + rain_sound + crowd + grind + pop + buzz + thud + chime + pickup).clamp(-0.8, 0.8))
     }
 }
 

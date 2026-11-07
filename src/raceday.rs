@@ -1,6 +1,7 @@
 //! What moves over a circuit on race day: the sponsors' airship circling the
 //! venue, hot-air balloons drifting higher up, a television helicopter
-//! keeping up with the race, and the funfair's big wheel turning.
+//! keeping up with the race, the funfair's big wheel turning, and the
+//! starter on the line waving the flag.
 
 use glam::{Mat4, Quat, Vec2, Vec3, vec3};
 
@@ -21,11 +22,17 @@ const HELI_ABOVE: f32 = 42.0;
 /// Turns a minute of the big wheel.
 const WHEEL_TURNS: f32 = 1.5;
 const GONDOLAS: usize = 16;
+/// The starter's rostrum: how far out past the gantry it stands, how high
+/// its deck is, and where on the starter the flag arm swings from.
+const ROSTRUM_OUT: f32 = 4.5;
+const ROSTRUM_HEIGHT: f32 = 2.4;
+const SHOULDER: Vec3 = vec3(0.42, 1.42, 0.0);
 
 const SILVER: [f32; 4] = [0.82, 0.84, 0.86, 1.0];
 const RED: [f32; 4] = [0.82, 0.12, 0.1, 1.0];
 const DARK: [f32; 4] = [0.15, 0.16, 0.18, 1.0];
 const WHITE: [f32; 4] = [0.95, 0.95, 0.92, 1.0];
+const MARSHAL: [f32; 4] = [0.95, 0.42, 0.08, 1.0];
 const BALLOONS: [[[f32; 4]; 2]; 3] = [
     [[0.92, 0.2, 0.14, 1.0], [0.98, 0.8, 0.16, 1.0]],
     [[0.14, 0.36, 0.84, 1.0], [0.95, 0.95, 0.92, 1.0]],
@@ -43,6 +50,13 @@ pub struct RaceDay {
     wheel_site: Option<(Vec3, Vec3)>,
     heli_pos: Vec3,
     heli_vel: Vec3,
+    starter: Mesh,
+    starter_arm: Mesh,
+    starter_flag: Mesh,
+    /// How hard the starter is waving (0 holding the flag still, 1 flat
+    /// out), easing toward the cue, and how far through the wave.
+    wave: f32,
+    wave_phase: f32,
 }
 
 fn mesh(gpu: &GpuContext, build: impl FnOnce(&mut Builder)) -> Mesh {
@@ -67,7 +81,21 @@ impl RaceDay {
             wheel_site: crate::road::network().and_then(crate::venue::wheel_site),
             heli_pos: Vec3::ZERO,
             heli_vel: Vec3::ZERO,
+            starter: mesh(gpu, starter),
+            starter_arm: mesh(gpu, |b| {
+                b.limb(Vec3::ZERO, vec3(0.0, 0.75, 0.0), 0.11, 0.09, 4, 0.0, MARSHAL);
+                b.limb(vec3(0.0, 0.6, 0.0), vec3(0.0, 2.6, 0.0), 0.05, 0.045, 4, 0.0, DARK);
+            }),
+            starter_flag: mesh(gpu, chequered_flag),
+            wave: 0.0,
+            wave_phase: 0.0,
         }
+    }
+
+    /// Cue the starter: `wave` 1 to wave the flag, 0 to hold it still.
+    pub fn cue_starter(&mut self, wave: f32, dt: f32) {
+        self.wave += (wave - self.wave) * (dt * 3.0).min(1.0);
+        self.wave_phase += dt * (1.0 + 4.5 * self.wave);
     }
 
     /// Keep the helicopter on station by `car` (position, heading).
@@ -129,6 +157,87 @@ impl RaceDay {
                 let rim = face * vec3(a.cos() * WHEEL_RADIUS, a.sin() * WHEEL_RADIUS, 0.0);
                 out.push(Draw::mesh(&self.gondola, Mat4::from_rotation_translation(face, hub + rim)));
             }
+        }
+    }
+
+    /// The starter on a rostrum beside the line at `start` (heading `dir`,
+    /// the gantry `gate_half` wide), waving as cued.
+    pub fn starter_draws<'a>(&'a self, out: &mut Vec<Draw<'a>>, camera: Vec3, start: Vec2, dir: Vec2, gate_half: f32) {
+        let Some((deck, face)) = rostrum_site(start, dir, gate_half) else { return };
+        if deck.distance(camera) > 900.0 {
+            return;
+        }
+        let body = Mat4::from_rotation_translation(Quat::from_rotation_y(face.x.atan2(face.y)), deck);
+        out.push(Draw::mesh(&self.starter, body));
+        // Held up and leaning out while it waits; swept overhead side to
+        // side when it's waved
+        let swing = -0.35 * (1.0 - self.wave) + self.wave * 1.15 * (self.wave_phase * 1.3).sin();
+        let arm = body * Mat4::from_translation(SHOULDER) * Mat4::from_rotation_z(swing);
+        out.push(Draw::mesh(&self.starter_arm, arm));
+        out.push(Draw::flags_at(&self.starter_flag, arm));
+    }
+}
+
+/// Where the starter's rostrum stands for the line at `start`: its deck,
+/// and which way the starter faces. On whichever side of the road is clear
+/// of the pits and the road itself, just short of the line.
+fn rostrum_site(start: Vec2, dir: Vec2, gate_half: f32) -> Option<(Vec3, Vec2)> {
+    let side = Vec2::new(-dir.y, dir.x);
+    [1.0, -1.0].into_iter().find_map(|s| {
+        let p = start + side * s * (gate_half + ROSTRUM_OUT) - dir * 3.0;
+        if crate::venue::occupied(p, 3.0) || crate::road::paved(p.x, p.y) {
+            return None;
+        }
+        let ground = [(-1.3, -1.3), (1.3, -1.3), (1.3, 1.3), (-1.3, 1.3)].iter()
+            .map(|&(x, z)| crate::terrain::settled(p.x + x, p.y + z))
+            .fold(f32::MAX, f32::min);
+        Some((vec3(p.x, ground + ROSTRUM_HEIGHT, p.y), -side * s))
+    })
+}
+
+/// The starter's rostrum and the starter on it, facing +Z, the deck's top
+/// at the origin. The flag arm is drawn on its own so it can swing.
+fn starter(b: &mut Builder) {
+    let orange = [0.92, 0.48, 0.1, 1.0];
+    b.block(vec3(0.0, -0.3, 0.0), 1.3, 0.3, 1.3, 0.0, orange, [0.55, 0.55, 0.56, 1.0]);
+    // Legs long enough to reach the ground however it falls away
+    for (x, z) in [(-1.15, -1.15), (1.15, -1.15), (1.15, 1.15), (-1.15, 1.15)] {
+        b.limb(vec3(x, -ROSTRUM_HEIGHT - 3.0, z), vec3(x, -0.3, z), 0.08, 0.08, 4, 0.0, SILVER);
+    }
+    // A rail round the back and sides
+    for (a, c) in [((-1.2, -1.2), (1.2, -1.2)), ((-1.2, -1.2), (-1.2, 1.2)), ((1.2, -1.2), (1.2, 1.2))] {
+        let (a, c) = (vec3(a.0, 1.0, a.1), vec3(c.0, 1.0, c.1));
+        b.limb(a, c, 0.04, 0.04, 4, 0.0, SILVER);
+        for p in [a, c] {
+            b.limb(vec3(p.x, 0.0, p.z), p, 0.04, 0.04, 4, 0.0, SILVER);
+        }
+    }
+    // The starter: dark trousers, a bright overall, a cap
+    let skin = [0.86, 0.66, 0.5, 1.0];
+    for x in [-0.17, 0.17] {
+        b.block(vec3(x, 0.0, 0.0), 0.13, 0.8, 0.14, 0.0, DARK, DARK);
+    }
+    b.block(vec3(0.0, 0.8, 0.0), 0.36, 0.7, 0.22, 0.0, MARSHAL, MARSHAL);
+    b.block(vec3(0.0, 1.5, 0.0), 0.2, 0.4, 0.2, 0.0, skin, skin);
+    b.block(vec3(0.0, 1.88, 0.03), 0.22, 0.1, 0.25, 0.0, WHITE, WHITE);
+    b.limb(vec3(-SHOULDER.x, SHOULDER.y, 0.0), vec3(-0.5, 0.75, 0.05), 0.1, 0.09, 4, 0.0, MARSHAL);
+}
+
+/// Black and white squares on a cloth from the top of the stick, free to
+/// ripple toward its far edge (drawn as `MeshKind::Flag`).
+fn chequered_flag(b: &mut Builder) {
+    const COLS: usize = 5;
+    const ROWS: usize = 4;
+    let (length, height, top) = (2.4, 1.6, 2.6);
+    for c in 0..COLS {
+        for r in 0..ROWS {
+            let (x0, x1) = (-length * c as f32 / COLS as f32, -length * (c + 1) as f32 / COLS as f32);
+            let (y0, y1) = (top - height * r as f32 / ROWS as f32, top - height * (r + 1) as f32 / ROWS as f32);
+            let (f0, f1) = (c as f32 / COLS as f32, (c + 1) as f32 / COLS as f32);
+            let tone = if (c + r) % 2 == 0 { [0.95, 0.95, 0.93] } else { [0.06, 0.06, 0.07] };
+            // Both faces, so it shows from the road and the stands
+            b.cloth([vec3(x0, y0, 0.0), vec3(x1, y0, 0.0), vec3(x1, y1, 0.0), vec3(x0, y1, 0.0)], [f0, f1, f1, f0], tone);
+            b.cloth([vec3(x0, y0, 0.0), vec3(x0, y1, 0.0), vec3(x1, y1, 0.0), vec3(x1, y0, 0.0)], [f0, f0, f1, f1], tone);
         }
     }
 }

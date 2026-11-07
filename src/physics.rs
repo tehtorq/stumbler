@@ -266,6 +266,8 @@ pub struct CarPhysics {
     /// How hard the underside is pressed into the ground this step
     /// (force, 0 clear of it).
     pub scrape: f32,
+    /// Where the underside touches hardest, when it does.
+    pub scrape_at: Vec3,
 }
 
 impl CarPhysics {
@@ -296,6 +298,7 @@ impl CarPhysics {
             draft: 0.0,
             setup: SETUPS[0],
             scrape: 0.0,
+            scrape_at: Vec3::ZERO,
         };
         car.place(ground, start_pos.x, start_pos.z, start_yaw);
         car
@@ -586,6 +589,9 @@ impl CarPhysics {
             } else {
                 (BODY_K * pen - BODY_DAMP * vn).max(0.0)
             };
+            if pen >= deepest {
+                self.scrape_at = p;
+            }
             self.scrape += fn_mag;
             let vt = v - n * vn;
             let friction = -vt.normalize_or_zero() * (if skids { SKID_MU } else { BODY_MU } * fn_mag).min(vt.length() * CAR_MASS / dt * 0.25);
