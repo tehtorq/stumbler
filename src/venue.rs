@@ -177,7 +177,7 @@ fn venues(network: &RoadNetwork) -> &'static Venues {
 /// Lay everything out now, rather than when the first chunk asks.
 pub fn prepare(network: &RoadNetwork) {
     venues(network);
-    trackside::floodlights(network);
+    trackside::streetlights(network);
 }
 
 /// Whether `p` is in the pit lane or on the pit wall, between a circuit's

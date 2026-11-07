@@ -16,6 +16,8 @@ struct Globals {
     screen: vec4<f32>, // xy = framebuffer size in pixels, z = rain, w = road wetness
     shadow_view_proj: mat4x4<f32>, // world to the sun's shadow map
     crowd: vec4<f32>, // xy = the car they're cheering, z = excitement 0..1, w = spare
+    street: array<vec4<f32>, 32>, // nearest streetlights: lamp xyz, w = how far on
+    street_count: u32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -49,6 +51,29 @@ fn eval_lights(frag_pos: vec3<f32>, normal: vec3<f32>, albedo: vec3<f32>) -> vec
     return result;
 }
 
+/// Light from the streetlights: warm, falling off with distance like a real
+/// lamp (inverse square, eased to nothing at its reach), and thrown mostly
+/// downward by the lamp's reflector, so the ground beneath is brightest.
+fn eval_street(frag_pos: vec3<f32>, normal: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
+    let reach = 55.0;
+    let warm = vec3<f32>(1.0, 0.78, 0.52);
+    var sum = 0.0;
+    for (var i = 0u; i < globals.street_count; i++) {
+        let lamp = globals.street[i];
+        let to_lamp = lamp.xyz - frag_pos;
+        let d2 = dot(to_lamp, to_lamp);
+        if (d2 > reach * reach) { continue; }
+        let d = sqrt(d2);
+        let l = to_lamp / max(d, 0.01);
+        let window = 1.0 - d2 / (reach * reach);
+        let falloff = window * window / (1.0 + d2 / 64.0);
+        // l.y is how far below the lamp this is, as a share of the distance
+        let downward = smoothstep(-0.05, 0.55, l.y);
+        sum += max(dot(normal, l), 0.0) * falloff * downward * lamp.w;
+    }
+    return albedo * warm * sum * 28.0;
+}
+
 // Flat face normal from screen-space derivatives, flipped to face the camera.
 // (Flipping on n.y flickered on vertical faces where n.y is ~0.)
 fn flat_normal(world_pos: vec3<f32>) -> vec3<f32> {
@@ -59,8 +84,10 @@ fn flat_normal(world_pos: vec3<f32>) -> vec3<f32> {
     return n;
 }
 
+/// 1 by day, 0 at night, easing through a long dusk. Must match
+/// `Stage::day_factor` on the CPU.
 fn day_factor() -> f32 {
-    return clamp(globals.sun_dir.y * 3.0 + 0.3, 0.0, 1.0);
+    return smoothstep(-0.3, 0.5, globals.sun_dir.y);
 }
 
 /// Colours are authored by eye (sRGB); lighting happens in linear light.

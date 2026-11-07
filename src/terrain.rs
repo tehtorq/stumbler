@@ -582,11 +582,14 @@ pub fn terrain_color(x: f32, z: f32, y: f32) -> [f32; 4] {
     let snowy = smooth(snowline, snowline + 25.0, y) * mountain + tundra * 0.6;
     c = mix3(c, rock, cliff * (1.0 - snowy * 0.6));
 
-    // Beaches where land meets water, and pale sand in the shallows
-    let shore = smooth(WATER_LEVEL + 3.5, WATER_LEVEL + 0.5, raw) * (1.0 - tundra);
+    // Beaches where land meets water, and pale sand in the shallows. Ground
+    // built up out of the water (a road's causeway and its verges) counts as
+    // land at the height it's drawn, so it's sandy rather than lake bed.
+    let ground = if y > raw + 0.5 { y } else { raw };
+    let shore = smooth(WATER_LEVEL + 3.5, WATER_LEVEL + 0.5, ground) * (1.0 - tundra);
     c = mix3(c, BEACH, shore * (1.0 - cliff));
-    if raw < WATER_LEVEL {
-        let depth = WATER_LEVEL - raw;
+    if ground < WATER_LEVEL {
+        let depth = WATER_LEVEL - ground;
         c = mix3(SHALLOWS, [0.2, 0.3, 0.32], smooth(0.0, 10.0, depth));
     }
 

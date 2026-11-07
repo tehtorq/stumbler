@@ -1625,7 +1625,7 @@ fn ground_report() {
 }
 
 /// What's built round the circuits, by `Builder::tag`.
-const TRACKSIDE: [&str; 11] = ["trackside", "floodlights", "tyres", "boards", "barriers", "bridge", "pits", "stands", "camps", "marshals", "fair"];
+const TRACKSIDE: [&str; 11] = ["trackside", "streetlights", "tyres", "boards", "barriers", "bridge", "pits", "stands", "camps", "marshals", "fair"];
 
 #[test]
 fn props_touch_the_ground_as_drawn() {

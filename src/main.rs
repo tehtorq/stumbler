@@ -12,6 +12,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 mod ai_cars;
 mod audio;
+mod biplane;
 mod birds;
 mod boosts;
 mod camera;
@@ -236,6 +237,8 @@ struct Stage {
     tour: Option<Tour>,
     /// The steam train going round the railway.
     train: Option<railway::Train>,
+    /// The biplane touring places you haven't found yet.
+    biplane: biplane::Biplane,
     progress: Progress,
     discover_timer: f32,
 
@@ -244,6 +247,7 @@ struct Stage {
     wheel_mesh: Mesh,
     shadow_mesh: Mesh,
     train_meshes: screen::TrainMeshes,
+    biplane_meshes: screen::BiplaneMeshes,
     ghost_mesh: Mesh,
     /// Start lights, lit: red during the countdown, green at the off.
     start_light_meshes: [Mesh; 2],
@@ -255,8 +259,6 @@ struct Stage {
     particle_mesh: DynamicMesh,
     skid_mesh: DynamicMesh,
     speed_line_mesh: DynamicMesh,
-    /// Pools of floodlight on the circuits after dark.
-    light_pool_mesh: DynamicMesh,
     /// When the skid mark mesh was last rebuilt (it fades, so now and then
     /// even without new marks).
     skid_mesh_time: f32,
@@ -461,6 +463,8 @@ impl Stage {
             wheel_mesh: Mesh::new(&gpu, &wheel_verts, &wheel_idxs),
             shadow_mesh: Mesh::new(&gpu, &shadow_verts, &shadow_idxs),
             train_meshes: screen::TrainMeshes::new(&gpu),
+            biplane_meshes: screen::BiplaneMeshes::new(&gpu),
+            biplane: biplane::Biplane::new(Vec2::new(player.pos.x, player.pos.z), { let f = player.forward(); Vec2::new(f.x, f.z) }),
             ghost_mesh: {
                 // The car, pale and see-through
                 let (mut v, idx) = car::generate_body_mesh(0);
@@ -488,7 +492,6 @@ impl Stage {
             particle_mesh: DynamicMesh::new(&gpu, "particles"),
             skid_mesh: DynamicMesh::new(&gpu, "skid marks"),
             speed_line_mesh: DynamicMesh::new(&gpu, "speed lines"),
-            light_pool_mesh: DynamicMesh::new(&gpu, "light pools"),
             skid_mesh_time: -1.0,
             hud_mesh: DynamicMesh::new(&gpu, "hud"),
             map_mesh: DynamicMesh::new(&gpu, "map"),
@@ -821,6 +824,7 @@ impl Stage {
         if let (Some(train), Some(rail)) = (&mut self.train, railway::get()) {
             train.update(rail, dt);
         }
+        self.fly_biplane(dt);
         if self.boost.update(&mut self.player, dt) {
             if let Some(a) = self.audio() { a.trigger_pickup(); }
         }
@@ -1103,6 +1107,30 @@ impl Stage {
             self.banner = Some((if trial { "TIME TRIAL ENDED" } else { "RACE ABANDONED" }.into(), hud::RED, 3.0));
             self.abandon_tour();
         }
+    }
+
+    /// The biplane flies on, choosing among the places still to be found
+    /// (secrets excepted: those stay secret).
+    fn fly_biplane(&mut self, dt: f32) {
+        let player = self.player_xz();
+        let (progress, world) = (&self.progress, &self.world);
+        let places = |all: bool| {
+            let landmarks = landmarks::all()
+                .iter()
+                .filter(|l| !l.kind.is_secret() && (all || !progress.landmarks.contains(&l.name)))
+                .map(|l| biplane::Destination { pos: l.pos, name: l.name.clone() });
+            let towns = towns::all()
+                .iter()
+                .filter(|t| all || !progress.places.contains(&t.name))
+                .map(|t| biplane::Destination { pos: t.centre, name: t.name.clone() });
+            let circuits = world
+                .circuits
+                .iter()
+                .filter(|c| all || !progress.circuits.contains(c.name))
+                .map(|c| biplane::Destination { pos: if c.stage { c.start() } else { c.centre }, name: c.name.to_string() });
+            landmarks.chain(towns).chain(circuits).collect::<Vec<_>>()
+        };
+        self.biplane.update(dt, player, || places(false), || places(true));
     }
 
     /// Mark circuits and landmarks as discovered when the player gets close.
@@ -1515,8 +1543,11 @@ impl Stage {
         }
     }
 
+    /// 1 by day, 0 at night, easing through a long dusk. Must match
+    /// `day_factor` in shaders/common.wgsl.
     fn day_factor(&self) -> f32 {
-        (self.sun_dir().y * 3.0 + 0.3).clamp(0.0, 1.0)
+        let t = ((self.sun_dir().y + 0.3) / 0.8).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
     }
 
     /// Circuit whose start line the player is parked near, if no race is on.

@@ -31,13 +31,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sun_scr = globals.sun_screen.xy;
     let sun_elev = globals.sun_screen.z;
 
-    // Day/night
-    let day = smoothstep(-0.3, 0.3, sun_elev);
+    // Day/night, through a long twilight (must match `horizon_color`)
+    let day = smoothstep(-0.45, 0.45, sun_elev);
 
     // Sky colors. The horizon is the fog colour (computed on the CPU) so
     // distant terrain melts into the sky.
     let day_zenith = vec3<f32>(0.25, 0.45, 0.85);
-    let sunset_factor = smoothstep(0.5, 0.0, abs(sun_elev)) * step(0.0, sun_elev + 0.2);
+    let sunset_factor = smoothstep(0.5, 0.0, abs(sun_elev)) * smoothstep(-0.4, -0.05, sun_elev);
     let sunset_zenith = vec3<f32>(0.4, 0.3, 0.6);
     let night_zenith = vec3<f32>(0.02, 0.02, 0.08);
 
@@ -55,19 +55,21 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sun_dist = length(in.screen - sun_scr);
 
     if (sun_scr.y > -1.5 && rain < 0.6) {
+        let clear = 1.0 - rain / 0.6;
         let sun_disc = smoothstep(0.1, 0.04, sun_dist);
         let disc_color = mix(vec3<f32>(1.0, 0.5, 0.15), vec3<f32>(1.0, 0.93, 0.8), day);
-        sky = mix(sky, disc_color * 14.0, sun_disc * (1.0 - rain / 0.6));
+        sky = mix(sky, disc_color * 14.0, sun_disc * clear);
 
-        let glow = exp(-sun_dist * sun_dist * 8.0) * 0.5 * day;
-        let warm_glow = exp(-sun_dist * sun_dist * 3.0) * 0.35 * sunset_factor;
+        let glow = exp(-sun_dist * sun_dist * 8.0) * 0.5 * day * clear;
+        let warm_glow = exp(-sun_dist * sun_dist * 3.0) * 0.35 * sunset_factor * clear;
         sky += vec3<f32>(0.85, 0.7, 0.4) * glow;
         sky += vec3<f32>(1.0, 0.25, 0.05) * warm_glow;
     }
 
-    // Stars at night — spherical mapping on world ray direction
-    if (day < 0.3 && rain < 0.5) {
-        let star_intensity = 1.0 - day / 0.3;
+    // Stars come out as the sky darkens, the brightest first, and the
+    // rest one by one; rain cloud hides them
+    let dusk = smoothstep(-0.02, -0.38, sun_elev) * (1.0 - smoothstep(0.15, 0.5, rain));
+    if (dusk > 0.0) {
         let azimuth = atan2(dir.x, dir.z);
         let elev = asin(clamp(dir.y, -1.0, 1.0));
         // Sparse grid cells, each holding at most one small square star
@@ -77,7 +79,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let in_cell = abs(fract(cell) - 0.5);
         if (star > 0.97 && max(in_cell.x, in_cell.y) < 0.18) {
             let brightness = fract(sin(dot(sp, vec2<f32>(93.97, 41.23))) * 31415.9);
-            sky += vec3<f32>(star_intensity * (0.2 + 1.3 * brightness * brightness));
+            let appear = 1.0 - brightness * 0.75;
+            let shown = smoothstep(appear - 0.25, appear, dusk);
+            // A slow, faint twinkle, each star to its own time
+            let twinkle = 0.85 + 0.15 * sin(globals.wind_time * (1.0 + fract(star * 731.0) * 2.0) + brightness * 40.0);
+            sky += vec3<f32>(shown * twinkle * (0.2 + 1.3 * brightness * brightness));
         }
     }
 

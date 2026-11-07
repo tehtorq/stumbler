@@ -77,7 +77,8 @@ Circuits have wide, flat run-off beyond the kerbs, so running wide costs
 time rather than sending you down a bank; tyre walls round the outside of
 the corners, braking boards
 counting down to the tight ones, sponsor hoardings along the straights, and
-floodlights that throw pools of light on the track after dark.
+streetlights reaching out over the track on alternate sides, lighting the
+road beneath them after dark.
 
 Out in the woods are gravel stages: point-to-point races from a start gantry
 somewhere out in the country to a finish gantry somewhere else, against the
@@ -132,6 +133,12 @@ Away from the circuits:
   the mountains, and over level crossings whose barriers come down, lamps
   flashing, as it nears. Its windows glow after dark, and it will shove
   aside anything left on the line. The world map shows where it is.
+- A biplane tours the island, flying unhurriedly from one place you haven't
+  found yet to the next (landmarks, towns and circuits; never the secrets)
+  and circling over each until you catch up, or it tires of waiting. Follow
+  it and it shows you somewhere new; stray far and it comes looking for
+  somewhere near you. It shows on the minimap and the world map, its wingtip
+  lights burn red and green after dark, and its shadow sweeps over the land.
 - Farms line some of the roads through the grasslands: a farmhouse, red barn,
   silo, hay bales and a tractor, with hedged fields of wheat, rapeseed,
   sunflowers (all turned to the road), young crops and fresh ploughing, and
@@ -233,7 +240,7 @@ solid, with impulses at the contact point so glancing blows spin you.
 | `secrets.rs` | The secret places, built by hand |
 | `railway.rs` | Routing the railway between the circuits, the train's tour, level crossings, viaducts and tunnel portals, and the train itself |
 | `roadside.rs` | Telegraph poles, road signs and trail fingerposts (lettered in the HUD's pixel font) |
-| `trackside.rs` | Round the circuits: gravel traps, tyre walls, the barrier line (catch fencing with sponsors' boards and bunting by the spectators, Armco elsewhere), mown stripes, braking boards, grid boxes, floodlights and the sponsors' bridge |
+| `trackside.rs` | Round the circuits: gravel traps, tyre walls, the barrier line (catch fencing with sponsors' boards and bunting by the spectators, Armco elsewhere), mown stripes, braking boards, grid boxes, streetlights and the sponsors' bridge |
 | `venue.rs` | Race day at every circuit: the pits and paddock, grandstands packed with fans, fans camped round the lap, marshals' posts and the home circuit's funfair, each on a plot it only takes if it fits |
 | `raceday.rs` | What moves over the circuits: the sponsors' airship, hot-air balloons, the television helicopter and the big wheel |
 | `skids.rs`, `speedlines.rs` | Skid marks and ruts; wind streaks at speed |
@@ -250,6 +257,7 @@ solid, with impulses at the contact point so glancing blows spin you.
 | `progress.rs` | Save file |
 | `gamepad.rs` | Gamepad steering, pedals and buttons (gilrs) |
 | `tuning.rs` | The optional feel settings file |
+| `biplane.rs` | The biplane: choosing where to fly next, flying there over the hills, circling, and its meshes |
 | `car.rs`, `trees.rs`, `birds.rs`, ... | Meshes and ambient life |
 
 ## Testing

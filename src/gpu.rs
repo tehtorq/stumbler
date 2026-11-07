@@ -62,7 +62,14 @@ pub struct Globals {
     pub shadow_view_proj: Mat4,
     /// xy = the car they're cheering, z = excitement 0..1, w = spare
     pub crowd: [f32; 4],
+    /// The streetlights nearest the camera: lamp xyz, w = how far on (0..1).
+    pub street: [[f32; 4]; MAX_STREET_LAMPS],
+    pub street_count: u32,
+    pub _pad: [u32; 3],
 }
+
+/// Streetlights the shaders light the world with at once (the nearest).
+pub const MAX_STREET_LAMPS: usize = 32;
 
 /// Times the GPU's passes (profiling only). Results are read
 /// back a few frames later through a small ring of buffers, so the pipeline

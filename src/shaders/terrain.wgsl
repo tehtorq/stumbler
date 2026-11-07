@@ -22,8 +22,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sun = sun_reaches(in.world_pos, normal) * cloud_light(in.world_pos.xz);
     var lit = sun_lighting(albedo, normal, sun);
 
-    // Dynamic lights (headlights)
-    lit += eval_lights(in.world_pos, normal, albedo);
+    // Headlights and streetlights
+    lit += eval_lights(in.world_pos, normal, albedo) + eval_street(in.world_pos, normal, albedo);
 
     lit = apply_fog(lit, in.world_pos);
     return vec4<f32>(max(lit, vec3<f32>(0.0)), 1.0);

@@ -162,7 +162,7 @@ fn shade_water(in: VertexOut, normal: vec3<f32>) -> vec4<f32> {
 
     // Clear in the shallows, opaque out in the deep
     let alpha = mix(0.32, 0.86, smoothstep(0.02, 0.7, depth)) + foam * 0.4 + fresnel * 0.1;
-    lit += eval_lights(in.world_pos, normal, albedo);
+    lit += eval_lights(in.world_pos, normal, albedo) + eval_street(in.world_pos, normal, albedo);
     lit = apply_fog(lit, in.world_pos);
     return vec4<f32>(max(lit, vec3<f32>(0.0)), clamp(alpha, 0.0, 1.0));
 }
@@ -227,7 +227,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         lit = mix(lit, haze_color(reflect(-to_eye, normal)) * 0.8, fresnel * 0.55 * wet);
         lit *= 1.0 - 0.15 * wet;
     }
-    lit += eval_lights(in.world_pos, normal, albedo) * (1.0 + 0.5 * wet);
+    lit += (eval_lights(in.world_pos, normal, albedo) + eval_street(in.world_pos, normal, albedo)) * (1.0 + 0.5 * wet);
     lit = apply_fog(lit, in.world_pos);
     return vec4<f32>(max(lit, vec3<f32>(0.0)), in.color.a);
 }

@@ -11,7 +11,7 @@ use glam::{Vec2, Vec3, vec3};
 
 use crate::collisions::Solid;
 use crate::props::{hash, Builder, Layer};
-use crate::road::{PathKind, RoadNetwork, RoadPath, CIRCUIT_SHOULDER, KERB_WIDTH, ROAD_HALF_WIDTH, SAMPLE_SPACING};
+use crate::road::{PathKind, RoadNetwork, RoadPath, KERB_WIDTH, ROAD_HALF_WIDTH, SAMPLE_SPACING};
 use crate::roadside::{lettering, text_units};
 use crate::terrain::{self, terrain_height};
 
@@ -22,13 +22,13 @@ const HAIRPIN_RADIUS: f32 = 130.0;
 /// Bends gentler than this count as straight (for hoardings).
 const STRAIGHT_RADIUS: f32 = 1200.0;
 /// Distance from the centreline: the barrier line stands on the flat
-/// shoulder, walls and fences along it; run-off lies between it and the kerb,
-/// and floodlights stand behind it. Boards are just off the kerb.
+/// shoulder, walls and fences along it; run-off lies between it and the kerb.
+/// Streetlights and boards are just off the kerb.
 pub const BARRIER_OFFSET: f32 = ROAD_HALF_WIDTH + 26.0;
 const WALL_OFFSET: f32 = BARRIER_OFFSET;
 const RUNOFF_FROM: f32 = ROAD_HALF_WIDTH + KERB_WIDTH + 0.5;
 const RUNOFF_TO: f32 = BARRIER_OFFSET - 1.5;
-const FLOODLIGHT_OFFSET: f32 = ROAD_HALF_WIDTH + CIRCUIT_SHOULDER;
+const STREETLIGHT_OFFSET: f32 = ROAD_HALF_WIDTH + KERB_WIDTH + 3.5;
 const BOARD_OFFSET: f32 = ROAD_HALF_WIDTH + 9.0;
 /// Samples of barrier in a run, a gap for getting through left at the end of each.
 const BARRIER_RUN: usize = 70;
@@ -161,55 +161,49 @@ fn clear(network: &RoadNetwork, p: Vec2, offset: f32) -> bool {
     }
 }
 
-/// A floodlight on a tall pole beside a circuit, angled down onto the track.
-pub struct Floodlight {
+/// A streetlight beside a circuit: a pole just off the kerb, its arm
+/// reaching out over the track to a lamp that lights the road below.
+pub struct Streetlight {
     /// Foot of the pole.
     pub base: Vec3,
-    /// The lamp head, out over the run-off.
+    /// Where the arm, rising from the top of the pole, levels out.
+    pub elbow: Vec3,
+    /// The lamp, out over the track: where the light comes from.
     pub head: Vec3,
-    /// Middle of the pool of light it throws on the track.
-    pub pool: Vec2,
-    /// The pool's rings laid on the ground: `POOL_RINGS[r]` round, `POOL_SIDES`
-    /// points each, ring by ring.
-    pub rings: Vec<Vec3>,
 }
 
-/// Floodlights stand this far apart round each circuit, on alternate sides.
-const FLOODLIGHT_EVERY: usize = 30;
-const FLOODLIGHT_HEIGHT: f32 = 18.0;
-/// Radius of a floodlight's pool of light, the rings it falls off in (as a
-/// share of that), and the sides of each ring.
-pub const POOL_RADIUS: f32 = 26.0;
-pub const POOL_RINGS: [f32; 4] = [0.0, 0.45, 0.75, 1.0];
-pub const POOL_SIDES: usize = 14;
+/// Streetlights stand this far apart round each circuit, on alternate sides.
+const STREETLIGHT_EVERY: usize = 18;
+const STREETLIGHT_HEIGHT: f32 = 13.0;
+/// How far in from the pole the arm reaches, over the track.
+const STREETLIGHT_REACH: f32 = 21.0;
 
-static FLOODLIGHTS: OnceLock<Vec<Floodlight>> = OnceLock::new();
+static STREETLIGHTS: OnceLock<Vec<Streetlight>> = OnceLock::new();
 
-/// Every floodlight round every circuit.
-pub fn floodlights(network: &RoadNetwork) -> &'static [Floodlight] {
-    FLOODLIGHTS.get_or_init(|| {
+/// Every streetlight round every circuit.
+pub fn streetlights(network: &RoadNetwork) -> &'static [Streetlight] {
+    STREETLIGHTS.get_or_init(|| {
         let circuits = network.paths.iter().filter(|p| p.circuit()).collect();
         crate::layout::parallel_map(circuits, |path| {
             let mut lights = Vec::new();
-            for (k, i) in (0..path.points.len()).step_by(FLOODLIGHT_EVERY).enumerate() {
+            for (k, i) in (0..path.points.len()).step_by(STREETLIGHT_EVERY).enumerate() {
                 let s = if k % 2 == 0 { 1.0 } else { -1.0 };
                 let side = side(path, i) * s;
-                let foot = path.points[i] + side * FLOODLIGHT_OFFSET;
-                // Not on the lip of a drop, where the mast would stand on nothing
+                let foot = path.points[i] + side * STREETLIGHT_OFFSET;
+                // Not on the lip of a drop, where the pole would stand on nothing
                 let lip = terrain_height(foot.x, foot.y) - crate::props::ground(foot, 2.0) > 1.5;
-                if lip || !clear(network, foot, FLOODLIGHT_OFFSET) || crate::venue::pit_lane(foot) {
+                if lip || !clear(network, foot, STREETLIGHT_OFFSET) || crate::venue::pit_lane(foot) {
                     continue;
                 }
                 let base = vec3(foot.x, crate::props::ground(foot, 0.5) - 0.3, foot.y);
-                let arm = path.points[i] + side * (FLOODLIGHT_OFFSET - 5.0);
-                let head = vec3(arm.x, base.y + FLOODLIGHT_HEIGHT, arm.y);
-                let pool = path.points[i] + side * 6.0;
-                let rings = POOL_RINGS.iter().flat_map(|&r| (0..POOL_SIDES).map(move |k| {
-                    let a = std::f32::consts::TAU * k as f32 / POOL_SIDES as f32;
-                    let p = pool + Vec2::new(a.cos(), a.sin()) * r * POOL_RADIUS;
-                    vec3(p.x, terrain_height(p.x, p.y) + 0.2, p.y)
-                })).collect();
-                lights.push(Floodlight { base, head, pool, rings });
+                let top = base.y + STREETLIGHT_HEIGHT;
+                let elbow = path.points[i] + side * (STREETLIGHT_OFFSET - STREETLIGHT_REACH * 0.35);
+                let over = path.points[i] + side * (STREETLIGHT_OFFSET - STREETLIGHT_REACH);
+                lights.push(Streetlight {
+                    base,
+                    elbow: vec3(elbow.x, top + 1.3, elbow.y),
+                    head: vec3(over.x, top + 1.6, over.y),
+                });
             }
             lights
         }).into_iter().flatten().collect()
@@ -218,9 +212,9 @@ pub fn floodlights(network: &RoadNetwork) -> &'static [Floodlight] {
 
 /// Everything trackside anchored in the chunk `inside` accepts.
 pub fn build(b: &mut Builder, network: &RoadNetwork, inside: &impl Fn(Vec2) -> bool) {
-    b.tag("floodlights");
-    for light in floodlights(network).iter().filter(|l| inside(Vec2::new(l.base.x, l.base.z))) {
-        floodlight(b, light);
+    b.tag("streetlights");
+    for light in streetlights(network).iter().filter(|l| inside(Vec2::new(l.base.x, l.base.z))) {
+        streetlight(b, light);
     }
     let layouts = layouts(network);
     for (path, layout) in network.paths.iter().filter(|p| p.circuit()).zip(layouts) {
@@ -478,21 +472,27 @@ fn bridge(b: &mut Builder, network: &RoadNetwork, path: &RoadPath, i: usize) {
 }
 
 /// A slim grey mast with an arm out toward the track and a lamp head that
-/// shines after dark.
-fn floodlight(b: &mut Builder, light: &Floodlight) {
-    let top = vec3(light.base.x, light.head.y, light.base.z);
-    b.limb(light.base, top, 0.35, 0.25, 6, 0.0, POST);
-    b.post(light.base, 0.5, FLOODLIGHT_HEIGHT);
-    // The arm and lamp hang from the top of the mast
+/// A streetlight: the pole, its arm curving up and out over the track with a
+/// brace beneath, and the lamp hanging from the end, glass facing down.
+fn streetlight(b: &mut Builder, light: &Streetlight) {
+    let top = vec3(light.base.x, light.base.y + STREETLIGHT_HEIGHT, light.base.z);
+    b.limb(light.base, top, 0.55, 0.38, 6, 0.0, POST);
+    b.post(light.base, 0.6, STREETLIGHT_HEIGHT);
+    // The arm and lamp hang out over the track
     b.tag("deck");
-    b.limb(top, light.head, 0.15, 0.15, 4, 0.0, POST);
-    let toward = (light.head - top).normalize_or_zero();
+    b.limb(top - Vec3::Y * 0.4, light.elbow, 0.36, 0.3, 5, 0.0, POST);
+    b.limb(light.elbow, light.head, 0.3, 0.26, 5, 0.0, POST);
+    b.limb(top - Vec3::Y * 2.8, top.lerp(light.elbow, 0.7), 0.16, 0.16, 4, 0.0, POST);
+    let toward = (light.head - top) * vec3(1.0, 0.0, 1.0);
+    let toward = toward.normalize_or_zero();
     let yaw = (-toward.x).atan2(-toward.z);
-    b.block(light.head - Vec3::Y * 0.6, 1.4, 0.9, 0.9, yaw, [0.2, 0.2, 0.22, 1.0], [0.2, 0.2, 0.22, 1.0]);
+    let lamp = light.head - toward * 1.6;
+    b.block(lamp - Vec3::Y * 0.6, 1.0, 0.8, 2.6, yaw, [0.22, 0.22, 0.24, 1.0], [0.3, 0.3, 0.32, 1.0]);
+    // The glass, bright enough to bloom after dark
     b.glowing = true;
-    b.block(light.head - Vec3::Y * 0.75, 1.2, 0.15, 0.75, yaw, [1.0, 0.96, 0.85, 1.0], [1.0, 0.96, 0.85, 1.0]);
+    b.block(lamp - Vec3::Y * 0.75, 0.8, 0.15, 2.3, yaw, [1.3, 1.2, 1.0, 1.0], [1.3, 1.2, 1.0, 1.0]);
     b.glowing = false;
-    b.tag("floodlights");
+    b.tag("streetlights");
 }
 
 /// Stacked tyres round the outside of a corner, every third pile painted,

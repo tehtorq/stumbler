@@ -168,6 +168,10 @@ fn build_detail(c: ChunkCoord) -> DetailData {
 /// terrain lattice. Vertex alpha is how deep the water is (0 at the shore,
 /// 1 from `WATER_DEEP_AT` down), which the shader turns into transparency,
 /// foam and wave height.
+///
+/// Depth is measured down to the ground as drawn, not the lake bed beneath:
+/// where a road crosses on its causeway the verges stand just proud of the
+/// water, and waves sized for the open lake would swell up through them.
 fn build_water(lo: Vec2) -> Option<(Vec<Vertex>, Vec<u32>)> {
     let cells = LOD_CELLS[0];
     let step = CHUNK_SIZE / cells as f32;
@@ -175,7 +179,14 @@ fn build_water(lo: Vec2) -> Option<(Vec<Vertex>, Vec<u32>)> {
     let depth: Vec<f32> = (0..row * row)
         .map(|k| {
             let p = lo + Vec2::new((k % row) as f32, (k / row) as f32) * step;
-            WATER_LEVEL - terrain::raw_height(p.x, p.y)
+            let below_lake_bed = WATER_LEVEL - terrain::raw_height(p.x, p.y);
+            // Dry land stays dry (the drawn ground never sits lower than the
+            // raw ground away from roads), so only look closer near water
+            if below_lake_bed < -2.0 {
+                below_lake_bed
+            } else {
+                WATER_LEVEL - terrain::terrain_mesh_height(p.x, p.y, step)
+            }
         })
         .collect();
     let mut idxs = Vec::new();

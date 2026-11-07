@@ -32,6 +32,26 @@ const MINIMAP_SIZE: f32 = 70.0;
 /// World units from the centre to the edge of the minimap.
 const MINIMAP_RANGE: f32 = 1400.0;
 
+/// The biplane on the maps.
+const PLANE_COLOR: [f32; 4] = [0.85, 0.95, 1.0, 1.0];
+/// The biplane is drawn this far off (the haze has it long before).
+const PLANE_DRAW_DISTANCE: f32 = 4000.0;
+
+/// The biplane, its wingtip lights and its propeller, built once.
+pub(crate) struct BiplaneMeshes {
+    body: gpu::Mesh,
+    lights: gpu::Mesh,
+    prop: gpu::Mesh,
+}
+
+impl BiplaneMeshes {
+    pub(crate) fn new(g: &gpu::GpuContext) -> Self {
+        let m = crate::biplane::build_meshes();
+        let mesh = |(v, i): &(Vec<Vertex>, Vec<u32>)| gpu::Mesh::new(g, v, i);
+        Self { body: mesh(&m.body), lights: mesh(&m.lights), prop: mesh(&m.prop) }
+    }
+}
+
 /// The train's cars and the crossing barriers, built once.
 pub(crate) struct TrainMeshes {
     loco: gpu::Mesh,
@@ -76,10 +96,12 @@ impl Stage {
 
         // Headlights at night: the player's two, plus the nearest AI cars
         let mut frame_lights: Vec<lights::Light> = Vec::new();
+        // They come up gradually from when they switch on
+        let beam = ((night - 0.1) / 0.9).clamp(0.0, 1.0);
         if night > 0.1 {
             let side = self.player.rot * Vec3::X;
             for offset in [-1.4, 1.4] {
-                frame_lights.push(headlight(&self.player, side * offset, 160.0, night * 2.0));
+                frame_lights.push(headlight(&self.player, side * offset, 160.0, beam * 2.0));
             }
             let mut nearby: Vec<&CarPhysics> = self.cars.iter()
                 .map(|c| &c.physics)
@@ -87,7 +109,7 @@ impl Stage {
                 .collect();
             nearby.sort_by(|a, b| a.pos.distance_squared(self.player.pos).total_cmp(&b.pos.distance_squared(self.player.pos)));
             for car in nearby.into_iter().take(lights::MAX_LIGHTS - 2) {
-                frame_lights.push(headlight(car, Vec3::ZERO, 110.0, night * 1.5));
+                frame_lights.push(headlight(car, Vec3::ZERO, 110.0, beam * 1.5));
             }
         }
         // The locomotive's lamp lights the line ahead after dark
@@ -123,6 +145,7 @@ impl Stage {
         let ahead = vec3(self.camera.target.x - self.camera.pos.x, 0.0, self.camera.target.z - self.camera.pos.z).normalize_or_zero();
         let shadow_focus = self.camera.pos + ahead * gpu::SHADOW_REACH * 0.7;
         let shadow_view_proj = shadow_matrix(sun_dir, shadow_focus);
+        let (street, street_count) = street_lamps(self.camera.pos, night);
         let globals = gpu::Globals {
             view_proj,
             inv_view_proj: view_proj.inverse(),
@@ -138,6 +161,9 @@ impl Stage {
             screen: [width, height, rain, self.weather.wet],
             shadow_view_proj,
             crowd: [self.player.pos.x, self.player.pos.z, self.excitement(), 0.0],
+            street,
+            street_count,
+            _pad: [0; 3],
         };
 
         // --- Per-frame meshes ---
@@ -156,8 +182,6 @@ impl Stage {
         }
         let (v, i) = self.speed_lines.mesh(self.camera.pos, self.player.vel);
         self.speed_line_mesh.update(&self.gpu, &v, &i);
-        let (v, i) = light_pools(self.camera.pos, night);
-        self.light_pool_mesh.update(&self.gpu, &v, &i);
         let (right, up) = self.camera.billboard_axes();
         let (v, i) = self.particles.build_mesh(right, up);
         self.particle_mesh.update(&self.gpu, &v, &i);
@@ -225,6 +249,15 @@ impl Stage {
             }
         }
 
+        // The biplane overhead
+        if self.biplane.pos.distance(self.camera.pos) < PLANE_DRAW_DISTANCE {
+            let m = &self.biplane_meshes;
+            let model = self.biplane.transform();
+            draws.push(Draw::paint(&m.body, model));
+            draws.push(Draw { kind: gpu::MeshKind::Glow, ..Draw::mesh(&m.lights, model) });
+            draws.push(Draw::mesh(&m.prop, self.biplane.prop_transform()));
+        }
+
         // The train, lit windows after dark, and the crossing barriers
         if train_poses.first().is_some_and(|p| p.centre.distance(self.camera.pos) < TRAIN_DRAW_DISTANCE) {
             let m = &self.train_meshes;
@@ -257,9 +290,6 @@ impl Stage {
                 }
             }
         }
-
-        // Floodlit pools on the circuits after dark
-        draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.light_pool_mesh.mesh(), identity) });
 
         // Skid marks lie see-through on the road and ground
         draws.push(Draw::new(PipelineKind::Particles, self.skid_mesh.mesh(), identity));
@@ -307,6 +337,10 @@ impl Stage {
             casters.extend(self.chunks.casters(focus, shadow_view_proj).into_iter().map(|mesh| Draw::mesh(mesh, identity)));
             let cars = std::iter::once((&self.player, &self.body_mesh))
                 .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()])));
+            // Its shadow sweeps over the ground as it passes
+            if self.biplane.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 1.4).powi(2) {
+                casters.push(Draw::mesh(&self.biplane_meshes.body, self.biplane.transform()));
+            }
             for (car, body) in cars.filter(|(car, _)| car.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 1.4).powi(2)) {
                 casters.push(Draw::mesh(body, car.body_transform()));
                 casters.extend((0..4).map(|wheel| Draw::mesh(&self.wheel_mesh, car.wheel_transform(wheel))));
@@ -703,6 +737,7 @@ impl Stage {
                 dot(h, Vec2::new(c.pos.x, c.pos.z), px * 1.0, hud::RED);
             }
         }
+        dot(h, self.biplane.xz(), px * 1.3, PLANE_COLOR);
         // The marker: a pin if it's in view, else an arrow round the edge toward it
         if let Some(m) = &self.marker {
             let q = view.project(m.pos);
@@ -764,6 +799,11 @@ impl Stage {
                     h.text(q.x + px * 2.5, q.y - px * 2.0, px * 0.6, Align::Left, "TRAIN", TRAIN_COLOR);
                 }
             }
+        }
+        let q = view.project(self.biplane.xz());
+        if inside(q, lo, hi) {
+            h.rect(q.x - px * 1.2, q.y - px * 1.2, px * 2.4, px * 2.4, PLANE_COLOR);
+            h.text(q.x + px * 2.5, q.y - px * 2.0, px * 0.6, Align::Left, "BIPLANE", PLANE_COLOR);
         }
         let label_px = px * 0.65 * zoom.powf(0.15);
         for c in &self.world.circuits {
@@ -890,38 +930,30 @@ fn stage_color(circuit: [f32; 4]) -> [f32; 4] {
     if circuit == hud::YELLOW { circuit } else { [1.0, 0.6 * circuit[1] + 0.1, 0.2, circuit[3]] }
 }
 
-/// Soft discs of light on the ground under the circuit floodlights near
-/// the camera, brightest in the middle, showing as night falls.
-fn light_pools(camera: Vec3, night: f32) -> (Vec<Vertex>, Vec<u16>) {
-    use crate::trackside::{POOL_RINGS, POOL_SIDES};
-    const RANGE: f32 = 900.0;
-    const ALPHAS: [f32; 3] = [0.17, 0.11, 0.05];
-    let (mut verts, mut idxs) = (Vec::new(), Vec::new());
-    let strength = ((night - 0.15) / 0.5).clamp(0.0, 1.0);
-    let Some(network) = crate::road::network() else { return (verts, idxs) };
-    if strength <= 0.0 {
-        return (verts, idxs);
+/// The streetlights nearest the camera, packed for the shaders: lamp
+/// position and brightness, plus how many there are. Off by day.
+fn street_lamps(camera: Vec3, night: f32) -> ([[f32; 4]; gpu::MAX_STREET_LAMPS], u32) {
+    const RANGE: f32 = 700.0;
+    let mut out = [[0.0; 4]; gpu::MAX_STREET_LAMPS];
+    // They come on as dusk deepens, and warm up over a few seconds' worth
+    let on = ((night - 0.12) / 0.45).clamp(0.0, 1.0);
+    let Some(network) = crate::road::network() else { return (out, 0) };
+    if on <= 0.0 {
+        return (out, 0);
     }
-    for light in crate::trackside::floodlights(network) {
-        if light.pool.distance(Vec2::new(camera.x, camera.z)) > RANGE || verts.len() + POOL_SIDES * 12 > u16::MAX as usize {
-            continue;
-        }
-        // Faces take one colour each, so the light falls off in steps:
-        // rings, brightest in the middle (colours above 1 mark it as a
-        // light: full strength, unshaded)
-        let at = |r: usize, k: usize| light.rings[r * POOL_SIDES + k % POOL_SIDES];
-        for r in 0..POOL_RINGS.len() - 1 {
-            let color = [1.6, 1.5, 1.3, ALPHAS[r] * strength];
-            for k in 0..POOL_SIDES {
-                let base = verts.len() as u16;
-                for p in [at(r, k), at(r + 1, k), at(r + 1, k + 1), at(r, k + 1)] {
-                    verts.push(Vertex { pos: p.into(), color });
-                }
-                idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }
-        }
+    let mut near: Vec<(f32, Vec3)> = crate::trackside::streetlights(network)
+        .iter()
+        .map(|l| (l.head.distance_squared(camera), l.head))
+        .filter(|(d, _)| *d < RANGE * RANGE)
+        .collect();
+    let count = near.len().min(gpu::MAX_STREET_LAMPS);
+    if near.len() > count {
+        near.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
     }
-    (verts, idxs)
+    for (slot, (_, head)) in out.iter_mut().zip(&near[..count]) {
+        *slot = [head.x, head.y - 0.6, head.z, on * on * (3.0 - 2.0 * on)];
+    }
+    (out, count as u32)
 }
 
 fn headlight(car: &CarPhysics, offset: Vec3, range: f32, intensity: f32) -> lights::Light {
@@ -963,8 +995,9 @@ fn horizon_color(sun_elev: f32) -> Vec3 {
         let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    let day = smooth(-0.3, 0.3, sun_elev);
-    let sunset = smooth(0.5, 0.0, sun_elev.abs()) * if sun_elev + 0.2 >= 0.0 { 1.0 } else { 0.0 };
+    // A long twilight: these must match sky.wgsl
+    let day = smooth(-0.45, 0.45, sun_elev);
+    let sunset = smooth(0.5, 0.0, sun_elev.abs()) * smooth(-0.4, -0.05, sun_elev);
     let night = vec3(0.05, 0.05, 0.1);
     let noon = vec3(0.72, 0.82, 0.92);
     let dusk = vec3(0.95, 0.55, 0.3);
