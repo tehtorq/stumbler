@@ -141,6 +141,10 @@ pub(crate) const RACERS: usize = RIVALS.len() + 1;
 const KMH_PER_UNIT: f32 = 1.8;
 /// Other cars' engines can be heard within this distance.
 const PASS_BY_RANGE: f32 = 150.0;
+/// How far off a sound falls to half its loudness, and how fast it travels
+/// (units, units a second).
+const SOUND_FALLOFF: f32 = 60.0;
+const SPEED_OF_SOUND: f32 = 340.0;
 /// Throttle down within this long before the start signal earns a boost
 /// off the line.
 const PERFECT_START_WINDOW: f32 = 0.5;
@@ -281,6 +285,16 @@ struct Stage {
     /// The crowd's roar after you take a place (1 fading to 0), and the
     /// place you were in last frame.
     cheer: f32,
+    /// Seconds in the air so far, for the thump on landing; the countdown
+    /// call last frame, to beep as each light comes on.
+    airtime: f32,
+    /// Seconds until the next look at the space around you for its
+    /// reverb, and which side of each start or finish gantry you were on.
+    room_timer: f32,
+    gate_sides: Vec<f32>,
+    /// Whether the train had whistled for each level crossing yet.
+    whistled: Vec<bool>,
+    last_call: Option<&'static str>,
     last_place: usize,
     show_map: bool,
     map: marker::MapControl,
@@ -515,6 +529,11 @@ impl Stage {
             boost: boosts::Boost::default(),
             lap_pulse: 0.0,
             cheer: 0.0,
+            airtime: 0.0,
+            room_timer: 0.0,
+            gate_sides: Vec::new(),
+            whistled: Vec::new(),
+            last_call: None,
             last_place: 0,
             show_map: false,
             map: Default::default(),
@@ -562,6 +581,32 @@ impl Stage {
 
     fn audio(&self) -> Option<&audio::AudioParams> {
         self.game_audio.as_ref().map(|a| &*a.params)
+    }
+
+    /// Where `at` sounds from the camera: (which way, how much of its
+    /// loudness carries, seconds for the sound to arrive).
+    fn hearing(&self, at: Vec3) -> (audio::Place, f32, f32) {
+        let to = at - self.camera.pos;
+        let dist = to.length();
+        let ahead = (self.camera.target - self.camera.pos).normalize_or_zero();
+        let right = ahead.cross(Vec3::Y).normalize_or_zero();
+        let place = if dist > 1.0 {
+            // Behind only once it's well round past the side
+            let front = to.dot(ahead) / dist;
+            audio::Place { pan: to.dot(right) / dist, behind: ((0.2 - front) / 0.8).clamp(0.0, 1.0) }
+        } else {
+            audio::Place::CENTRE
+        };
+        let carry = 1.0 / (1.0 + (dist / SOUND_FALLOFF).powi(2));
+        (place, carry, dist / SPEED_OF_SOUND)
+    }
+
+    /// Play `sound` as if from `at`, at `gain` from close by.
+    fn sound_at(&self, sound: audio::Sound, gain: f32, at: Vec3) {
+        let (place, carry, delay) = self.hearing(at);
+        if let Some(a) = self.audio() {
+            a.play(sound, gain * carry, place, delay);
+        }
     }
 
     fn player_xz(&self) -> Vec2 {
@@ -823,21 +868,30 @@ impl Stage {
             a.set_scrape((self.player.scrape / 2500.0).min(1.0) * (self.player.vel.length() / 25.0).min(1.0));
             let rear = self.player.wheel_contact_pos[2];
             a.set_paved(road::paved(rear.x, rear.z));
-            // The nearest car close by, louder the closer, its note rising
-            // as it closes and falling as it goes (sound at ~340 units/s)
-            let near = self.cars.iter()
+            a.set_grounded(self.player.grounded_wheels() as f32 / 4.0);
+            // The nearest cars close by, louder the closer, from where they
+            // are, each note rising as it closes and falling as it goes
+            let mut near: Vec<_> = self.cars.iter()
                 .map(|c| (c, c.physics.pos.distance(self.player.pos)))
                 .filter(|&(_, d)| d < PASS_BY_RANGE)
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            match near {
-                Some((car, d)) => {
-                    let to_me = (self.player.pos - car.physics.pos).normalize_or_zero();
-                    let closing = (car.physics.vel - self.player.vel).dot(to_me);
-                    let pitch = (1.0 + closing / 340.0).clamp(0.7, 1.4);
-                    a.set_other(car.physics.speed, (1.0 - d / PASS_BY_RANGE).powi(2), pitch);
+                .collect();
+            near.sort_by(|a, b| a.1.total_cmp(&b.1));
+            for slot in 0..audio::OTHER_CARS {
+                match near.get(slot) {
+                    Some(&(car, d)) => {
+                        let to_me = (self.player.pos - car.physics.pos).normalize_or_zero();
+                        let closing = (car.physics.vel - self.player.vel).dot(to_me);
+                        let pitch = (1.0 + closing / SPEED_OF_SOUND).clamp(0.7, 1.4);
+                        let (place, _, _) = self.hearing(car.physics.pos);
+                        a.set_other(slot, car.physics.speed, (1.0 - d / PASS_BY_RANGE).powi(2), pitch, place);
+                    }
+                    None => a.set_other(slot, 0.0, 0.0, 1.0, audio::Place::CENTRE),
                 }
-                None => a.set_other(0.0, 0.0, 1.0),
             }
+            // Birds and crickets, away from the roads and the crowds
+            let me = self.player_xz();
+            let quiet = (1.0 - road::on_road(me.x, me.y)) * (1.0 - venue::crowd_near(me) * 2.0).max(0.0);
+            a.set_ambience(if self.race.is_some() { 0.0 } else { quiet }, self.day_factor());
         }
 
         // --- Camera ---
@@ -883,6 +937,16 @@ impl Stage {
         self.particles.spray(&self.player, wet, road::paved(rear.x, rear.z), dt);
         let under = self.player.scrape_at;
         self.particles.scrape(&self.player, road::paved(under.x, under.z), dt);
+        // Coming down from a jump: the springs bottom out, harder the longer
+        // the fall
+        if self.player.grounded_wheels() == 0 {
+            self.airtime += dt;
+        } else {
+            if self.airtime > 0.25 {
+                self.sound_at(audio::Sound::Landing, (0.3 + self.airtime * 0.8).min(1.3), self.player.pos);
+            }
+            self.airtime = 0.0;
+        }
         // Off the throttle at high revs, the exhaust crackles and spits
         if self.last_throttle > 0.7 && self.throttle < 0.2 && self.player.speed > 45.0 {
             self.crackle = 0.35 + 0.3 * (now * 3.7).fract();
@@ -923,6 +987,8 @@ impl Stage {
                 train.smoke(rail, &poses, &mut self.particles, dt);
             }
         }
+        self.train_sounds();
+        self.acoustics(dt);
         self.celebrate(dt);
         self.raceday.follow(self.player.pos, self.player.heading(), dt);
         // The starter waves the field away, then the chequered flag as you
@@ -952,6 +1018,15 @@ impl Stage {
         race.record(self.player.pos, self.player.rot);
         race.check_direction(Vec2::new(self.player.vel.x, self.player.vel.z), track, dt);
         let final_lap = !race.trial && race.laps_done + 1 == race::RACE_LAPS;
+        // A beep as each light comes on, a higher one as they go out
+        let call = race.countdown_text();
+        if call != self.last_call {
+            if let (Some(c), Some(a)) = (call, self.game_audio.as_ref()) {
+                let sound = if c == "GO!" { audio::Sound::GoBeep } else { audio::Sound::Beep };
+                a.params.play(sound, 1.0, audio::Place::CENTRE, 0.0);
+            }
+            self.last_call = call;
+        }
         // Making up a place brings the crowd to its feet
         if race.phase == Phase::Racing && race.position < self.last_place {
             self.cheer = 1.0;
@@ -1001,7 +1076,7 @@ impl Stage {
                 }
                 RaceEvent::LapInvalid => self.banner = Some(("LAP NOT COUNTED - MISSED A SECTOR".into(), hud::RED, 2.5)),
                 RaceEvent::Finished => {
-                    if let Some(a) = self.game_audio.as_ref() { a.params.trigger_chime(); }
+                    if let Some(a) = self.game_audio.as_ref() { a.params.play(audio::Sound::Fanfare, 1.0, audio::Place::CENTRE, 0.0); }
                     if let Some(Race { phase: Phase::Finished { position, total_time }, stage, .. }) = &self.race {
                         self.progress.record_finish(name, *position);
                         // A stage's time is its record to beat
@@ -1109,7 +1184,122 @@ impl Stage {
             let k = (self.fireworks * 7.0) as usize;
             let colours = [[2.2, 0.5, 0.3], [0.4, 1.8, 2.2], [2.2, 2.0, 0.5], [1.8, 0.5, 2.2], [0.5, 2.2, 0.8]];
             let spread = Vec3::new(((k * 37) % 11) as f32 - 5.0, 0.0, ((k * 53) % 11) as f32 - 5.0) * 4.0;
-            self.particles.firework(ahead + Vec3::Y * (22.0 + (k % 3) as f32 * 8.0) + spread, colours[k % colours.len()]);
+            let burst = ahead + Vec3::Y * (22.0 + (k % 3) as f32 * 8.0) + spread;
+            self.particles.firework(burst, colours[k % colours.len()]);
+            // Heard a moment after it's seen, as it's well off
+            self.sound_at(audio::Sound::Boom, 2.5, burst);
+        }
+    }
+
+    /// How the space around you rings: off the grandstands, back from the
+    /// hillsides of a valley (with an echo off the nearest), softly among
+    /// trees; and a rush of air going under a gantry.
+    fn acoustics(&mut self, dt: f32) {
+        let me = self.player_xz();
+        let speed = self.player.vel.length();
+        // Under a gantry: you've crossed its line between its poles
+        let gates: Vec<(Vec2, Vec2, f32)> = self.world.circuits.iter().flat_map(|c| {
+            let finish = c.stage.then(|| {
+                let i = c.finish_idx();
+                (c.points[i], (c.points[i + 1] - c.points[i]).normalize_or_zero(), c.gate_half())
+            });
+            std::iter::once((c.start(), c.start_dir(), c.gate_half())).chain(finish)
+        }).collect();
+        self.gate_sides.resize(gates.len(), 0.0);
+        let mut under = false;
+        for (k, &(at, dir, half)) in gates.iter().enumerate() {
+            let to = me - at;
+            if to.length() > 80.0 {
+                self.gate_sides[k] = 0.0;
+                continue;
+            }
+            let along = to.dot(dir);
+            let beside = to.perp_dot(dir).abs();
+            under |= self.gate_sides[k] != 0.0 && self.gate_sides[k].signum() != along.signum() && beside < half;
+            self.gate_sides[k] = along;
+        }
+        if under && speed > 20.0 {
+            if let Some(a) = self.audio() {
+                a.play(audio::Sound::Swish, (speed / 60.0).min(1.2), audio::Place::CENTRE, 0.0);
+            }
+        }
+
+        self.room_timer -= dt;
+        if self.room_timer > 0.0 {
+            return;
+        }
+        self.room_timer = 0.2;
+        // Hillsides: in eight directions, the first ground standing well
+        // above you, and the echo off the one that sends back the most
+        let ear = self.player.pos.y + 1.0;
+        let mut walled = 0;
+        let (mut echo, mut echo_delay) = (0.0_f32, 0.0_f32);
+        for k in 0..8 {
+            let dir = Vec2::from_angle(k as f32 * std::f32::consts::TAU / 8.0);
+            for d in [25.0, 50.0, 90.0, 150.0] {
+                let p = me + dir * d;
+                let rise = terrain::terrain_height(p.x, p.y) - ear;
+                if rise > 6.0 {
+                    walled += 1;
+                    let back = (rise / 40.0).min(1.0) * (1.0 - d / 200.0) * 0.3;
+                    if back > echo && 2.0 * d / SPEED_OF_SOUND <= audio::ECHO_LONGEST {
+                        (echo, echo_delay) = (back, 2.0 * d / SPEED_OF_SOUND);
+                    }
+                    break;
+                }
+            }
+        }
+        let valley = walled as f32 / 8.0;
+        let stands = venue::crowd_near(me).powf(1.5);
+        let trees = self.chunks.trees_near(me.x, me.y)
+            .filter(|t| Vec2::new(t[0], t[1]).distance_squared(me) < 30.0 * 30.0)
+            .count();
+        let forest = (trees as f32 / 20.0).min(1.0);
+        // Whichever kind of space rings most says how long it rings
+        let (wet, decay) = [(stands * 0.35, 0.75), (valley * 0.3, 0.5 + 0.35 * valley), (forest * 0.16, 0.3)]
+            .into_iter()
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap_or((0.0, 0.0));
+        if let Some(a) = self.audio() {
+            a.set_room(wet, decay, echo, echo_delay);
+        }
+    }
+
+    /// The steam train chuffing along (muffled in its tunnel), its whistle
+    /// as it nears each crossing, and the bell at a crossing while its
+    /// lights flash.
+    fn train_sounds(&mut self) {
+        let (Some(train), Some(rail)) = (&self.train, railway::get()) else { return };
+        let loco = train.poses(rail)[0].centre;
+        let (place, carry, delay) = self.hearing(loco);
+        let muffle = if rail.in_tunnel(train.distance) { 0.3 } else { 1.0 };
+        let mut whistles = Vec::new();
+        // On the first look, note where the lights already flash without
+        // whistling for them
+        let fresh = self.whistled.len() != rail.crossings.len();
+        self.whistled.resize(rail.crossings.len(), false);
+        let mut bell: Option<(audio::Place, f32)> = None;
+        for (c, crossing) in rail.crossings.iter().enumerate() {
+            let warning = train.warning(rail, c);
+            if warning && !self.whistled[c] && !fresh {
+                whistles.push(());
+            }
+            self.whistled[c] = warning;
+            if warning {
+                let (bell_place, bell_carry, _) = self.hearing(crossing.pos);
+                if bell.is_none_or(|(_, loudest)| bell_carry > loudest) {
+                    bell = Some((bell_place, bell_carry));
+                }
+            }
+        }
+        let Some(a) = self.audio() else { return };
+        a.set_train(carry * 6.0 * muffle, railway::TRAIN_SPEED * 0.3, place);
+        match bell {
+            Some((place, carry)) => a.set_bell(carry * 2.5, place),
+            None => a.set_bell(0.0, audio::Place::CENTRE),
+        }
+        for _ in whistles {
+            a.play(audio::Sound::Whistle, (carry * 20.0).min(1.0) * muffle, place, delay);
         }
     }
 
@@ -1123,7 +1313,7 @@ impl Stage {
             let already = self.sway_events.iter().any(|s| (s.x - tx).abs() < 1.0 && (s.z - tz).abs() < 1.0);
             if !already {
                 if hit.impact_speed > 5.0 {
-                    if let Some(a) = self.audio() { a.trigger_impact(); }
+                    self.sound_at(audio::Sound::Thunk, hit.impact_speed / 30.0, hit.point);
                     self.particles.burst(hit.point + Vec3::Y * 6.0, [0.35, 0.55, 0.2], 14, 9.0);
                 }
                 if self.sway_events.len() >= MAX_SWAY {
@@ -1146,7 +1336,7 @@ impl Stage {
         let solids: Vec<collisions::Solid> = self.chunks.solids_near(px, pz).copied().collect();
         if let Some(hit) = collisions::car_vs_solids(&mut self.player, &solids) {
             if hit.impact_speed > 5.0 {
-                if let Some(a) = self.audio() { a.trigger_impact(); }
+                self.sound_at(audio::Sound::Clang, hit.impact_speed / 30.0, hit.point);
                 self.particles.burst(hit.point, [0.6, 0.58, 0.55], 8, 6.0);
                 if hit.impact_speed > 12.0 {
                     self.particles.sparks(hit.point + Vec3::Y * 0.5, (hit.impact_speed * 0.6) as usize, 14.0);
@@ -1161,7 +1351,8 @@ impl Stage {
                 let solids = railway::Train::solids(&poses);
                 if let Some(hit) = collisions::car_vs_moving(&mut self.player, &solids) {
                     if hit.impact_speed > 4.0 {
-                        if let Some(a) = self.audio() { a.trigger_impact(); }
+                        self.sound_at(audio::Sound::Clang, 1.2, hit.point);
+                        self.sound_at(audio::Sound::Crunch, hit.impact_speed / 20.0, hit.point);
                         self.particles.burst(hit.point, [0.6, 0.58, 0.55], 10, 7.0);
                     }
                 }
@@ -1174,21 +1365,23 @@ impl Stage {
         let player_pos = self.player.pos;
         let near = move |c: &CarPhysics| c.pos.distance_squared(player_pos) < AI_PHYSICS_RANGE * AI_PHYSICS_RANGE;
         // Cars nearby hit tyre walls, hoardings and buildings too
+        let mut clangs = Vec::new();
         for car in self.cars.iter_mut().filter(|c| near(&c.physics)) {
             let solids: Vec<collisions::Solid> = self.chunks.solids_near(car.physics.pos.x, car.physics.pos.z).copied().collect();
             if let Some(hit) = collisions::car_vs_solids(&mut car.physics, &solids) {
+                if hit.impact_speed > 8.0 {
+                    clangs.push((hit.point, hit.impact_speed));
+                }
                 if hit.impact_speed > 12.0 && hit.point.distance(self.camera.pos) < 400.0 {
                     self.particles.sparks(hit.point + Vec3::Y * 0.5, (hit.impact_speed * 0.5) as usize, 12.0);
                 }
             }
         }
-        let mut player_hit = false;
         let paint = |idx: usize| car::CAR_COLORS[idx % car::CAR_COLORS.len()];
         // Knocks between cars throw sparks, and bits of each car's paint
         let mut knocks: Vec<(Vec3, f32, [f32; 3], [f32; 3])> = Vec::new();
         for car in &mut self.cars {
             if let Some(hit) = collisions::car_vs_car(&mut self.player, &mut car.physics) {
-                player_hit |= hit.impact_speed > 4.0;
                 knocks.push((hit.point, hit.impact_speed, paint(self.car_color), paint(car.color_idx)));
             }
         }
@@ -1203,6 +1396,7 @@ impl Stage {
                 }
             }
         }
+        let knocks_heard = knocks.clone();
         for (at, speed, a, b) in knocks {
             if speed > 6.0 && at.distance(self.camera.pos) < 400.0 {
                 let bits = (speed * 0.4).min(12.0) as usize;
@@ -1211,8 +1405,15 @@ impl Stage {
                 self.particles.shards(at + Vec3::Y * 1.2, b, bits / 2 + 1, 8.0);
             }
         }
-        if player_hit {
-            if let Some(a) = self.audio() { a.trigger_impact(); }
+        // Every knock heard from where it happened: rivals banging wheels
+        // ahead of you as well as your own
+        for (at, speed, _, _) in &knocks_heard {
+            if *speed > 4.0 {
+                self.sound_at(audio::Sound::Crunch, speed / 25.0, *at);
+            }
+        }
+        for (at, speed) in clangs {
+            self.sound_at(audio::Sound::Clang, speed / 35.0, at);
         }
     }
 
@@ -1244,7 +1445,7 @@ impl Stage {
         }
         let on_pad = self.world.boost_pads.iter().any(|pad| pad.contains(pos.x, pos.z));
         if on_pad && self.boost.pad() {
-            if let Some(a) = self.audio() { a.trigger_pickup(); }
+            if let Some(a) = self.audio() { a.play(audio::Sound::Whoosh, 1.0, audio::Place::CENTRE, 0.0); }
             self.particles.burst(pos, [0.2, 0.85, 1.0], 20, 10.0);
         }
     }
@@ -1275,7 +1476,7 @@ impl Stage {
         let me = self.player_xz();
         if let Some(speed) = step.splash {
             self.particles.splash(Vec3::new(me.x, terrain::WATER_LEVEL + 0.3, me.y), speed);
-            if let Some(a) = self.audio() { a.trigger_impact(); }
+            self.sound_at(audio::Sound::Splash, 0.5 + speed / 40.0, self.player.pos);
         }
         if step.sinking {
             self.particles.bubbles(self.player.pos, terrain::WATER_LEVEL, dt);
