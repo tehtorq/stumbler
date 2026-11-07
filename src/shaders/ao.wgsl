@@ -36,7 +36,8 @@ fn fs_main(in: ScreenOut) -> @location(0) vec4<f32> {
     let size = vec2<f32>(textureDimensions(half_depth));
     let px = vec2<i32>(in.clip.xy);
     let depth = depth_at(px);
-    if (depth >= 1.0) {
+    // Reversed depth: the sky is left at 0
+    if (depth <= 0.0) {
         return vec4<f32>(1.0, SKY_DISTANCE, 0.0, 1.0);
     }
     let p = world_at(px, depth);

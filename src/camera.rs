@@ -65,7 +65,10 @@ impl ChaseCamera {
         let speed_ratio = (speed.abs() / 170.0).min(1.0);
         let fov = 60.0 + speed_ratio * crate::tuning::get().fov_at_speed + self.fov_kick;
         let far = crate::chunks::DRAW_DISTANCE + 800.0;
-        let proj = Mat4::perspective_lh(fov.to_radians(), aspect, 1.0, far);
+        // Reversed depth (near at 1, far at 0): with a float depth buffer that
+        // keeps nearly even precision all the way out, so lettering a few
+        // centimetres proud of a board doesn't flicker through it far off
+        let proj = Mat4::perspective_lh(fov.to_radians(), aspect, far, 1.0);
         let shake_amount = ((speed_ratio - 0.7).max(0.0) / 0.3) * 0.15 + self.rumble * 0.35;
         let t = time * 30.0;
         // Two frequencies, so the judder doesn't look like a clean wobble

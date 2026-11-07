@@ -178,6 +178,7 @@ fn venues(network: &RoadNetwork) -> &'static Venues {
 pub fn prepare(network: &RoadNetwork) {
     venues(network);
     trackside::streetlights(network);
+    crate::roadside::prepare(network);
 }
 
 /// Whether `p` is in the pit lane or on the pit wall, between a circuit's

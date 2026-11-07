@@ -18,6 +18,7 @@ mod boosts;
 mod camera;
 mod car;
 mod chunks;
+mod debug;
 mod circuit_data;
 mod collectibles;
 mod collisions;
@@ -239,6 +240,8 @@ struct Stage {
     train: Option<railway::Train>,
     /// The biplane touring places you haven't found yet.
     biplane: biplane::Biplane,
+    /// The debug menu (]) and the graphics settings it holds.
+    debug: debug::DebugMenu,
     progress: Progress,
     discover_timer: f32,
 
@@ -464,6 +467,7 @@ impl Stage {
             shadow_mesh: Mesh::new(&gpu, &shadow_verts, &shadow_idxs),
             train_meshes: screen::TrainMeshes::new(&gpu),
             biplane_meshes: screen::BiplaneMeshes::new(&gpu),
+            debug: Default::default(),
             biplane: biplane::Biplane::new(Vec2::new(player.pos.x, player.pos.z), { let f = player.forward(); Vec2::new(f.x, f.z) }),
             ghost_mesh: {
                 // The car, pale and see-through
@@ -748,7 +752,9 @@ impl Stage {
         let now = self.time();
         let dt = (now - self.last_time).clamp(0.001, 0.05);
         self.last_time = now;
-        self.day_time = (self.day_time + dt / DAY_LENGTH).fract();
+        if !self.debug.freeze_time {
+            self.day_time = (self.day_time + dt / DAY_LENGTH).fract();
+        }
         self.weather.update(now, dt);
         let grip = weather::grip();
         for car in &mut self.cars {
@@ -1560,6 +1566,16 @@ impl Stage {
 
     /// Returns true if the game should quit.
     fn key_down(&mut self, key: KeyCode) -> bool {
+        if self.debug.open {
+            if self.debug_key(key) {
+                return false;
+            }
+        } else if key == KeyCode::BracketRight {
+            // Let go of everything, so the car doesn't drive on under the menu
+            self.controls = Default::default();
+            self.debug.open = true;
+            return false;
+        }
         if self.show_map {
             if let Some(quit) = self.map_key(key) {
                 return quit;
@@ -1770,7 +1786,7 @@ impl ApplicationHandler for App {
             } => {
                 if !state.is_pressed() {
                     stage.key_up(key);
-                } else if !repeat && stage.key_down(key) {
+                } else if (!repeat || stage.debug.open) && stage.key_down(key) {
                     event_loop.exit();
                 }
             }

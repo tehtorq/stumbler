@@ -9,7 +9,7 @@ fn sun_reaches(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     // Lifted off the surface, so a face doesn't shadow itself
     let p = globals.shadow_view_proj * vec4<f32>(world_pos + normal * 0.4, 1.0);
     let edge = max(abs(p.x), abs(p.y));
-    if (edge >= 1.0 || p.z >= 1.0 || p.z <= 0.0) {
+    if (globals.extra.x < 0.5 || edge >= 1.0 || p.z >= 1.0 || p.z <= 0.0) {
         return 1.0;
     }
     let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);

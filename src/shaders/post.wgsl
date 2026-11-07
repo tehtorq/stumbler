@@ -6,8 +6,6 @@
 @group(0) @binding(3) var ao_tex: texture_2d<f32>;
 @group(0) @binding(5) var bilinear: sampler;
 
-const BLOOM: f32 = 0.12;
-const AO_STRENGTH: f32 = 0.85;
 
 /// The half-res AO, blurred over its neighbours at a similar distance
 /// (the AO target holds the distance alongside)
@@ -50,19 +48,22 @@ fn neutral_tonemap(color: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: ScreenOut) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(in.clip.xy);
-    var color = textureLoad(hdr_tex, px, 0).rgb;
+    // The world may be drawn smaller than the screen (the resolution
+    // setting): scale it up, finding AO by the drawn frame's pixels
+    let px = vec2<i32>(in.uv * vec2<f32>(textureDimensions(hdr_tex)));
+    var color = textureSampleLevel(hdr_tex, bilinear, in.uv, 0.0).rgb;
     let ao = ambient_occlusion(px);
-    color *= mix(1.0, ao, AO_STRENGTH);
-    color += textureSampleLevel(bloom_tex, bilinear, in.uv, 0.0).rgb * BLOOM;
+    // Strengths from the settings (see `debug::Graphics`)
+    color *= mix(1.0, ao, globals.post.x);
+    color += textureSampleLevel(bloom_tex, bilinear, in.uv, 0.0).rgb * globals.post.y;
     // Eye adjusting to the high sun, as the midday light would otherwise
     // wash everything out
-    let exposure = mix(1.0, 0.7, smoothstep(0.3, 0.95, globals.sun_dir.y));
+    let exposure = mix(1.0, 0.7, smoothstep(0.3, 0.95, globals.sun_dir.y)) * globals.post.z;
     color = neutral_tonemap(color * exposure);
 
     // Gentle vignette pulls the eye to the middle
     let centred = in.uv - 0.5;
-    color *= 1.0 - dot(centred, centred) * 0.35;
+    color *= 1.0 - dot(centred, centred) * 0.35 * globals.post.w;
 
     var display = pow(color, vec3<f32>(1.0 / 2.2));
     // Dither away banding in the sky's long gradients

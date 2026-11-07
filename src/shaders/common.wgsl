@@ -18,6 +18,8 @@ struct Globals {
     crowd: vec4<f32>, // xy = the car they're cheering, z = excitement 0..1, w = spare
     street: array<vec4<f32>, 32>, // nearest streetlights: lamp xyz, w = how far on
     street_count: u32,
+    post: vec4<f32>,  // AO strength, bloom strength, exposure, vignette
+    extra: vec4<f32>, // x = sun shadows on
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;

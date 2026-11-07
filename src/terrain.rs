@@ -151,9 +151,10 @@ pub fn natural_height(x: f32, z: f32) -> f32 {
 /// Public terrain height: natural ground, flattened under and around roads.
 /// This is the surface physics drives on and the road mesh sits on.
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    let natural = natural_height(x, z);
+    let raw = terrain_height_raw(x, z);
+    let natural = raw.max(WATER_FLOOR);
     match road::network().and_then(|n| n.nearest_ground(x, z)) {
-        Some(s) => road_blend(s, natural),
+        Some(s) => road_blend(s, natural, raw),
         None => natural,
     }
 }
@@ -163,18 +164,31 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
 pub fn solid_height(x: f32, z: f32) -> f32 {
     let raw = terrain_height_raw(x, z);
     match road::network().and_then(|n| n.nearest_ground(x, z)) {
-        Some(s) => road_blend(s, raw.max(WATER_LEVEL + 1.0)),
+        Some(s) => road_blend(s, raw, raw),
         None => raw,
     }
 }
 
-/// Flat across the asphalt and shoulder, then a smooth blend to natural ground.
-fn road_blend(s: road::RoadSample, natural: f32) -> f32 {
-    let flat = s.half_width() + s.shoulder();
+/// Over open water a road runs on a narrow causeway: this much flat verge
+/// beyond the asphalt (room for its low walls), then a bank at least this
+/// wide dropping into the lake.
+const CAUSEWAY_VERGE: f32 = 3.0;
+const CAUSEWAY_BANK: f32 = 9.0;
+
+/// Flat across the asphalt and shoulder, then a smooth blend to `natural`
+/// ground. Where the land beneath (`raw`) is under water, the shoulder
+/// narrows to a causeway's verge and its bank drops steeply instead.
+fn road_blend(s: road::RoadSample, natural: f32, raw: f32) -> f32 {
+    let wet = smooth(WATER_LEVEL + 2.0, WATER_LEVEL - 0.5, raw);
+    let flat = s.half_width() + s.shoulder() + (CAUSEWAY_VERGE - s.shoulder()) * wet;
     if s.dist <= flat {
         return s.height;
     }
-    let t = ((s.dist - flat) / road::BLEND).min(1.0);
+    // No steeper than about 1 in 3, so a road high above the shore doesn't
+    // end in a cliff (and a car down the bank can drive back up)
+    let bank = CAUSEWAY_BANK.max((s.height - natural).max(0.0) * 3.0);
+    let blend = road::BLEND + (bank - road::BLEND) * wet;
+    let t = ((s.dist - flat) / blend).min(1.0);
     let t = t * t * (3.0 - 2.0 * t);
     s.height + (natural - s.height) * t
 }
@@ -187,10 +201,19 @@ pub(crate) fn terrain_mesh_height(x: f32, z: f32, step: f32) -> f32 {
     let raw = terrain_height_raw(x, z);
     match road::network().and_then(|n| n.nearest_ground(x, z)) {
         Some(s) => {
-            let h = road_blend(s, raw.max(WATER_LEVEL + 1.0));
-            if s.dist < s.half_width() + road::KERB_WIDTH + step * std::f32::consts::SQRT_2 {
+            let h = road_blend(s, raw, raw);
+            let reach = s.half_width() + road::KERB_WIDTH + step * std::f32::consts::SQRT_2;
+            if s.dist < reach {
                 // Coarser cells bridge dips in the road more, so sit a little lower
-                h.min(s.height - 0.3 - step * 0.012)
+                let under = s.height - 0.3 - step * 0.012;
+                // On a causeway the bank drops away within a cell: hold the
+                // lattice points beside the road up at its level, so the
+                // triangles under its edge don't sag toward the lake bed
+                if raw < WATER_LEVEL && s.dist < s.half_width() + step * std::f32::consts::SQRT_2 {
+                    under
+                } else {
+                    h.min(under)
+                }
             } else {
                 h
             }
@@ -583,10 +606,12 @@ pub fn terrain_color(x: f32, z: f32, y: f32) -> [f32; 4] {
     c = mix3(c, rock, cliff * (1.0 - snowy * 0.6));
 
     // Beaches where land meets water, and pale sand in the shallows. Ground
-    // built up out of the water (a road's causeway and its verges) counts as
-    // land at the height it's drawn, so it's sandy rather than lake bed.
-    let ground = if y > raw + 0.5 { y } else { raw };
-    let shore = smooth(WATER_LEVEL + 3.5, WATER_LEVEL + 0.5, ground) * (1.0 - tundra);
+    // built up out of the water (a road's causeway, its verge and bank) is
+    // judged at the height it's drawn, and has no beach: it stays grass to
+    // the waterline.
+    let built_up = y > raw + 0.5;
+    let ground = if built_up { y } else { raw };
+    let shore = if built_up { 0.0 } else { smooth(WATER_LEVEL + 3.5, WATER_LEVEL + 0.5, ground) * (1.0 - tundra) };
     c = mix3(c, BEACH, shore * (1.0 - cliff));
     if ground < WATER_LEVEL {
         let depth = WATER_LEVEL - ground;

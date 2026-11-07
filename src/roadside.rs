@@ -143,12 +143,151 @@ pub fn build(b: &mut Builder, network: &RoadNetwork, inside: &impl Fn(Vec2) -> b
             }
         }
     }
+    for piece in causeway_pieces(network).iter().filter(|w| inside((w.a + w.c) * 0.5)) {
+        wall_piece(b, piece);
+    }
     for sign in SIGNS.get().map_or(&[][..], Vec::as_slice).iter().filter(|s| inside(s.pos)) {
         match &sign.kind {
             Kind::Road { front, back } => road_sign(b, sign.pos, sign.dir, front, back),
             Kind::Finger { name } => fingerpost(b, sign.pos, sign.dir, name),
         }
     }
+}
+
+/// Low concrete walls along both edges of a road where it crosses water on
+/// its causeway, so a car can't run off into the lake: along any stretch
+/// where the ground beside the road drops away, with short gaps filled in
+/// and each run carried a little way onto dry land at its ends, so a car
+/// sliding along one never finds a gap to fall through or an end to hit.
+/// Not across a junction, where another road meets this one.
+struct WallPiece {
+    a: Vec2,
+    c: Vec2,
+    /// Foot of the wall, and how much higher the far end's road is.
+    y: f32,
+    rise: f32,
+    shade: f32,
+}
+
+const WALL_HEIGHT: f32 = 1.1;
+/// It looks a low kerb of a wall, but stops a car as if it were taller: the
+/// car's underside rides higher than its top.
+const WALL_COLLIDER_EXTRA: f32 = 2.5;
+/// Samples per wall piece.
+const WALL_STEP: usize = 2;
+/// Gaps this many pieces long or less in a run are walled anyway.
+const WALL_GAP_FILL: usize = 4;
+/// Pieces a run carries on past where it's needed, at each end.
+const WALL_OVERRUN: usize = 4;
+
+static CAUSEWAY_WALLS: OnceLock<Vec<WallPiece>> = OnceLock::new();
+
+/// Lay the causeway walls out now (on the loading thread), rather than when
+/// the first chunk asks.
+pub fn prepare(network: &RoadNetwork) {
+    causeway_pieces(network);
+}
+
+fn causeway_pieces(network: &RoadNetwork) -> &'static [WallPiece] {
+    CAUSEWAY_WALLS.get_or_init(|| {
+        let paths: Vec<&RoadPath> = network.paths.iter().filter(|p| p.kind != PathKind::Rail).collect();
+        crate::layout::parallel_map(paths, |path| path_walls(network, path)).into_iter().flatten().collect()
+    })
+}
+
+fn path_walls(network: &RoadNetwork, path: &RoadPath) -> Vec<WallPiece> {
+    let n = path.points.len();
+    let mut pieces = Vec::new();
+    if n < WALL_STEP + 1 {
+        return pieces;
+    }
+    let count = if path.closed { n / WALL_STEP } else { (n - 1) / WALL_STEP };
+    let ends = |k: usize| (k * WALL_STEP, (k * WALL_STEP + WALL_STEP) % n);
+    let off = path.kind.half_width() + 1.4;
+    let across = |i: usize| {
+        let t = path.tangent(i);
+        Vec2::new(-t.y, t.x)
+    };
+    // Does the ground fall away into water anywhere a car could reach after
+    // leaving the road here? (Near the shore the verge widens back toward a
+    // full shoulder, but its bank still drops into the lake beyond.) Only
+    // over water, so roads along hillsides don't get walls.
+    let drops = |i: usize, s: f32| {
+        [4.0, 10.0, 16.0, 22.0, 28.0].iter().any(|&d| {
+            let probe = path.points[i] + across(i) * s * (off + d);
+            let ground = terrain::solid_height(probe.x, probe.y);
+            ground < WATER_LEVEL + 0.5 && ground < path.heights[i] - 1.0
+        })
+    };
+    // Not standing on another road's surface (where it joins or crosses this
+    // one), but right up to its edge, so the corner of a junction is closed
+    let clear = |w: Vec2| !network.on_surface(w.x, w.y, 0.5);
+    let index = |k: isize| -> Option<usize> {
+        if path.closed {
+            Some(k.rem_euclid(count as isize) as usize)
+        } else {
+            (0..count as isize).contains(&k).then_some(k as usize)
+        }
+    };
+    for s in [-1.0, 1.0] {
+        let needed: Vec<bool> = (0..count).map(|k| {
+            let (i, j) = ends(k);
+            drops(i, s) || drops(j, s)
+        }).collect();
+        // Fill short gaps, then carry each run on past its ends
+        let near = |k: usize, reach: usize| {
+            (1..=reach as isize).any(|d| index(k as isize - d).is_some_and(|q| needed[q]))
+                && (1..=reach as isize).any(|d| index(k as isize + d).is_some_and(|q| needed[q]))
+        };
+        let filled: Vec<bool> = (0..count).map(|k| needed[k] || near(k, WALL_GAP_FILL)).collect();
+        let walled: Vec<bool> = (0..count)
+            .map(|k| (-(WALL_OVERRUN as isize)..=WALL_OVERRUN as isize).any(|d| index(k as isize + d).is_some_and(|q| filled[q])))
+            .collect();
+        for k in (0..count).filter(|&k| walled[k]) {
+            let (i, j) = ends(k);
+            let (a, c) = (path.points[i] + across(i) * s * off, path.points[j] + across(j) * s * off);
+            if a.distance(c) < 0.5 || !clear(a) || !clear(c) {
+                continue;
+            }
+            pieces.push(WallPiece {
+                a,
+                c,
+                y: path.heights[i].min(path.heights[j]) - 0.3,
+                rise: (path.heights[i] - path.heights[j]).abs(),
+                shade: if k % 2 == 0 { 1.0 } else { 0.93 },
+            });
+        }
+    }
+    pieces
+}
+
+/// One wall piece and its collider. The ends overlap a little, so a car
+/// can't catch a seam.
+fn wall_piece(b: &mut Builder, w: &WallPiece) {
+    let along = w.c - w.a;
+    let len = along.length();
+    let mid = (w.a + w.c) * 0.5;
+    let yaw = (-along.x).atan2(-along.y);
+    let half = Vec2::new(0.35, len * 0.5 + 0.15);
+    let side = [0.74 * w.shade, 0.73 * w.shade, 0.7 * w.shade, 1.0];
+    b.block(vec3(mid.x, w.y, mid.y), half.x, WALL_HEIGHT + w.rise, half.y, yaw, side, [0.82, 0.81, 0.78, 1.0]);
+    b.solids.push(crate::collisions::Solid { centre: mid, half, yaw, top: w.y + WALL_HEIGHT + w.rise + WALL_COLLIDER_EXTRA, round: false });
+}
+
+/// Every causeway wall's collider across the network, bucketed into
+/// `cell`-unit squares, for simulations that run without the chunk streamer.
+#[cfg(test)]
+pub fn causeway_solids(network: &RoadNetwork, cell: f32) -> std::collections::HashMap<(i32, i32), Vec<crate::collisions::Solid>> {
+    let mut b = Builder::default();
+    for piece in causeway_pieces(network) {
+        wall_piece(&mut b, piece);
+    }
+    let mut cells: std::collections::HashMap<(i32, i32), Vec<crate::collisions::Solid>> = Default::default();
+    for solid in b.solids {
+        let key = ((solid.centre.x / cell).floor() as i32, (solid.centre.y / cell).floor() as i32);
+        cells.entry(key).or_default().push(solid);
+    }
+    cells
 }
 
 /// Where the pole by sample `i` of road `r` stands (its foot, and the

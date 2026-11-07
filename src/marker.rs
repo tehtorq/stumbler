@@ -75,6 +75,7 @@ impl Stage {
     /// A key pressed with the map open: `Some(quit)` if the map used it.
     pub(crate) fn map_key(&mut self, key: KeyCode) -> Option<bool> {
         match key {
+            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space if self.debug.map_drop => self.drop_car(self.map.cursor),
             KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => self.set_marker(self.map.cursor),
             KeyCode::Backspace | KeyCode::Delete => self.clear_marker(),
             KeyCode::Equal | KeyCode::NumpadAdd | KeyCode::KeyE | KeyCode::PageUp => self.zoom_map(2.0_f32.sqrt(), self.map.cursor),
@@ -93,6 +94,13 @@ impl Stage {
             _ => return None,
         }
         Some(false)
+    }
+
+    /// Debug: put the car down at `p` (facing the way it was) and close the map.
+    fn drop_car(&mut self, p: Vec2) {
+        let yaw = self.player.yaw();
+        self.teleport(p, yaw, "DROPPED".into());
+        self.show_map = false;
     }
 
     /// With the map open: the held arrow keys (or the stick) move the
@@ -129,6 +137,7 @@ impl Stage {
             return;
         }
         match button {
+            MouseButton::Left if self.debug.map_drop => self.drop_car(self.map.cursor),
             MouseButton::Left => self.set_marker(self.map.cursor),
             MouseButton::Right => self.clear_marker(),
             _ => {}

@@ -586,6 +586,12 @@ impl RoadNetwork {
         best
     }
 
+    /// Whether `(x, z)` is on the surface of some path the ground meets (within
+    /// `margin` of its edge).
+    pub fn on_surface(&self, x: f32, z: f32, margin: f32) -> bool {
+        self.segments_near(Vec2::new(x, z)).any(|(seg, dist, _)| !seg.raised && dist < seg.kind.half_width() + margin)
+    }
+
     /// Nearest path within `INFLUENCE` whose kind passes `matches`.
     pub fn nearest_matching(&self, x: f32, z: f32, matches: impl Fn(PathKind) -> bool) -> Option<RoadSample> {
         self.segments_near(Vec2::new(x, z))
@@ -929,7 +935,8 @@ fn build_path(
 
 /// Jumps along a gravel stage, at least `RAMP_GAP` apart: each on a
 /// straight, gently graded stretch with a run-up and room to land, away
-/// from crossings (`crossing`) and the stage's ends.
+/// from crossings (`crossing`) and the stage's ends, and never out on a
+/// causeway (a car would sail over its walls into the lake).
 fn place_ramps(path: &RoadPath, crossing: &[bool]) -> Vec<usize> {
     const RAMP_GAP: f32 = 450.0;
     const STRAIGHT: f32 = 1.0 / 250.0;
@@ -941,7 +948,13 @@ fn place_ramps(path: &RoadPath, crossing: &[bool]) -> Vec<usize> {
     let mut i = (400.0 / SAMPLE_SPACING) as usize;
     while i + after + 80 < n {
         let around = i - before..i + after;
-        let fits = around.clone().all(|k| path.curvature[k] < STRAIGHT && !crossing[k] && (path.heights[k + 1] - path.heights[k]).abs() < GRADE);
+        let dry = |k: usize| {
+            let t = path.tangent(k);
+            let side = Vec2::new(-t.y, t.x) * (path.kind.half_width() + 40.0);
+            [path.points[k] + side, path.points[k] - side].iter().all(|q| crate::terrain::raw_height(q.x, q.y) > crate::terrain::WATER_LEVEL + 1.0)
+        };
+        let fits = around.clone().all(|k| path.curvature[k] < STRAIGHT && !crossing[k] && (path.heights[k + 1] - path.heights[k]).abs() < GRADE)
+            && around.clone().step_by(5).all(dry);
         if fits {
             ramps.push(i);
             i += gap;

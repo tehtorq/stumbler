@@ -140,12 +140,12 @@ impl Stage {
         let clear = horizon_color(sun_dir.y);
         let overcast = clear.dot(Vec3::splat(1.0 / 3.0)) * vec3(0.92, 0.95, 1.0) * 0.85;
         let fog_color = clear.lerp(overcast, rain);
-        let fog_density = (1.0 + 1.2 * rain) / 1500.0;
+        let fog_density = (1.0 + 1.2 * rain) / 1500.0 * self.debug.graphics.fog;
         // The sun's map is centred ahead of the camera, where the eye goes
         let ahead = vec3(self.camera.target.x - self.camera.pos.x, 0.0, self.camera.target.z - self.camera.pos.z).normalize_or_zero();
         let shadow_focus = self.camera.pos + ahead * gpu::SHADOW_REACH * 0.7;
         let shadow_view_proj = shadow_matrix(sun_dir, shadow_focus);
-        let (street, street_count) = street_lamps(self.camera.pos, night);
+        let (street, street_count) = street_lamps(self.camera.pos, night, self.debug.graphics.streetlights);
         let globals = gpu::Globals {
             view_proj,
             inv_view_proj: view_proj.inverse(),
@@ -164,6 +164,8 @@ impl Stage {
             street,
             street_count,
             _pad: [0; 3],
+            post: self.debug.graphics.post(),
+            extra: [self.debug.graphics.shadows as u32 as f32, 0.0, 0.0, 0.0],
         };
 
         // --- Per-frame meshes ---
@@ -187,8 +189,7 @@ impl Stage {
         self.particle_mesh.update(&self.gpu, &v, &i);
         let (v, i) = self.guide_geometry(time);
         self.guide_mesh.update(&self.gpu, &v, &i);
-        // Dev aid: STUMBLER_NO_HUD=1 for clean screenshots
-        let (back, hud) = if std::env::var_os("STUMBLER_NO_HUD").is_some() { (HudBuilder::new(), HudBuilder::new()) } else { self.build_hud(width, height) };
+        let (back, hud) = self.build_hud(width, height);
         self.map_mesh.update(&self.gpu, &back.verts, &back.idxs);
         self.hud_mesh.update(&self.gpu, &hud.verts, &hud.idxs);
 
@@ -236,7 +237,7 @@ impl Stage {
             }
             // The sun casts its own shadow where its map reaches; the blob
             // stands in at night and further off
-            let sun_casts = sun_dir.y > 0.02 && car.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 0.9).powi(2);
+            let sun_casts = self.debug.graphics.shadows && sun_dir.y > 0.02 && car.pos.distance_squared(shadow_focus) < (gpu::SHADOW_REACH * 0.9).powi(2);
             if !sun_casts {
                 draws.push(Draw::mesh(&self.shadow_mesh, shadow_transform(car)));
             }
@@ -332,7 +333,7 @@ impl Stage {
 
         // With the sun down there's nothing to cast
         let mut casters: Vec<Draw> = Vec::new();
-        if sun_dir.y > 0.02 {
+        if self.debug.graphics.shadows && sun_dir.y > 0.02 {
             let focus = Vec2::new(shadow_focus.x, shadow_focus.z);
             casters.extend(self.chunks.casters(focus, shadow_view_proj).into_iter().map(|mesh| Draw::mesh(mesh, identity)));
             let cars = std::iter::once((&self.player, &self.body_mesh))
@@ -379,6 +380,14 @@ impl Stage {
             self.world_map(&mut back, &mut h, width, height, px);
             return (back, h);
         }
+        // The debug menu takes the screen's place of the HUD while it's open
+        if self.debug.open {
+            self.debug_menu(&mut back, &mut h, height, px);
+            return (back, h);
+        }
+        if !self.debug.graphics.hud {
+            return (back, h);
+        }
 
         match &self.race {
             Some(race) => self.race_hud(&mut h, race, width, height, px),
@@ -386,7 +395,9 @@ impl Stage {
         }
 
         // Top right corner: frame rate
-        h.text(width - margin * 0.5, margin * 0.4, px * 0.8, Align::Right, &format!("{:.0} FPS", self.fps), hud::DIM);
+        if self.debug.graphics.fps {
+            h.text(width - margin * 0.5, margin * 0.4, px * 0.8, Align::Right, &format!("{:.0} FPS", self.fps), hud::DIM);
+        }
 
         // Bottom right: speedometer
         let kmh = (self.player.speed.abs() * KMH_PER_UNIT).round() as i32;
@@ -885,7 +896,11 @@ impl Stage {
         h.rect(bx, by, bar, px * 0.8, hud::WHITE);
         h.text(bx + bar * 0.5, by - px * 5.0, px * 0.7, Align::Center, &format!("{km} KM"), hud::WHITE);
         let help = [
-            "CLICK OR ENTER: SET MARKER   RIGHT CLICK OR BACKSPACE: CLEAR   N: NEAREST UNFOUND",
+            if self.debug.map_drop {
+                "CLICK OR ENTER: DROP THE CAR HERE (DEBUG)   RIGHT CLICK OR BACKSPACE: CLEAR MARKER"
+            } else {
+                "CLICK OR ENTER: SET MARKER   RIGHT CLICK OR BACKSPACE: CLEAR   N: NEAREST UNFOUND"
+            },
             "ARROWS: MOVE   WHEEL OR +/-: ZOOM   H: BACK TO THE CAR   M: CLOSE",
         ];
         for (k, text) in help.iter().enumerate() {
@@ -932,11 +947,12 @@ fn stage_color(circuit: [f32; 4]) -> [f32; 4] {
 
 /// The streetlights nearest the camera, packed for the shaders: lamp
 /// position and brightness, plus how many there are. Off by day.
-fn street_lamps(camera: Vec3, night: f32) -> ([[f32; 4]; gpu::MAX_STREET_LAMPS], u32) {
+fn street_lamps(camera: Vec3, night: f32, brightness: f32) -> ([[f32; 4]; gpu::MAX_STREET_LAMPS], u32) {
     const RANGE: f32 = 700.0;
     let mut out = [[0.0; 4]; gpu::MAX_STREET_LAMPS];
     // They come on as dusk deepens, and warm up over a few seconds' worth
     let on = ((night - 0.12) / 0.45).clamp(0.0, 1.0);
+    let lit = on * on * (3.0 - 2.0 * on) * brightness;
     let Some(network) = crate::road::network() else { return (out, 0) };
     if on <= 0.0 {
         return (out, 0);
@@ -951,7 +967,7 @@ fn street_lamps(camera: Vec3, night: f32) -> ([[f32; 4]; gpu::MAX_STREET_LAMPS],
         near.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
     }
     for (slot, (_, head)) in out.iter_mut().zip(&near[..count]) {
-        *slot = [head.x, head.y - 0.6, head.z, on * on * (3.0 - 2.0 * on)];
+        *slot = [head.x, head.y - 0.6, head.z, lit];
     }
     (out, count as u32)
 }

@@ -59,6 +59,15 @@ impl Weather {
         Self { rain: wet, wet, forced, drops: Vec::new(), rng: 0x1234_5678 }
     }
 
+    /// Hold the rain at this (0 dry, 1 pouring), or `None` to let it come and go.
+    pub fn force(&mut self, rain: Option<f32>) {
+        self.forced = rain;
+    }
+
+    pub fn forced(&self) -> Option<f32> {
+        self.forced
+    }
+
     /// Move the weather on to `time` (seconds of play).
     pub fn update(&mut self, time: f32, dt: f32) {
         let target = self.forced.unwrap_or_else(|| {

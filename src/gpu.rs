@@ -8,6 +8,9 @@
 //! target. Post passes then work out ambient occlusion from the depth
 //! buffer, blur the brightest parts into bloom, and tonemap the lot into the
 //! swapchain image, with the HUD drawn on top of that.
+//!
+//! The camera's depth is reversed (1 near, 0 far) for even precision with a
+//! float depth buffer; the sun's shadow map keeps the usual 0 near, 1 far.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,6 +69,10 @@ pub struct Globals {
     pub street: [[f32; 4]; MAX_STREET_LAMPS],
     pub street_count: u32,
     pub _pad: [u32; 3],
+    /// Post settings: AO strength, bloom strength, exposure, vignette (0/1).
+    pub post: [f32; 4],
+    /// x = sun shadows on (0/1), yzw spare.
+    pub extra: [f32; 4],
 }
 
 /// Streetlights the shaders light the world with at once (the nearest).
@@ -391,6 +398,10 @@ pub struct Gpu {
     context: GpuContext,
     config: wgpu::SurfaceConfiguration,
     targets: Targets,
+    /// The world is drawn at this share of the window's size.
+    render_scale: f32,
+    /// What the surface can present with, for switching vsync.
+    present_modes: Vec<wgpu::PresentMode>,
     post_layouts: PostLayouts,
     linear_sampler: wgpu::Sampler,
 
@@ -478,12 +489,8 @@ impl Gpu {
         // Uncapped frame rate: present immediately if the surface allows it
         // (may tear), else mailbox (no tearing), else fall back to vsync.
         // STUMBLER_VSYNC=1 turns vsync back on.
-        let wanted: &[wgpu::PresentMode] = if std::env::var_os("STUMBLER_VSYNC").is_some() {
-            &[wgpu::PresentMode::Fifo]
-        } else {
-            &[wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
-        };
-        config.present_mode = wanted.iter().copied().find(|m| caps.present_modes.contains(m)).unwrap_or(wgpu::PresentMode::Fifo);
+        let present_modes = caps.present_modes.clone();
+        config.present_mode = present_mode(&present_modes, std::env::var_os("STUMBLER_VSYNC").is_some());
         eprintln!("present mode {:?} (surface offers {:?})", config.present_mode, caps.present_modes);
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC; // for frame captures
@@ -624,7 +631,7 @@ impl Gpu {
             shader: &sky_shader,
             vertex_buffer: false,
             depth_write: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             cull: None,
             blend: None,
         });
@@ -634,7 +641,7 @@ impl Gpu {
             shader: &terrain_shader,
             vertex_buffer: true,
             depth_write: true,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             cull: None, // chunk skirts are seen from either side
             blend: None,
         });
@@ -644,7 +651,7 @@ impl Gpu {
             shader: &mesh_shader,
             vertex_buffer: true,
             depth_write: true,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             cull: None,
             blend: Some(alpha_blend()),
         });
@@ -654,7 +661,7 @@ impl Gpu {
             shader: &mesh_shader,
             vertex_buffer: true,
             depth_write: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             cull: None,
             blend: Some(alpha_blend()),
         });
@@ -754,7 +761,7 @@ impl Gpu {
         let bloom_down_pipeline = fullscreen_pipeline("bloom down", &bloom_pipeline_layout, &bloom_shader, "fs_down", hdr_format, None);
         let bloom_up_pipeline = fullscreen_pipeline("bloom up", &bloom_pipeline_layout, &bloom_shader, "fs_up", hdr_format, Some(additive));
         let post_layouts = PostLayouts { post: post_layout, depth: depth_layout, ao: ao_layout, bloom: bloom_layout, hdr_format };
-        let targets = Targets::new(&device, &config, &post_layouts, &globals_buffer, &linear_sampler);
+        let targets = Targets::new(&device, render_size(&config, 1.0), &post_layouts, &globals_buffer, &linear_sampler);
 
         Self {
             window,
@@ -762,6 +769,8 @@ impl Gpu {
             context: GpuContext { device, queue },
             config,
             targets,
+            render_scale: 1.0,
+            present_modes,
             post_layouts,
             linear_sampler,
             globals_buffer,
@@ -799,7 +808,40 @@ impl Gpu {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.context.device, &self.config);
-        self.targets = Targets::new(&self.context.device, &self.config, &self.post_layouts, &self.globals_buffer, &self.linear_sampler);
+        self.rebuild_targets();
+    }
+
+    /// Remake everything sized to the drawn frame (after a resize or a
+    /// change of render scale).
+    fn rebuild_targets(&mut self) {
+        let size = render_size(&self.config, self.render_scale);
+        self.targets = Targets::new(&self.context.device, size, &self.post_layouts, &self.globals_buffer, &self.linear_sampler);
+    }
+
+    /// Draw the world at this share of the window's size (the HUD stays sharp).
+    pub fn set_render_scale(&mut self, scale: f32) {
+        if scale != self.render_scale {
+            self.render_scale = scale;
+            self.rebuild_targets();
+        }
+    }
+
+    /// The size the world is drawn at, in pixels.
+    pub fn render_size(&self) -> (u32, u32) {
+        render_size(&self.config, self.render_scale)
+    }
+
+    /// Wait for the display's refresh, or present as soon as a frame's ready.
+    pub fn set_vsync(&mut self, on: bool) {
+        let mode = present_mode(&self.present_modes, on);
+        if mode != self.config.present_mode {
+            self.config.present_mode = mode;
+            self.surface.configure(&self.context.device, &self.config);
+        }
+    }
+
+    pub fn vsync(&self) -> bool {
+        self.config.present_mode == wgpu::PresentMode::Fifo
     }
 
     /// Framebuffer size in pixels.
@@ -892,8 +934,8 @@ impl Gpu {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
-                    // Kept for the AO and post passes
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    // Reversed depth: 0 is the far plane. Kept for the AO and post passes
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: self.timer.as_ref().and_then(|t| t.writes(1, true, true)),
@@ -1123,6 +1165,21 @@ fn create_object_buffer(
     (buffer, bind_group)
 }
 
+/// Uncapped (tearing if need be, else mailbox) without vsync; FIFO with it.
+fn present_mode(available: &[wgpu::PresentMode], vsync: bool) -> wgpu::PresentMode {
+    let wanted: &[wgpu::PresentMode] = if vsync {
+        &[wgpu::PresentMode::Fifo]
+    } else {
+        &[wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+    };
+    wanted.iter().copied().find(|m| available.contains(m)).unwrap_or(wgpu::PresentMode::Fifo)
+}
+
+/// The window's size scaled by `scale`, at least a pixel each way.
+fn render_size(config: &wgpu::SurfaceConfiguration, scale: f32) -> (u32, u32) {
+    (((config.width as f32 * scale).round() as u32).max(1), ((config.height as f32 * scale).round() as u32).max(1))
+}
+
 /// A pass drawing one colour target and nothing else.
 fn screen_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
@@ -1175,7 +1232,7 @@ struct PostLayouts {
 impl Targets {
     fn new(
         device: &wgpu::Device,
-        config: &wgpu::SurfaceConfiguration,
+        (width, height): (u32, u32),
         layouts: &PostLayouts,
         globals: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
@@ -1193,8 +1250,8 @@ impl Targets {
             })
         };
         let hdr_format = layouts.hdr_format;
-        let full = (config.width, config.height);
-        let half = (config.width.div_ceil(2), config.height.div_ceil(2));
+        let full = (width, height);
+        let half = (width.div_ceil(2), height.div_ceil(2));
         let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
         let read = attach | wgpu::TextureUsages::TEXTURE_BINDING;
         let view = |t: wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());

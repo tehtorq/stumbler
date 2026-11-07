@@ -27,6 +27,7 @@ cargo run --release
 | V | D-pad left/right | Car setup: balanced, grip (more wing, slower on the straights) or speed (less wing, looser in quick corners) |
 | Backspace | B | Abandon the race / back to free roam |
 | M | Back | World map |
+| ] | | Debug menu: jump to any circuit, landmark or town (or under the biplane), drop the car anywhere by clicking the world map, set the time and weather, change graphics settings, render resolution, v-sync and the FPS counter |
 | C | X | Change paint (from those you've unlocked) |
 | F | | Fullscreen |
 | Mouse wheel | | Camera distance |
@@ -124,7 +125,9 @@ Away from the circuits:
 - The gold orbs scattered off-road each add a little engine power for good.
 - The roads between circuits have edge lines (the centre line turns solid on
   bends), telegraph poles strung with wires, and a sign at each end naming
-  the circuit ahead and how far it is. Wooden fingerposts mark where trails
+  the circuit ahead and how far it is. Where a road crosses water it runs on
+  a narrow causeway, its bank dropping straight into the lake, with a low
+  concrete wall along each edge to keep you out of it. Wooden fingerposts mark where trails
   turn off to landmarks.
 - A railway runs right round the edge of the map, with a second line up
   through the middle between the circuits. A steam train with four coaches
@@ -257,6 +260,7 @@ solid, with impulses at the contact point so glancing blows spin you.
 | `progress.rs` | Save file |
 | `gamepad.rs` | Gamepad steering, pedals and buttons (gilrs) |
 | `tuning.rs` | The optional feel settings file |
+| `debug.rs` | The debug menu (]): teleports, time and weather, graphics settings |
 | `biplane.rs` | The biplane: choosing where to fly next, flying there over the hills, circling, and its meshes |
 | `car.rs`, `trees.rs`, `birds.rs`, ... | Meshes and ambient life |
 
@@ -313,7 +317,7 @@ Dev aids:
   for a time trial, `STUMBLER_RACE=tour` for a tour)
 - `STUMBLER_SCREENSHOT_MAP=1` opens the world map for the screenshot
 - `STUMBLER_AT=x,z,yaw` starts anywhere (yaw in degrees, 0 = facing -Z)
-- `STUMBLER_NO_HUD=1` hides the HUD, for clean screenshots
+- `STUMBLER_NO_HUD=1` hides the HUD, for clean screenshots (the debug menu can turn it back on)
 - Vsync is off (the frame rate is uncapped); `STUMBLER_VSYNC=1` turns it on.
   Screenshot runs report the frame time and triangle count
 - `STUMBLER_WILDLIFE_CLOSE=1` spawns animals near the player

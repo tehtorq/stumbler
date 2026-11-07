@@ -11,13 +11,14 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
     // Oversized triangle covering the screen
     let xy = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u)) * 2.0 - 1.0;
     var out: VertexOut;
-    // On the far plane: drawn after the world, it only fills what's left uncovered
-    out.clip = vec4<f32>(xy, 1.0, 1.0);
+    // On the far plane (0, as depth is reversed): drawn after the world, it
+    // only fills what's left uncovered
+    out.clip = vec4<f32>(xy, 0.0, 1.0);
     out.screen = xy;
 
     // Unproject two points at different depths to get a world-space ray direction
-    let near = globals.inv_view_proj * vec4<f32>(xy, 0.0, 1.0);
-    let far = globals.inv_view_proj * vec4<f32>(xy, 1.0, 1.0);
+    let near = globals.inv_view_proj * vec4<f32>(xy, 1.0, 1.0);
+    let far = globals.inv_view_proj * vec4<f32>(xy, 0.0, 1.0);
     out.ray_dir = far.xyz / far.w - near.xyz / near.w;
     return out;
 }

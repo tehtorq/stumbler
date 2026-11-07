@@ -1122,6 +1122,28 @@ fn gravel_stages_have_no_steps_but_their_jumps() {
 /// A full stage race on `name` with the AI driving the player's car too:
 /// (finishing time, place, rivals who reached the finish, longest any car
 /// was off the road in one go).
+/// The causeway walls, as the game has them, for cars in the simulations
+/// to run into (rather than off the causeway into the lake).
+fn causeway_walls() -> &'static std::collections::HashMap<(i32, i32), Vec<collisions::Solid>> {
+    static WALLS: std::sync::OnceLock<std::collections::HashMap<(i32, i32), Vec<collisions::Solid>>> = std::sync::OnceLock::new();
+    WALLS.get_or_init(|| crate::roadside::causeway_solids(network(), WALL_CELL))
+}
+const WALL_CELL: f32 = 100.0;
+
+/// Bump `car` off any causeway wall it's run into.
+fn hit_walls(car: &mut CarPhysics) {
+    let (cx, cz) = ((car.pos.x / WALL_CELL).floor() as i32, (car.pos.z / WALL_CELL).floor() as i32);
+    let near: Vec<collisions::Solid> = (-1..=1)
+        .flat_map(|dz| (-1..=1).map(move |dx| (cx + dx, cz + dz)))
+        .filter_map(|k| causeway_walls().get(&k))
+        .flatten()
+        .copied()
+        .collect();
+    if !near.is_empty() {
+        collisions::car_vs_solids(car, &near);
+    }
+}
+
 fn stage_race(name: &str, seed: u32) -> (f32, usize, usize, f32) {
     let _ = network();
     let track = stage_track(name);
@@ -1155,6 +1177,10 @@ fn stage_race(name: &str, seed: u32) -> (f32, usize, usize, f32) {
             for other in tail {
                 collisions::car_vs_car(&mut head[i].physics, &mut other.physics);
             }
+        }
+        hit_walls(&mut player);
+        for car in &mut cars {
+            hit_walls(&mut car.physics);
         }
         race.update(dt, Vec2::new(player.pos.x, player.pos.z), &mut cars, &track);
         for (ci, c) in std::iter::once(&player).chain(cars.iter().map(|c| &c.physics)).enumerate() {
@@ -1658,4 +1684,80 @@ fn circuit_crossings_meet_level() {
         let (i, steepest) = (0..n).map(|i| (i, (path.heights[(i + 1) % n] - path.heights[i]).abs() / road::SAMPLE_SPACING)).fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
         assert!(steepest < 0.105, "circuit {k}: a {:.0}% step in the road at {}", steepest * 100.0, path.points[i]);
     }
+}
+
+/// Wherever a road crosses water, a car driven hard at the edge of the
+/// causeway (along it, and especially where it meets the land) is turned
+/// back by the wall rather than slipping off into the lake.
+#[test]
+fn causeway_walls_keep_cars_out_of_the_water() {
+    let net = network();
+    let dt = 1.0 / 60.0;
+    let (mut tried, mut lost) = (0, Vec::new());
+    for path in net.paths.iter().filter(|p| p.kind != road::PathKind::Rail && !p.closed) {
+        let n = path.points.len();
+        let off = path.kind.half_width() + 1.4;
+        for s in [-1.0_f32, 1.0] {
+            let across = |i: usize| {
+                let t = path.tangent(i);
+                Vec2::new(-t.y, t.x) * s
+            };
+            let drops = |i: usize| {
+                [4.0, 16.0, 28.0].iter().any(|&d| {
+                    let p = path.points[i] + across(i) * (off + d);
+                    let ground = terrain::solid_height(p.x, p.y);
+                    ground < terrain::WATER_LEVEL + 0.5 && ground < path.heights[i] - 1.0
+                })
+            };
+            let wet: Vec<bool> = (0..n).map(drops).collect();
+            // Where each run of drop-off starts and ends, and every so often along it
+            let spots: Vec<usize> = (1..n.saturating_sub(1))
+                .filter(|&i| wet[i] && (!wet[i - 1] || !wet[i + 1] || i % 40 == 0))
+                .collect();
+            for &i in &spots {
+                // Not where another path crosses or joins (its own surface is open)
+                let edge = path.points[i] + across(i) * off;
+                if net.on_surface(edge.x, edge.y, 0.5) || (0..=40).step_by(8).any(|d| {
+                    let q = path.points[i] + across(i) * (off - 2.0) + path.tangent(i) * (d as f32 - 20.0);
+                    net.nearest_ground(q.x, q.y).is_some_and(|r| r.kind != path.kind || r.dist < off - 4.0)
+                }) {
+                    continue;
+                }
+                for along in [-1.0_f32, 1.0] {
+                    // From the centreline, angled 35 degrees toward the edge
+                    let t = path.tangent(i) * along;
+                    let dir = (t * 35f32.to_radians().cos() + across(i) * 35f32.to_radians().sin()).normalize();
+                    let start = path.points[i] - dir * 12.0;
+                    let mut car = CarPhysics::new(Vec3::ZERO, 0.0);
+                    car.place(&WorldGround, start.x, start.y, (-dir.x).atan2(-dir.y));
+                    car.vel = Vec3::new(dir.x, 0.0, dir.y) * 45.0;
+                    for _ in 0..(1.5 / dt) as usize {
+                        car.update(&WorldGround, dt, CarInput { throttle: 1.0, ..Default::default() });
+                        hit_walls(&mut car);
+                    }
+                    tried += 1;
+                    // In the water, or past the wall line and down the bank into the lake
+                    // How far out from this road's centreline (not whichever is nearest)
+                    let ground = terrain::solid_height(car.pos.x, car.pos.z);
+                    let here = Vec2::new(car.pos.x, car.pos.z);
+                    let (lo, hi) = (i.saturating_sub(80), (i + 80).min(n - 1));
+                    let (k, out) = (lo..hi).map(|k| {
+                        let (a, b) = (path.points[k], path.points[k + 1]);
+                        let t = ((here - a).dot(b - a) / (b - a).length_squared().max(1e-6)).clamp(0.0, 1.0);
+                        (k, here.distance(a + (b - a) * t))
+                    }).min_by(|x, y| x.1.total_cmp(&y.1)).unwrap();
+                    let road_y = path.heights[k];
+                    // Off the end of a wall onto dry land is fair (that's just off-road),
+                    // and so is reaching a natural shore well away from the road
+                    let in_lake = car.submerged > 0.3 || ground < terrain::WATER_LEVEL - 0.5;
+                    if in_lake && out > off && out < off + 30.0 && ground < road_y - 1.5 {
+                        lost.push(format!("{:?} sample {i} at {:?} side {s} going {along}: ended {out:.0} out, {:.1} below the road, submerged {:.1}", path.kind, path.points[i], road_y - ground, car.submerged));
+                    }
+                }
+            }
+        }
+    }
+    println!("{tried} runs at causeway edges");
+    assert!(tried > 50, "only {tried} runs: found no causeways?");
+    assert!(lost.is_empty(), "{} of {tried} runs off the causeway, e.g.\n{}", lost.len(), lost.iter().take(8).cloned().collect::<Vec<_>>().join("\n"));
 }
