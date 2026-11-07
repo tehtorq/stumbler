@@ -343,6 +343,11 @@ enum Species {
 
 /// Plants per cell (0..1) at a spot `ground` high.
 pub fn density(x: f32, z: f32, ground: f32) -> f32 {
+    density_over(x, z, ground, terrain::raw_height(x, z))
+}
+
+/// `density`, for a caller that already has `raw_height` at (x, z).
+pub fn density_over(x: f32, z: f32, ground: f32, raw: f32) -> f32 {
     let desert = terrain::biome_desert(x, z);
     let mountain = terrain::biome_mountain(x, z);
     let forest = terrain::biome_forest(x, z);
@@ -353,7 +358,7 @@ pub fn density(x: f32, z: f32, ground: f32) -> f32 {
     let patch = noise(x, z, 420.0);
     let grove = noise(x + 900.0, z - 300.0, 260.0);
     let treeline = 125.0 + 35.0 * noise(x, z, 800.0);
-    let near_water = terrain::raw_height(x, z) < WATER_LEVEL + 6.0;
+    let near_water = raw < WATER_LEVEL + 6.0;
 
     let mut density = forest * (0.15 + 0.85 * ((patch - 0.25) * 2.0).clamp(0.0, 1.0))
         + grass * if grove > 0.62 { 0.45 } else { 0.035 }

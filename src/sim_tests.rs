@@ -10,7 +10,10 @@ use crate::road::{self, RoadNetwork};
 use crate::{collisions, terrain};
 
 pub(crate) fn network() -> &'static RoadNetwork {
-    road::install(|| crate::world::build_network(crate::layout::build(terrain::TERRAIN_HALF_SIZE)))
+    road::install(|| {
+        let (layout, routes) = crate::world::plan();
+        crate::world::build_network(layout, routes)
+    })
 }
 
 fn race_track() -> AiTrack {
@@ -1484,4 +1487,47 @@ fn there_is_always_something_to_find_nearby() {
     let tenth = gaps[gaps.len() / 10];
     assert!(gaps[0] < 5500.0, "land {:.0} from anything to find", gaps[0]);
     assert!(tenth < 3000.0, "a tenth of the land is over {tenth:.0} from anything to find");
+}
+
+/// Prints a hash of each part of the generated world. Compare it before and
+/// after touching world generation: it should only change when the world is
+/// meant to. It depends on `available_parallelism` (see `trails::route_all`),
+/// so compare runs on the same machine.
+#[test]
+#[ignore]
+fn world_fingerprint() {
+    #[derive(Clone, Copy)]
+    struct Fnv(u64);
+    impl Fnv {
+        fn eat(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
+    let new = || Fnv(0xcbf2_9ce4_8422_2325);
+    let net = network();
+    let mut paths = new();
+    for p in &net.paths {
+        paths.eat(bytemuck::cast_slice(&p.points));
+        paths.eat(bytemuck::cast_slice(&p.heights));
+        paths.eat(bytemuck::cast_slice(&p.curvature));
+        paths.eat(&[p.kind as u8, p.closed as u8]);
+        paths.eat(bytemuck::cast_slice(&p.ramps.iter().map(|&r| r as u64).collect::<Vec<_>>()));
+    }
+    let mut marks = new();
+    for l in crate::landmarks::all() {
+        marks.eat(l.name.as_bytes());
+        marks.eat(bytemuck::cast_slice(&[l.pos.x, l.pos.y]));
+        marks.eat(&l.seed.to_le_bytes());
+    }
+    let mut chunks = new();
+    crate::chunks::chunk_digest(|b| chunks.eat(b));
+    let mut map = new();
+    crate::map::MapImage::build().digest(|b| map.eat(b));
+    eprintln!("fingerprint: {} paths, {} landmarks", net.paths.len(), crate::landmarks::all().len());
+    eprintln!("fingerprint: paths {:016x}", paths.0);
+    eprintln!("fingerprint: landmarks {:016x}", marks.0);
+    eprintln!("fingerprint: chunks {:016x}", chunks.0);
+    eprintln!("fingerprint: map {:016x}", map.0);
 }

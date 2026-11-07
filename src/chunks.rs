@@ -522,3 +522,33 @@ fn _assert_centre_used(c: ChunkCoord) -> Vec2 {
     c.centre()
 }
 
+
+/// Hash of a square of chunks' geometry, for checking world generation
+/// produces the same world.
+#[cfg(test)]
+pub(crate) fn chunk_digest(mut eat: impl FnMut(&[u8])) {
+    fn mesh(eat: &mut impl FnMut(&[u8]), m: &(Vec<Vertex>, Vec<u32>)) {
+        eat(bytemuck::cast_slice(&m.0));
+        eat(bytemuck::cast_slice(&m.1));
+    }
+    // Across the whole island, plus every lod around the home circuit
+    let n = chunks_per_side();
+    let spots = (0..n).step_by(13).flat_map(|z| (0..n).step_by(13).map(move |x| ChunkCoord(x, z)));
+    let mid = n / 2;
+    for c in spots.chain((-2..=2).flat_map(|z| (-2..=2).map(move |x| ChunkCoord(mid + x, mid + z)))) {
+        for lod in 0..LOD_CELLS.len() {
+            if let JobResult::Terrain(_, _, t) = run_job(Job::Terrain(c, lod)) {
+                mesh(&mut eat, &(t.verts, t.idxs));
+            }
+        }
+        if let JobResult::Detail(_, d) = run_job(Job::Detail(c)) {
+            d.meshes.iter().chain(&d.foliage).chain(&d.foliage_far).chain(&d.glow).chain(&d.water).for_each(|m| mesh(&mut eat, m));
+            eat(bytemuck::cast_slice(&d.tree_positions));
+        }
+        if let JobResult::Cover(_, tiles) = run_job(Job::Cover(c)) {
+            for t in tiles {
+                mesh(&mut eat, &(t.verts, t.idxs));
+            }
+        }
+    }
+}

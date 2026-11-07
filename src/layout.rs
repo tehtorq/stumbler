@@ -1,6 +1,8 @@
 //! World layout: spreads the circuits evenly over the map, a grid slot each,
 //! then links neighbouring circuits with connecting roads.
 
+use std::sync::Mutex;
+
 use glam::{Vec2, vec2};
 
 use crate::road::{ease_tight_corners, resample, ROAD_HALF_WIDTH};
@@ -71,13 +73,27 @@ pub fn build(half_size: f32) -> Layout {
     Layout { circuits, roads }
 }
 
-/// `f` over `items` on a thread each, keeping their order.
+/// `f` over `items` on a thread per core, keeping their order.
 pub fn parallel_map<T: Send, U: Send>(items: Vec<T>, f: impl Fn(T) -> U + Sync) -> Vec<U> {
-    std::thread::scope(|scope| {
-        let f = &f;
-        let handles: Vec<_> = items.into_iter().map(|item| scope.spawn(move || f(item))).collect();
-        handles.into_iter().map(|h| h.join().expect("layout worker panicked")).collect()
-    })
+    let count = items.len();
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(count);
+    let queue = Mutex::new(items.into_iter().enumerate());
+    let mut done: Vec<(usize, U)> = std::thread::scope(|scope| {
+        let (f, queue) = (&f, &queue);
+        let handles: Vec<_> = (0..workers)
+            .map(|_| scope.spawn(move || {
+                let mut out = Vec::new();
+                loop {
+                    let item = queue.lock().unwrap().next();
+                    let Some((i, item)) = item else { return out };
+                    out.push((i, f(item)));
+                }
+            }))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("layout worker panicked")).collect()
+    });
+    done.sort_unstable_by_key(|d| d.0);
+    done.into_iter().map(|d| d.1).collect()
 }
 
 /// Each circuit's grid slot (x, z steps from the centre; +z is north),
@@ -420,8 +436,7 @@ fn connect(circuits: &[Circuit]) -> Vec<Track> {
         }
     }
 
-    links.iter()
-        .filter_map(|&(a, b)| route_road(circuits, a, b))
+    parallel_map(links, |(a, b)| route_road(circuits, a, b)).into_iter().flatten()
         .collect()
 }
 

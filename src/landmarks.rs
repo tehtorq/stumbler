@@ -34,6 +34,13 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// In declaration order: a kind's place here is `kind as usize`.
+    pub const ALL: [Kind; 17] = [
+        Kind::Windmill, Kind::Lighthouse, Kind::RadioMast, Kind::StoneArch, Kind::Cabin, Kind::Village,
+        Kind::Summit, Kind::Cove, Kind::Viewpoint, Kind::StandingStones, Kind::SunkenTemple, Kind::OldRacer,
+        Kind::FairyRing, Kind::Watcher, Kind::GreatOak, Kind::Shipwreck, Kind::HotSpring,
+    ];
+
     pub fn is_secret(self) -> bool {
         matches!(self, Kind::StandingStones | Kind::SunkenTemple | Kind::OldRacer | Kind::FairyRing
             | Kind::Watcher | Kind::GreatOak | Kind::Shipwreck | Kind::HotSpring)
@@ -89,9 +96,11 @@ pub fn cairns() -> &'static [Vec2] {
 
 fn cairn_trails(landmarks: &[Landmark], network: &RoadNetwork) -> Vec<Vec2> {
     let mut out = Vec::new();
-    for l in landmarks.iter().filter(|l| l.kind.is_secret()) {
+    let secrets = landmarks.iter().filter(|l| l.kind.is_secret()).collect();
+    let paths = crate::layout::parallel_map(secrets, |l| (l, crate::trails::path_to(network, l.pos)));
+    for (l, path) in paths {
         // Along the way a walker would go from the road, round any water
-        if let Some(path) = crate::trails::path_to(network, l.pos) {
+        if let Some(path) = path {
             let mut since = -50.0;
             for w in path.windows(2) {
                 since += w[0].distance(w[1]);

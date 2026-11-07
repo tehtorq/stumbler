@@ -42,6 +42,7 @@ mod railway;
 mod rescue;
 mod road;
 mod roadside;
+mod routes;
 mod screen;
 mod secrets;
 mod skids;
@@ -192,6 +193,8 @@ struct Stage {
     last_time: f32,
 
     world: World,
+    /// The island as a picture, for maps.
+    map_image: map::MapImage,
     chunks: ChunkManager,
     /// Circuits first (same indices as `world.circuits`), then road loops.
     ai_tracks: Vec<AiTrack>,
@@ -306,6 +309,7 @@ fn trail_start(landmark: &str) -> Option<(Vec2, f32)> {
 struct Loaded {
     started: Instant,
     world: World,
+    map_image: map::MapImage,
     ai_tracks: Vec<AiTrack>,
     cars: Vec<AiCar>,
     traffic_count: usize,
@@ -322,15 +326,19 @@ impl Stage {
     fn load(gpu: &gpu::GpuContext, status: &Mutex<&'static str>) -> Loaded {
         let t0 = Instant::now();
         let world = World::build(gpu);
+        // Comes up alongside the rest. It shows the farms, so not before
+        // `World::build` has placed them
+        let map_image = std::thread::spawn(map::MapImage::build);
 
         let mut stage_roads = road::network().into_iter().flat_map(|n| n.paths.iter()).filter(|p| p.kind == road::PathKind::Gravel);
-        let mut ai_tracks: Vec<AiTrack> = world.circuits.iter()
-            .map(|c| match c.stage {
-                true => ai_cars::stage_track(stage_roads.next().expect("a road for each stage")),
-                false => AiTrack::racing(c.points.clone(), AI_TOP_SPEED, ai_cars::RACING_ROOM),
-            })
-            .chain(world.road_loops.iter().map(|points| AiTrack::new(points.clone(), AI_TOP_SPEED)))
+        let racing: Vec<_> = world.circuits.iter()
+            .map(|c| (c, c.stage.then(|| stage_roads.next().expect("a road for each stage"))))
             .collect();
+        let mut ai_tracks = layout::parallel_map(racing, |(c, stage_road)| match stage_road {
+            Some(road) => ai_cars::stage_track(road),
+            None => AiTrack::racing(c.points.clone(), AI_TOP_SPEED, ai_cars::RACING_ROOM),
+        });
+        ai_tracks.extend(layout::parallel_map(world.road_loops.iter().collect(), |points| AiTrack::new(points.clone(), AI_TOP_SPEED)));
         // Cruising traffic on connecting roads is slower
         for track in ai_tracks.iter_mut().skip(world.circuits.len()) {
             for v in &mut track.speed {
@@ -381,11 +389,12 @@ impl Stage {
         let camera = ChaseCamera::new(&player);
         *status.lock().unwrap() = "GROWING THE COUNTRYSIDE";
         let chunks = ChunkManager::new(gpu, pos);
-        Loaded { started: t0, world, ai_tracks, cars, traffic_count, start_circuit, train, pos, player, camera, chunks }
+        let map_image = map_image.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        Loaded { started: t0, world, map_image, ai_tracks, cars, traffic_count, start_circuit, train, pos, player, camera, chunks }
     }
 
     fn new(gpu: gpu::Gpu, loaded: Loaded) -> Stage {
-        let Loaded { started: t0, world, ai_tracks, cars, traffic_count, start_circuit, train, pos, mut player, camera, chunks } = loaded;
+        let Loaded { started: t0, world, map_image, ai_tracks, cars, traffic_count, start_circuit, train, pos, mut player, camera, chunks } = loaded;
 
         let demo_driver = std::env::var_os("STUMBLER_DEMO").map(|_| {
             let mut d = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
@@ -462,6 +471,7 @@ impl Stage {
             wildlife_mesh: DynamicMesh::new(&gpu, "wildlife"),
             spectators: spectators::create_spectators(&loops),
             world,
+            map_image,
             chunks,
             ai_tracks,
             cars,

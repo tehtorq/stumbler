@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::geometry::Vertex;
 use crate::road;
 
@@ -20,6 +22,10 @@ pub const WATER_LEVEL: f32 = -20.0;
 
 fn bump(x: f32, z: f32, cx: f32, cz: f32, r: f32, h: f32) -> f32 {
     let d2 = ((x - cx) * (x - cx) + (z - cz) * (z - cz)) / (r * r);
+    // Past this an f32 exponential is exactly zero, so skip working it out
+    if d2 > 110.0 {
+        return 0.0;
+    }
     h * (-d2).exp()
 }
 
@@ -134,9 +140,12 @@ pub fn biome_tundra(_x: f32, z: f32) -> f32 {
 
 // ── Height function ──
 
+/// The lowest `natural_height` goes.
+pub const WATER_FLOOR: f32 = WATER_LEVEL + 1.0;
+
 /// Natural terrain height clamped above the water surface, ignoring roads.
 pub fn natural_height(x: f32, z: f32) -> f32 {
-    terrain_height_raw(x, z).max(WATER_LEVEL + 1.0)
+    terrain_height_raw(x, z).max(WATER_FLOOR)
 }
 
 /// Public terrain height: natural ground, flattened under and around roads.
@@ -228,32 +237,40 @@ pub fn uncarved_height(x: f32, z: f32) -> f32 {
     let roughness = (rough1 + rough2) * rough_scale;
 
     // ── Mountain range (north) — massive peaks with rocky ridges ──
-    let mountain_height = mtn * 90.0 * (1.0 + 0.5 * (x * 0.003).sin() * (z * 0.004 + 1.0).sin());
-    let peaks = mtn * 35.0 * ((x * 0.008).sin() * (z * 0.011).sin()).max(0.0);
-    let mtn_ridges = mtn * 15.0 * ((x * 0.02 + z * 0.01).sin()).abs();
-    let cliff_n = mtn * ridge(x, z, at(-3000.0), at(5500.0), at(5000.0), at(5000.0), 150.0, 45.0);
-    let cliff_n2 = mtn * ridge(x, z, at(1000.0), at(6500.0), at(6000.0), at(6000.0), 120.0, 35.0);
+    let [mountain_height, peaks, mtn_ridges, cliff_n, cliff_n2] = if mtn > 0.0 { [
+        mtn * 90.0 * (1.0 + 0.5 * (x * 0.003).sin() * (z * 0.004 + 1.0).sin()),
+        mtn * 35.0 * ((x * 0.008).sin() * (z * 0.011).sin()).max(0.0),
+        mtn * 15.0 * ((x * 0.02 + z * 0.01).sin()).abs(),
+        mtn * ridge(x, z, at(-3000.0), at(5500.0), at(5000.0), at(5000.0), 150.0, 45.0),
+        mtn * ridge(x, z, at(1000.0), at(6500.0), at(6000.0), at(6000.0), 120.0, 35.0),
+    ] } else { [0.0; 5] };
 
     // ── Desert features (southwest) ──
-    let desert_floor = -20.0 * desert;
-    let mesa1 = plateau(x, z, at(-6000.0), at(-6000.0), 500.0, 45.0) * desert;
-    let mesa2 = plateau(x, z, at(-4500.0), at(-7000.0), 350.0, 35.0) * desert;
-    let mesa3 = plateau(x, z, at(-7000.0), at(-4500.0), 400.0, 40.0) * desert;
-    let canyon = ridge(x, z, at(-7500.0), at(-4000.0), at(-4000.0), at(-7500.0), 80.0, -30.0) * desert;
-    let dunes = desert * 8.0 * (x * 0.015 + z * 0.005).sin() * (x * 0.003 - z * 0.012).sin();
-    let washboard = desert * 3.0 * (x * 0.05 + z * 0.03).sin();
-    let desert_ridge1 = desert * ridge(x, z, at(-7000.0), at(-6000.0), at(-5000.0), at(-4000.0), 100.0, 25.0);
-    let desert_ridge2 = desert * ridge(x, z, at(-6500.0), at(-3500.0), at(-4500.0), at(-5500.0), 80.0, 20.0);
+    let [desert_floor, mesa1, mesa2, mesa3, canyon, dunes, washboard, desert_ridge1, desert_ridge2] = if desert > 0.0 { [
+        -20.0 * desert,
+        plateau(x, z, at(-6000.0), at(-6000.0), 500.0, 45.0) * desert,
+        plateau(x, z, at(-4500.0), at(-7000.0), 350.0, 35.0) * desert,
+        plateau(x, z, at(-7000.0), at(-4500.0), 400.0, 40.0) * desert,
+        ridge(x, z, at(-7500.0), at(-4000.0), at(-4000.0), at(-7500.0), 80.0, -30.0) * desert,
+        desert * 8.0 * (x * 0.015 + z * 0.005).sin() * (x * 0.003 - z * 0.012).sin(),
+        desert * 3.0 * (x * 0.05 + z * 0.03).sin(),
+        desert * ridge(x, z, at(-7000.0), at(-6000.0), at(-5000.0), at(-4000.0), 100.0, 25.0),
+        desert * ridge(x, z, at(-6500.0), at(-3500.0), at(-4500.0), at(-5500.0), 80.0, 20.0),
+    ] } else { [0.0; 9] };
 
     // ── Forest (northwest) — dense rolling hills with gullies ──
-    let forest_hills = forest * 20.0 * (x * 0.006 + 0.5).sin() * (z * 0.008 + 0.3).sin();
-    let gully1 = forest * ridge(x, z, at(-6000.0), at(3000.0), at(-4000.0), at(5000.0), 50.0, -12.0);
-    let gully2 = forest * ridge(x, z, at(-5500.0), at(4500.0), at(-3500.0), at(3500.0), 40.0, -10.0);
-    let forest_bumps = forest * 3.0 * ((x * 0.04).sin() * (z * 0.06).sin()).max(0.0) * 4.0;
+    let [forest_hills, gully1, gully2, forest_bumps] = if forest > 0.0 { [
+        forest * 20.0 * (x * 0.006 + 0.5).sin() * (z * 0.008 + 0.3).sin(),
+        forest * ridge(x, z, at(-6000.0), at(3000.0), at(-4000.0), at(5000.0), 50.0, -12.0),
+        forest * ridge(x, z, at(-5500.0), at(4500.0), at(-3500.0), at(3500.0), 40.0, -10.0),
+        forest * 3.0 * ((x * 0.04).sin() * (z * 0.06).sin()).max(0.0) * 4.0,
+    ] } else { [0.0; 4] };
 
     // ── Tundra — gentle undulation with frozen ridges ──
-    let tundra_roll = tundra * 5.0 * (x * 0.004).sin() * (z * 0.005).sin();
-    let tundra_ridge = tundra * ridge(x, z, at(-2000.0), at(7500.0), at(4000.0), at(8000.0), 200.0, 20.0);
+    let [tundra_roll, tundra_ridge] = if tundra > 0.0 { [
+        tundra * 5.0 * (x * 0.004).sin() * (z * 0.005).sin(),
+        tundra * ridge(x, z, at(-2000.0), at(7500.0), at(4000.0), at(8000.0), 200.0, 20.0),
+    ] } else { [0.0; 2] };
 
     // ── Grassland ridgelines (center, visible from tracks) ──
     let grass_mask = (1.0 - mtn) * (1.0 - desert);
@@ -339,8 +356,12 @@ pub const COAST_WANDER: f32 = 1100.0;
 /// The world is an island: the land runs down into the sea before the
 /// map's edge, so there's always a shore to drive to and nowhere to fall off.
 fn coast(x: f32, z: f32, land: f32) -> f32 {
-    let out = x.abs().max(z.abs()) + (crate::noise::noise(x, z, 3200.0) - 0.5) * 2.0 * COAST_WANDER;
     let shore = TERRAIN_HALF_SIZE - COAST;
+    // Too far inland for even the widest wander of the coast to reach
+    if x.abs().max(z.abs()) + COAST_WANDER < shore - 900.0 {
+        return land;
+    }
+    let out = x.abs().max(z.abs()) + (crate::noise::noise(x, z, 3200.0) - 0.5) * 2.0 * COAST_WANDER;
     let t = smooth(shore - 900.0, shore + 700.0, out);
     land + (SEA_FLOOR - land) * t
 }
@@ -350,13 +371,51 @@ const SCATTER_CELL: f32 = 1600.0;
 /// Circuit slots: the layout's grid spacing, in the original layout.
 const SLOT_SPACING: f32 = at(3500.0);
 
+/// What's dealt to a cell of `SCATTER_CELL`s: the rolls behind its landform.
+#[derive(Clone, Copy)]
+struct Deal {
+    roll: f32,
+    cx: f32,
+    cz: f32,
+    size: f32,
+    turn: f32,
+}
+
+impl Deal {
+    fn at(i: f32, j: f32) -> Self {
+        use crate::noise::hash;
+        Self {
+            roll: hash(i * 1.7 + 11.0, j * 2.3 - 7.0),
+            // Kept well inside the cell, so only its neighbours can reach x, z
+            cx: (i + 0.25 + 0.5 * hash(i, j + 31.0)) * SCATTER_CELL,
+            cz: (j + 0.25 + 0.5 * hash(i + 17.0, j)) * SCATTER_CELL,
+            size: hash(i - 5.0, j + 9.0),
+            turn: hash(i + 3.0, j - 11.0),
+        }
+    }
+
+    /// The deal for cell (i, j): looked up on the map, worked out off it.
+    fn of(i: f32, j: f32) -> Self {
+        static DEALS: OnceLock<Vec<Deal>> = OnceLock::new();
+        const REACH: i32 = (TERRAIN_HALF_SIZE / SCATTER_CELL) as i32 + 3;
+        const SIDE: i32 = 2 * REACH + 1;
+        let (ci, cj) = (i as i32 + REACH, j as i32 + REACH);
+        if ci < 0 || cj < 0 || ci >= SIDE || cj >= SIDE {
+            return Self::at(i, j);
+        }
+        let deals = DEALS.get_or_init(|| {
+            (0..SIDE * SIDE).map(|k| Self::at((k % SIDE - REACH) as f32, (k / SIDE - REACH) as f32)).collect()
+        });
+        deals[(cj * SIDE + ci) as usize]
+    }
+}
+
 /// Landforms dealt out over the whole map, one or none per cell, to suit
 /// the biome: mesas and spires in the desert, hills in the woods and
 /// grassland with the odd ridge or crater lake, hollows in the tundra.
 /// They fill the country between circuits and keep clear of the circuit
 /// slots themselves.
 fn scattered(x: f32, z: f32, desert: f32, forest: f32, mtn: f32, tundra: f32) -> f32 {
-    use crate::noise::hash;
     // Clear of the circuits: nothing within reach of a grid slot
     let slot = |v: f32| (v - (v / SLOT_SPACING).round() * SLOT_SPACING).abs();
     let clear = smooth(2400.0, 3400.0, slot(x).hypot(slot(z)));
@@ -367,19 +426,14 @@ fn scattered(x: f32, z: f32, desert: f32, forest: f32, mtn: f32, tundra: f32) ->
     let mut h = 0.0;
     for dj in -1..=1 {
         for di in -1..=1 {
-            let (i, j) = (ci + di as f32, cj + dj as f32);
-            let roll = hash(i * 1.7 + 11.0, j * 2.3 - 7.0);
+            let Deal { roll, cx, cz, size, turn } = Deal::of(ci + di as f32, cj + dj as f32);
             if roll > 0.55 {
                 continue;
             }
-            // Kept well inside the cell, so only its neighbours can reach x, z
-            let cx = (i + 0.25 + 0.5 * hash(i, j + 31.0)) * SCATTER_CELL;
-            let cz = (j + 0.25 + 0.5 * hash(i + 17.0, j)) * SCATTER_CELL;
-            let size = hash(i - 5.0, j + 9.0);
             let pick = roll / 0.55;
             h += if desert > 0.3 {
                 if pick < 0.6 {
-                    let a = hash(i + 3.0, j - 11.0) * std::f32::consts::TAU;
+                    let a = turn * std::f32::consts::TAU;
                     mesa(x, z, cx, cz, a.cos(), a.sin(), 250.0 + 250.0 * size, 25.0 + 20.0 * size) * desert
                 } else {
                     (bump(x, z, cx, cz, 70.0, 45.0) + bump(x, z, cx + 260.0, cz - 340.0, 60.0, 35.0)) * desert

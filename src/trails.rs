@@ -3,10 +3,11 @@
 //! earlier trails, so remote landmarks end up on a network of their own.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use glam::Vec2;
 
+use crate::noise::CellMap;
 use crate::road::{ease_tight_corners, resample, PathKind, RoadNetwork, CIRCUIT_SHOULDER, ROAD_HALF_WIDTH, TRAIL_HALF_WIDTH};
 use crate::terrain::{self, TERRAIN_HALF_SIZE, WATER_LEVEL, WORLD_SCALE};
 use crate::track::Track;
@@ -41,16 +42,23 @@ pub fn route_all(network: &RoadNetwork, sites: &[Vec2]) -> Vec<Track> {
     let wave = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut existing = TrailPoints::default();
     let mut trails = Vec::new();
+    // What each site's search learned of the ground, for the wider search
+    // after it: the sites are the same and so are the cells round them
+    let mut surveys: Vec<Survey> = sites.iter().map(|_| Survey::default()).collect();
     for radius in SEARCH_RADII {
         let mut unreached = Vec::new();
         for batch in order.chunks(wave) {
-            let routed = crate::layout::parallel_map(batch.to_vec(), |i| (i, route(network, &existing, sites[i], radius)));
+            let batch: Vec<(usize, Survey)> = batch.iter().map(|&i| (i, std::mem::take(&mut surveys[i]))).collect();
+            let routed = crate::layout::parallel_map(batch, |(i, mut survey)| {
+                let trail = route(network, &existing, sites[i], radius, &mut survey);
+                (i, trail, survey)
+            });
             let mut this_wave = TrailPoints::default();
-            for (i, mut trail) in routed {
+            for (i, mut trail, mut survey) in routed {
                 // One that runs into another of this wave (which it couldn't
                 // see) is routed again, now able to join it
                 if trail.as_ref().is_some_and(|t| t.points_2d.iter().any(|&p| this_wave.within(p, CELL * 1.5))) {
-                    trail = route(network, &existing, sites[i], radius);
+                    trail = route(network, &existing, sites[i], radius, &mut survey);
                 }
                 if let Some(t) = &trail {
                     this_wave.add(&t.points_2d);
@@ -60,7 +68,10 @@ pub fn route_all(network: &RoadNetwork, sites: &[Vec2]) -> Vec<Track> {
                         existing.add(&trail.points_2d);
                         trails.push(trail);
                     }
-                    None => unreached.push(i),
+                    None => {
+                        surveys[i] = survey;
+                        unreached.push(i);
+                    }
                 }
             }
         }
@@ -73,12 +84,13 @@ pub fn route_all(network: &RoadNetwork, sites: &[Vec2]) -> Vec<Track> {
 /// circuits), as trail routing would lay it, but without building anything.
 pub fn path_to(network: &RoadNetwork, site: Vec2) -> Option<Vec<Vec2>> {
     let none = TrailPoints::default();
-    SEARCH_RADII.iter().find_map(|&r| route(network, &none, site, r)).map(|t| t.points_2d)
+    let mut survey = Survey::default();
+    SEARCH_RADII.iter().find_map(|&r| route(network, &none, site, r, &mut survey)).map(|t| t.points_2d)
 }
 
 /// Points along trails routed so far, bucketed by grid cell.
 #[derive(Default)]
-struct TrailPoints(HashMap<(i32, i32), Vec<Vec2>>);
+struct TrailPoints(CellMap<Vec<Vec2>>);
 
 impl TrailPoints {
     fn key(p: Vec2) -> (i32, i32) {
@@ -101,46 +113,74 @@ impl TrailPoints {
 
 #[derive(Clone, Copy)]
 enum Cell {
-    Open(f32),
+    /// Height, and whether a road is close enough to join.
+    Open(f32, bool),
     NearCircuit,
     Blocked,
 }
 
+/// The cells round a site judged so far: a square `2 * r + 1` a side, centred
+/// on the site.
+#[derive(Default)]
+struct Survey {
+    r: i32,
+    cells: Vec<Option<Cell>>,
+}
+
+impl Survey {
+    /// Make room out to `r`, keeping what's known.
+    fn widen(&mut self, r: i32) {
+        if self.r == r && !self.cells.is_empty() {
+            return;
+        }
+        let (dim, old_dim) = ((2 * r + 1) as usize, (2 * self.r + 1) as usize);
+        let inset = (r - self.r) as usize;
+        let mut cells = vec![None; dim * dim];
+        for (row, old) in self.cells.chunks(old_dim).enumerate() {
+            cells[(row + inset) * dim + inset..][..old_dim].copy_from_slice(old);
+        }
+        *self = Self { r, cells };
+    }
+}
+
 /// Cheapest path over a grid from `site` to the first road or trail it meets
 /// (or failing that, a circuit), as a smooth trail starting at the join.
-fn route(network: &RoadNetwork, existing: &TrailPoints, site: Vec2, radius: f32) -> Option<Track> {
+fn route(network: &RoadNetwork, existing: &TrailPoints, site: Vec2, radius: f32, survey: &mut Survey) -> Option<Track> {
     let r = (radius / CELL) as i32;
+    survey.widen(r);
     let dim = 2 * r + 1;
     let pos = |i: usize| site + Vec2::new((i as i32 % dim - r) as f32, (i as i32 / dim - r) as f32) * CELL;
     let start = (r * dim + r) as usize;
 
-    let mut cells: Vec<Option<Cell>> = vec![None; (dim * dim) as usize];
     let mut cell = |i: usize| {
-        *cells[i].get_or_insert_with(|| {
+        *survey.cells[i].get_or_insert_with(|| {
             let p = pos(i);
-            if p.x.abs().max(p.y.abs()) > TERRAIN_HALF_SIZE - 300.0 || terrain::raw_height(p.x, p.y) < WATER_LEVEL + 1.5 {
+            if p.x.abs().max(p.y.abs()) > TERRAIN_HALF_SIZE - 300.0 {
+                return Cell::Blocked;
+            }
+            let raw = terrain::raw_height(p.x, p.y);
+            if raw < WATER_LEVEL + 1.5 {
                 Cell::Blocked
             } else if network.nearest_matching(p.x, p.y, |k| k == PathKind::Circuit).is_some_and(|s| s.dist < CIRCUIT_CLEARANCE) {
                 Cell::NearCircuit
             } else {
-                Cell::Open(terrain::natural_height(p.x, p.y))
+                let road = network.nearest_matching(p.x, p.y, |k| k == PathKind::Road).is_some_and(|s| s.dist < CELL * 0.75);
+                Cell::Open(raw.max(terrain::WATER_FLOOR), road)
             }
         })
     };
-    let joins = |p: Vec2| {
-        network.nearest_matching(p.x, p.y, |k| k == PathKind::Road).is_some_and(|s| s.dist < CELL * 0.75)
-            || existing.within(p, CELL * 0.75)
-    };
 
-    // Entries are (cost bits, cell, whether this is a circuit join)
+    // Entries sort by cost (positive floats order the same as their bit
+    // patterns), then cell; the lowest bit marks a circuit join
+    let entry = |cost: f32, i: usize, circuit_join: bool| Reverse((cost.to_bits() as u64) << 32 | (i as u64) << 1 | circuit_join as u64);
     let mut cost = vec![f32::INFINITY; (dim * dim) as usize];
     let mut from = vec![usize::MAX; (dim * dim) as usize];
     let mut open = BinaryHeap::new();
     cost[start] = 0.0;
-    open.push(Reverse((0u32, start, false)));
+    open.push(entry(0.0, start, false));
     let mut goal = None;
-    while let Some(Reverse((bits, i, circuit_join))) = open.pop() {
-        let c = f32::from_bits(bits);
+    while let Some(Reverse(top)) = open.pop() {
+        let (c, i, circuit_join) = (f32::from_bits((top >> 32) as u32), (top as u32 >> 1) as usize, top & 1 != 0);
         if circuit_join {
             goal = Some((i, true));
             break;
@@ -148,11 +188,12 @@ fn route(network: &RoadNetwork, existing: &TrailPoints, site: Vec2, radius: f32)
         if c > cost[i] {
             continue;
         }
-        if i != start && joins(pos(i)) {
+        // Only open cells are queued, bar the start
+        let Cell::Open(h, by_road) = cell(i) else { continue };
+        if i != start && (by_road || existing.within(pos(i), CELL * 0.75)) {
             goal = Some((i, false));
             break;
         }
-        let Cell::Open(h) = cell(i) else { continue };
         let (cx, cz) = (i as i32 % dim, i as i32 / dim);
         for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
             let (nx, nz) = (cx + dx, cz + dz);
@@ -161,13 +202,12 @@ fn route(network: &RoadNetwork, existing: &TrailPoints, site: Vec2, radius: f32)
             }
             let j = (nz * dim + nx) as usize;
             let step = CELL * if dx != 0 && dz != 0 { std::f32::consts::SQRT_2 } else { 1.0 };
-            // Positive floats order the same as their bit patterns
             let hj = match cell(j) {
-                Cell::Open(hj) => hj,
+                Cell::Open(hj, _) => hj,
                 Cell::NearCircuit => {
                     if from[j] == usize::MAX {
                         from[j] = i;
-                        open.push(Reverse(((c + step + CIRCUIT_JOIN_COST).to_bits(), j, true)));
+                        open.push(entry(c + step + CIRCUIT_JOIN_COST, j, true));
                     }
                     continue;
                 }
@@ -178,7 +218,7 @@ fn route(network: &RoadNetwork, existing: &TrailPoints, site: Vec2, radius: f32)
             if next < cost[j] {
                 cost[j] = next;
                 from[j] = i;
-                open.push(Reverse((next.to_bits(), j, false)));
+                open.push(entry(next, j, false));
             }
         }
     }

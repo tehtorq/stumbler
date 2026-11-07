@@ -9,6 +9,7 @@ use crate::boosts::{self, BoostPad};
 use crate::geometry::Vertex;
 use crate::gpu::{GpuContext, Mesh};
 use crate::road::{self, PathKind, RoadNetwork, ROAD_HALF_WIDTH, KERB_WIDTH};
+use crate::routes::Routes;
 use crate::terrain::{self, terrain_height};
 use crate::{farms, landmarks, layout, railway, roadside, stages, trails};
 
@@ -58,8 +59,6 @@ pub struct World {
     pub trail_outlines: Vec<Vec<Vec2>>,
     /// The island's shoreline, for maps.
     pub coastline: Vec<Vec2>,
-    /// The island as a picture, for maps.
-    pub map_image: crate::map::MapImage,
     pub boost_pads: Vec<BoostPad>,
     pub gate_mesh: Mesh,
     pub boost_mesh: Mesh,
@@ -69,10 +68,10 @@ impl World {
     pub fn build(gpu: &GpuContext) -> Self {
         // The road network must exist before anything samples terrain_height
         let t0 = std::time::Instant::now();
-        let layout = layout::build(terrain::TERRAIN_HALF_SIZE);
+        let (layout, routes) = plan();
         eprintln!("[timing] layout {:.2}s", t0.elapsed().as_secs_f32());
         let names: Vec<&'static str> = layout.circuits.iter().map(|c| c.name).collect();
-        let network = road::install(|| build_network(layout));
+        let network = road::install(|| build_network(layout, routes));
         eprintln!("[timing] roads, railway, landmarks and trails {:.2}s", t0.elapsed().as_secs_f32());
 
         // Circuits, then the gravel stages
@@ -123,7 +122,6 @@ impl World {
             road_outlines,
             trail_outlines,
             coastline,
-            map_image: crate::map::MapImage::build(),
             boost_pads,
             gate_mesh: Mesh::new(gpu, &gate_verts, &gate_idxs),
             boost_mesh: Mesh::new(gpu, &boost_verts, &boost_idxs),
@@ -141,24 +139,48 @@ impl World {
 /// Circuits and connecting roads from `layout`, the railway routed between
 /// them, then landmarks sited against them all (installed for
 /// `landmarks::all`) and a dirt trail out to each that isn't a secret.
-pub fn build_network(layout: layout::Layout) -> RoadNetwork {
+pub fn build_network(layout: layout::Layout, known: Option<Routes>) -> RoadNetwork {
     let names: Vec<&'static str> = layout.circuits.iter().map(|c| c.name).collect();
     let circuits: Vec<_> = layout.circuits.into_iter().map(|c| c.track).collect();
     let mut network = RoadNetwork::build(&circuits, &layout.roads, terrain::TERRAIN_HALF_SIZE, terrain::natural_height);
-    network.add_rail(&railway::route(&network), terrain::natural_height);
-    network.add_gravel(&stages::route_all(&network), terrain::natural_height);
-    let mut sites = landmarks::place(&network);
-    // Secrets get no trail; finding them is the point
-    let positions: Vec<Vec2> = sites.iter().filter(|l| !l.kind.is_secret()).map(|l| l.pos).collect();
-    let trails = trails::route_all(&network, &positions);
-    // A landmark no trail could reach (boxed in by cliffs or water) isn't put up
-    sites.retain(|l| l.kind.is_secret() || trails.iter().any(|t| t.points_2d.last().is_some_and(|e| e.distance(l.pos) < 60.0)));
-    network.add_trails(&trails, terrain::natural_height);
-    landmarks::install(sites, &network);
+    let cached = known.is_some();
+    let mut routes = known.unwrap_or_default();
+    if !cached {
+        routes.rail = railway::route(&network);
+    }
+    network.add_rail(&routes.rail, terrain::natural_height);
+    if cached {
+        stages::restore(std::mem::take(&mut routes.stage_names));
+    } else {
+        routes.stages = stages::route_all(&network);
+    }
+    network.add_gravel(&routes.stages, terrain::natural_height);
+    if !cached {
+        let mut sites = landmarks::place(&network);
+        // Secrets get no trail; finding them is the point
+        let positions: Vec<Vec2> = sites.iter().filter(|l| !l.kind.is_secret()).map(|l| l.pos).collect();
+        let trails = trails::route_all(&network, &positions);
+        // A landmark no trail could reach (boxed in by cliffs or water) isn't put up
+        sites.retain(|l| l.kind.is_secret() || trails.iter().any(|t| t.points_2d.last().is_some_and(|e| e.distance(l.pos) < 60.0)));
+        routes.sites = sites;
+        routes.trails = trails;
+        routes.stage_names = stages::names().to_vec();
+        crate::routes::save(&names, &circuits, &layout.roads, &routes);
+    }
+    network.add_trails(&routes.trails, terrain::natural_height);
+    landmarks::install(routes.sites, &network);
     farms::install(&network);
     roadside::install(&names, &network);
     railway::install(&network);
     network
+}
+
+/// The layout, and the routes if they were saved by an earlier run.
+pub fn plan() -> (layout::Layout, Option<Routes>) {
+    match crate::routes::load() {
+        Some((layout, routes)) => (layout, Some(routes)),
+        None => (layout::build(terrain::TERRAIN_HALF_SIZE), None),
+    }
 }
 
 /// Where the five start lights hang on `c`'s start gantry: in a row

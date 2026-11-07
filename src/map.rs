@@ -32,6 +32,8 @@ pub struct MapImage {
 
 impl MapImage {
     pub fn build() -> Self {
+        // The picture shows the fields, so it would come out without them
+        assert!(!crate::farms::all().is_empty(), "the map image needs the farms placed first");
         let step = TERRAIN_HALF_SIZE * 2.0 / (SIDE - 1) as f32;
         let at = |i: usize, j: usize| Vec2::new(i as f32, j as f32) * step - TERRAIN_HALF_SIZE;
         let heights: Vec<f32> = crate::layout::parallel_map((0..SIDE).collect(), |j| {
@@ -72,6 +74,14 @@ impl MapImage {
             levels.push(Level { side, colors });
         }
         Self { levels }
+    }
+
+    /// Every level's colours, for checking the picture hasn't changed.
+    #[cfg(test)]
+    pub(crate) fn digest(&self, mut eat: impl FnMut(&[u8])) {
+        for level in &self.levels {
+            eat(bytemuck::cast_slice(&level.colors));
+        }
     }
 
     /// The colour at world point `p` from picture `level`, blended between

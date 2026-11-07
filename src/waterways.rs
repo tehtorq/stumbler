@@ -10,12 +10,11 @@
 //! as a profile across its centreline: the terrain takes whichever is lower,
 //! its own height or the cut's, blended so the edge is never a crease.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use glam::Vec2;
 
-use crate::noise::noise;
+use crate::noise::{noise, CellMap};
 use crate::terrain::{self, WATER_LEVEL, WORLD_SCALE};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,7 +128,7 @@ impl Course {
 struct Waterways {
     courses: Vec<Course>,
     /// Segments (course, index) within `REACH` of each cell.
-    grid: HashMap<(i32, i32), Vec<(u16, u32)>>,
+    grid: CellMap<Vec<(u16, u32)>>,
 }
 
 static WATERWAYS: OnceLock<Waterways> = OnceLock::new();
@@ -251,7 +250,7 @@ fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
 
 fn build() -> Waterways {
     let courses: Vec<Course> = DEFS.iter().enumerate().map(|(n, def)| lay(n, def)).collect();
-    let mut grid: HashMap<(i32, i32), Vec<(u16, u32)>> = HashMap::new();
+    let mut grid: CellMap<Vec<(u16, u32)>> = CellMap::default();
     let r = (REACH / CELL).ceil() as i32 + 1;
     for (c, course) in courses.iter().enumerate() {
         for i in 0..course.points.len() - 1 {

@@ -589,7 +589,7 @@ impl Stage {
             yaw: Some(self.player.yaw()),
         };
         // The land itself, a little dimmed so the lines on it stand out
-        self.world.map_image.draw(back, &view, lo, hi, 24, 0.7);
+        self.map_image.draw(back, &view, lo, hi, 24, 0.7);
         frame(h, lo, hi, px * 0.5, [0.0, 0.0, 0.0, 0.7]);
         let clip = (lo, hi);
         for course in waterways::all() {
@@ -666,7 +666,7 @@ impl Stage {
     fn world_map(&self, back: &mut HudBuilder, h: &mut HudBuilder, width: f32, height: f32, px: f32) {
         let (view, lo, hi) = self.world_map_view(width, height);
         back.rect(0.0, 0.0, width, height, [0.03, 0.05, 0.09, 0.94]);
-        self.world.map_image.draw(back, &view, lo, hi, 140, 0.85);
+        self.map_image.draw(back, &view, lo, hi, 140, 0.85);
         frame(h, lo, hi, px * 0.6, [0.85, 0.8, 0.65, 0.8]);
         let clip = (lo, hi);
         let zoom = self.map.zoom;

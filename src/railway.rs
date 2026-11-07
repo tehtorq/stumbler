@@ -10,7 +10,7 @@
 //! cuttings, embankments and level crossings with the roads.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::OnceLock;
 
 use glam::{Mat4, Quat, Vec2, Vec3, vec3};
@@ -18,6 +18,7 @@ use glam::{Mat4, Quat, Vec2, Vec3, vec3};
 use crate::collisions::Solid;
 use crate::geometry::Vertex;
 use crate::layout::GRID_SPACING;
+use crate::noise::CellMap;
 use crate::props::Builder;
 use crate::road::{self, corner_radius, resample, PathKind, RoadNetwork, RoadPath, Structure, RAIL_HALF_WIDTH, ROAD_HALF_WIDTH};
 use crate::terrain::{self, WATER_LEVEL};
@@ -177,16 +178,16 @@ pub fn route(network: &RoadNetwork) -> Vec<Track> {
 }
 
 /// Routing cells too close to a circuit.
-fn circuit_cells(network: &RoadNetwork) -> HashSet<(i32, i32)> {
+fn circuit_cells(network: &RoadNetwork) -> CellMap<()> {
     let r = (CIRCUIT_CLEARANCE / CELL).ceil() as i32;
-    let mut cells = HashSet::new();
+    let mut cells = CellMap::default();
     for p in network.paths.iter().filter(|p| p.circuit()).flat_map(|p| p.points.iter().step_by(3)) {
         let (kx, kz) = cell_of(*p);
         for dz in -r..=r {
             for dx in -r..=r {
                 let c = Vec2::new((kx + dx) as f32, (kz + dz) as f32) * CELL;
                 if c.distance(*p) < CIRCUIT_CLEARANCE {
-                    cells.insert((kx + dx, kz + dz));
+                    cells.insert((kx + dx, kz + dz), ());
                 }
             }
         }
@@ -201,7 +202,7 @@ fn cell_of(p: Vec2) -> (i32, i32) {
 /// Cheapest way from `from` to `to` over the grid: steep ground costs a lot
 /// (a railway can barely climb), water a fair bit (a causeway), and circuits
 /// are out of bounds. Returns cell centres, starting at `from`'s cell.
-fn astar(from: Vec2, to: Vec2, blocked: &HashSet<(i32, i32)>) -> Vec<Vec2> {
+fn astar(from: Vec2, to: Vec2, blocked: &CellMap<()>) -> Vec<Vec2> {
     let margin = 1800.0;
     let lo = cell_of((from.min(to) - margin).max(Vec2::splat(-EDGE)));
     let hi = cell_of((from.max(to) + margin).min(Vec2::splat(EDGE)));
@@ -215,9 +216,9 @@ fn astar(from: Vec2, to: Vec2, blocked: &HashSet<(i32, i32)>) -> Vec<Vec2> {
     let mut ground = |i: usize| {
         if height[i].is_nan() {
             let p = pos(i);
-            let wet = terrain::raw_height(p.x, p.y) < WATER_LEVEL + 0.5;
+            let raw = terrain::raw_height(p.x, p.y);
             // Water is marked with -inf
-            height[i] = if wet { f32::NEG_INFINITY } else { terrain::natural_height(p.x, p.y) };
+            height[i] = if raw < WATER_LEVEL + 0.5 { f32::NEG_INFINITY } else { raw.max(terrain::WATER_FLOOR) };
         }
         height[i]
     };
@@ -238,7 +239,7 @@ fn astar(from: Vec2, to: Vec2, blocked: &HashSet<(i32, i32)>) -> Vec<Vec2> {
                 continue;
             }
             let j = nz as usize * w + nx as usize;
-            if j != goal && blocked.contains(&(lo.0 + nx, lo.1 + nz)) {
+            if j != goal && blocked.contains_key(&(lo.0 + nx, lo.1 + nz)) {
                 continue;
             }
             let step = CELL * if dx != 0 && dz != 0 { std::f32::consts::SQRT_2 } else { 1.0 };

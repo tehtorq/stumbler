@@ -250,18 +250,18 @@ impl RoadNetwork {
         circuits: &[Track],
         roads: &[Track],
         bounds: f32,
-        natural_height: impl Fn(f32, f32) -> f32,
+        natural_height: impl Fn(f32, f32) -> f32 + Sync,
     ) -> Self {
         let limit = bounds - INFLUENCE;
         let inside = |t: &Track| t.points_2d.iter().all(|p| p.x.abs() < limit && p.y.abs() < limit);
 
-        let mut paths: Vec<RoadPath> = circuits
+        let tracks = circuits
             .iter()
             .map(|t| (t, PathKind::Circuit))
             .chain(roads.iter().map(|t| (t, PathKind::Road)))
             .filter(|(t, _)| t.points_2d.len() >= 2 && inside(t))
-            .map(|(t, kind)| build_path(&t.points_2d, t.closed, kind, &natural_height))
             .collect();
+        let mut paths = crate::layout::parallel_map(tracks, |(t, kind)| build_path(&t.points_2d, t.closed, kind, &natural_height));
         blend_junctions(&mut paths);
 
         let mut network = Self { paths, segments: Vec::new(), grid: Vec::new(), grid_dim: 0, grid_half: bounds };
@@ -271,10 +271,10 @@ impl RoadNetwork {
 
     /// Add dirt trails, each starting on a road, a circuit or an earlier
     /// trail. Their heights ease into whatever they leave so the join has no step.
-    pub fn add_trails(&mut self, trails: &[Track], natural_height: impl Fn(f32, f32) -> f32) {
+    pub fn add_trails(&mut self, trails: &[Track], natural_height: impl Fn(f32, f32) -> f32 + Sync) {
         let mut added: Vec<RoadPath> = Vec::new();
-        for track in trails.iter().filter(|t| t.points_2d.len() >= 2) {
-            let mut path = build_path(&track.points_2d, track.closed, PathKind::Trail, &natural_height);
+        let tracks = trails.iter().filter(|t| t.points_2d.len() >= 2).collect();
+        for mut path in crate::layout::parallel_map(tracks, |t| build_path(&t.points_2d, t.closed, PathKind::Trail, &natural_height)) {
             // Where it starts: the nearest point on a road or circuit, or on an earlier trail
             let start = path.points[0];
             // (an earlier trail's height is taken along its segments: on a
@@ -329,7 +329,7 @@ impl RoadNetwork {
     /// Add gravel stage roads (open paths). Where one crosses a road, the
     /// railway or a circuit it eases to that path's height so the crossing
     /// is level; then jumps are set into its straighter stretches.
-    pub fn add_gravel(&mut self, stages: &[Track], natural_height: impl Fn(f32, f32) -> f32) {
+    pub fn add_gravel(&mut self, stages: &[Track], natural_height: impl Fn(f32, f32) -> f32 + Sync) {
         // Eased over this many samples either side of a crossing, beyond
         // the stretch flat with the other path
         const EASE: usize = 30;
@@ -404,11 +404,9 @@ impl RoadNetwork {
     /// Where one crosses a road the two meet at one height, each easing in to
     /// it, so the crossing is level; where a line's end runs onto another
     /// line (a junction), its heights ease into that line's.
-    pub fn add_rail(&mut self, lines: &[Track], natural_height: impl Fn(f32, f32) -> f32) {
-        let mut rails: Vec<RoadPath> = lines.iter()
-            .filter(|t| t.points_2d.len() >= 2)
-            .map(|t| build_path(&t.points_2d, t.closed, PathKind::Rail, &natural_height))
-            .collect();
+    pub fn add_rail(&mut self, lines: &[Track], natural_height: impl Fn(f32, f32) -> f32 + Sync) {
+        let lines = lines.iter().filter(|t| t.points_2d.len() >= 2).collect();
+        let mut rails = crate::layout::parallel_map(lines, |t| build_path(&t.points_2d, t.closed, PathKind::Rail, &natural_height));
 
         // Level crossings: the closest rail sample to each road it crosses.
         // Each eases in over a stretch long enough to keep to its own grade

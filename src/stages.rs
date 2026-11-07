@@ -85,6 +85,11 @@ pub fn route_all(network: &RoadNetwork) -> Vec<Track> {
     routed.into_iter().map(|(_, t)| t).collect()
 }
 
+/// Set the names `names` returns, for stages routed by an earlier run.
+pub fn restore(names: Vec<&'static str>) {
+    let _ = ROUTED.set(names);
+}
+
 /// The names of the stages `route_all` laid out, in order.
 pub fn names() -> &'static [&'static str] {
     ROUTED.get().map_or(&[], |v| v.as_slice())
@@ -148,6 +153,28 @@ fn route(network: &RoadNetwork, taken: &HashSet<(i32, i32)>, waypoints: &[[f32; 
     Some(Track { points_2d: resample(&points, false, 4.0), closed: false })
 }
 
+/// What stepping onto a cell costs, whichever way you come.
+#[derive(Clone, Copy)]
+struct Ground {
+    height: f32,
+    /// Multiplies a step's cost.
+    terms: f32,
+}
+
+impl Ground {
+    fn at(network: &RoadNetwork, p: Vec2) -> Self {
+        let raw = terrain::raw_height(p.x, p.y);
+        let height = raw.max(terrain::WATER_FLOOR);
+        // Through the woods if it can: open ground costs a little more
+        let wood = (crate::trees::density_over(p.x, p.y, height, raw) * 1.5).min(1.0);
+        // Across a road or the railway, but not along beside one
+        let beside = network.nearest_matching(p.x, p.y, |k| k > PathKind::Gravel).is_some_and(|s| s.dist < s.half_width() + s.shoulder() + 50.0);
+        // Over water on a causeway only when there's no way round
+        let wet = raw < WATER_LEVEL + 1.5;
+        Self { height, terms: (1.3 - 0.4 * wood) * if beside { 4.0 } else { 1.0 } * if wet { WATER_COST } else { 1.0 } }
+    }
+}
+
 /// The cheapest path over a grid from `a` to `b` (both nudged onto open
 /// ground), as the cells' centres in order.
 fn leg_route(network: &RoadNetwork, taken: &HashSet<(i32, i32)>, a: Vec2, b: Vec2) -> Option<Vec<Vec2>> {
@@ -159,16 +186,16 @@ fn leg_route(network: &RoadNetwork, taken: &HashSet<(i32, i32)>, a: Vec2, b: Vec
         let c = ((p - lo) / CELL).round();
         (c.x >= 0.0 && c.y >= 0.0 && (c.x as i32) < w && (c.y as i32) < h).then(|| (c.y as i32 * w + c.x as i32) as usize)
     };
-    let mut cells: Vec<Option<Option<f32>>> = vec![None; (w * h) as usize];
+    let mut cells: Vec<Option<Option<Ground>>> = vec![None; (w * h) as usize];
     let mut cell = |i: usize| {
         *cells[i].get_or_insert_with(|| {
             let p = pos(i);
             let k = (p / CELL).floor();
-            (open(network, p) && !taken.contains(&(k.x as i32, k.y as i32))).then(|| terrain::natural_height(p.x, p.y))
+            (open(network, p) && !taken.contains(&(k.x as i32, k.y as i32))).then(|| Ground::at(network, p))
         })
     };
     // The nearest open cell to a point, if it's in water or too near a circuit
-    let settle = |p: Vec2, cell: &mut dyn FnMut(usize) -> Option<f32>| {
+    let settle = |p: Vec2, cell: &mut dyn FnMut(usize) -> Option<Ground>| {
         (0..80).map(|r| r as f32 * CELL * 0.5)
             .flat_map(|r| (0..16).map(move |k| p + Vec2::from_angle(k as f32 * std::f32::consts::TAU / 16.0) * r))
             .filter_map(index)
@@ -187,7 +214,7 @@ fn leg_route(network: &RoadNetwork, taken: &HashSet<(i32, i32)>, a: Vec2, b: Vec
         if i == goal {
             break;
         }
-        let Some(hi_) = cell(i) else { continue };
+        let Some(here) = cell(i) else { continue };
         let (cx, cz) = (i as i32 % w, i as i32 / w);
         for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
             let (nx, nz) = (cx + dx, cz + dz);
@@ -195,23 +222,15 @@ fn leg_route(network: &RoadNetwork, taken: &HashSet<(i32, i32)>, a: Vec2, b: Vec
                 continue;
             }
             let j = (nz * w + nx) as usize;
-            let Some(hj) = cell(j) else { continue };
-            let p = pos(j);
+            let Some(there) = cell(j) else { continue };
             let step = CELL * if dx != 0 && dz != 0 { std::f32::consts::SQRT_2 } else { 1.0 };
-            let slope = (hj - hi_).abs() / step;
-            // Through the woods if it can: open ground costs a little more
-            let wood = (crate::trees::density(p.x, p.y, hj) * 1.5).min(1.0);
-            // Across a road or the railway, but not along beside one
-            let beside = network.nearest_matching(p.x, p.y, |k| k > PathKind::Gravel).is_some_and(|s| s.dist < s.half_width() + s.shoulder() + 50.0);
-            // Over water on a causeway only when there's no way round
-            let wet = terrain::raw_height(p.x, p.y) < WATER_LEVEL + 1.5;
-            let next = cost[i] + step * (1.0 + 3.0 * (slope / COMFORTABLE_SLOPE).powi(2)) * (1.3 - 0.4 * wood)
-                * if beside { 4.0 } else { 1.0 } * if wet { WATER_COST } else { 1.0 };
+            let slope = (there.height - here.height).abs() / step;
+            let next = cost[i] + step * (1.0 + 3.0 * (slope / COMFORTABLE_SLOPE).powi(2)) * there.terms;
             if next < cost[j] {
                 cost[j] = next;
                 from[j] = i;
                 // A* toward the goal (positive floats order as their bits)
-                queue.push(Reverse(((next + p.distance(target)).to_bits(), j)));
+                queue.push(Reverse(((next + pos(j).distance(target)).to_bits(), j)));
             }
         }
     }
