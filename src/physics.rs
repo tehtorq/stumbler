@@ -1069,6 +1069,45 @@ mod tests {
         fn on_road(&self, _x: f32, _z: f32) -> f32 { 0.0 }
     }
 
+    /// Bottoming out into a steep hill throws sparks from the underside,
+    /// where it touches; cruising on the flat throws none. A backfire spits
+    /// from the tail.
+    #[test]
+    fn scraping_throws_sparks() {
+        let dt = 1.0 / 240.0;
+        let sparks = |grade: f32| {
+            let g = Foothill { grade, blend: 0.0 };
+            let mut car = CarPhysics::new_on(&g, vec3(0.0, 0.0, 60.0), 0.0);
+            run(&mut car, &g, 0.5, CarInput::default());
+            car.vel = car.forward() * 45.0;
+            let mut particles = crate::particles::Particles::new();
+            let (mut thrown, mut far) = (0, 0.0_f32);
+            for _ in 0..(1.5 / dt) as usize {
+                car.update(&g, dt, throttle(1.0));
+                let before = particles.count();
+                particles.scrape(&car, true, dt);
+                if particles.count() > before {
+                    thrown += particles.count() - before;
+                    far = far.max(car.scrape_at.distance(car.pos));
+                }
+                particles.update(dt);
+            }
+            (thrown, far)
+        };
+        let (flat, _) = sparks(0.0);
+        assert_eq!(flat, 0, "sparks on the flat");
+        let (steep, far) = sparks(0.5);
+        assert!(steep > 10, "only {steep} sparks bottoming out");
+        assert!(far < 6.0, "sparks {far} from the car");
+
+        let g = Foothill { grade: 0.0, blend: 0.0 };
+        let car = CarPhysics::new_on(&g, vec3(0.0, 0.0, 0.0), 0.0);
+        let mut particles = crate::particles::Particles::new();
+        particles.backfire(&car);
+        let behind = particles.positions().all(|p| (p - car.pos).dot(car.forward()) < -3.0);
+        assert!(particles.count() > 0 && behind, "backfire not at the tail");
+    }
+
     /// Hit a `grade` hill at `speed` with the throttle down: (speed lost to
     /// by 30 units up the slope, peak underside force, worst deceleration in
     /// g, ends upright).

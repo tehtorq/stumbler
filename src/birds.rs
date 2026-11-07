@@ -1,4 +1,4 @@
-use glam::{Vec3, vec3};
+use glam::{Vec2, Vec3, vec3};
 use crate::geometry::Vertex;
 use crate::terrain::terrain_height;
 
@@ -13,8 +13,13 @@ pub struct Flock {
     radius: f32,
     pub birds: Vec<Bird>,
     scatter_timer: f32,
+    /// Seconds left of gliding back into the circle after a scatter.
+    returning: f32,
     angular_speed: f32,
 }
+
+/// How long scattered birds take to find their places in the circle again.
+const RETURN_TIME: f32 = 3.0;
 
 pub fn create_flocks(circuit_centroids: &[(f32, f32)]) -> Vec<Flock> {
     circuit_centroids.iter().enumerate().map(|(i, &(cx, cz))| {
@@ -42,9 +47,38 @@ pub fn create_flocks(circuit_centroids: &[(f32, f32)]) -> Vec<Flock> {
             radius,
             birds,
             scatter_timer: 0.0,
+            returning: 0.0,
             angular_speed,
         }
     }).collect()
+}
+
+impl Flock {
+    /// Send every bird flying off outward and up.
+    fn scatter(&mut self) {
+        self.scatter_timer = 4.0;
+        self.returning = 0.0;
+        for bird in &mut self.birds {
+            let bx = bird.pos.x - self.center.x;
+            let bz = bird.pos.z - self.center.z;
+            let len = (bx * bx + bz * bz).sqrt().max(1.0);
+            bird.vel = vec3(
+                bx / len * 25.0 + (bird.phase * 3.1).sin() * 8.0,
+                12.0 + (bird.phase * 5.7).sin().abs() * 8.0,
+                bz / len * 25.0 + (bird.phase * 7.3).sin() * 8.0,
+            );
+        }
+    }
+}
+
+/// A sudden din at `at` (a field of engines at full revs) puts up every
+/// flock within `reach`.
+pub fn startle(flocks: &mut [Flock], at: Vec3, reach: f32) {
+    for flock in flocks.iter_mut().filter(|f| f.scatter_timer <= 0.0) {
+        if Vec2::new(flock.center.x - at.x, flock.center.z - at.z).length() < reach {
+            flock.scatter();
+        }
+    }
 }
 
 pub fn update_flocks(flocks: &mut [Flock], player_pos: Vec3, dt: f32, time: f32) {
@@ -55,17 +89,7 @@ pub fn update_flocks(flocks: &mut [Flock], player_pos: Vec3, dt: f32, time: f32)
 
         // Scatter when player drives close
         if dist_sq < 80.0 * 80.0 && flock.scatter_timer <= 0.0 {
-            flock.scatter_timer = 4.0;
-            for bird in &mut flock.birds {
-                let bx = bird.pos.x - flock.center.x;
-                let bz = bird.pos.z - flock.center.z;
-                let len = (bx * bx + bz * bz).sqrt().max(1.0);
-                bird.vel = vec3(
-                    bx / len * 25.0 + (bird.phase * 3.1).sin() * 8.0,
-                    12.0 + (bird.phase * 5.7).sin().abs() * 8.0,
-                    bz / len * 25.0 + (bird.phase * 7.3).sin() * 8.0,
-                );
-            }
+            flock.scatter();
         }
 
         if flock.scatter_timer > 0.0 {
@@ -75,32 +99,34 @@ pub fn update_flocks(flocks: &mut [Flock], player_pos: Vec3, dt: f32, time: f32)
                 bird.vel.y -= 4.0 * dt;
                 bird.vel *= 1.0 - 0.4 * dt;
             }
-            // Return to orbiting when scatter ends
+            // Then glide back to the circle rather than jump into it
             if flock.scatter_timer <= 0.0 {
-                let n = flock.birds.len();
-                for (j, bird) in flock.birds.iter_mut().enumerate() {
-                    let angle = time * flock.angular_speed
-                        + j as f32 / n as f32 * std::f32::consts::TAU;
-                    bird.pos = vec3(
-                        flock.center.x + angle.cos() * flock.radius,
-                        flock.center.y,
-                        flock.center.z + angle.sin() * flock.radius,
-                    );
+                flock.returning = RETURN_TIME;
+                for bird in &mut flock.birds {
                     bird.vel = Vec3::ZERO;
                 }
             }
         } else {
-            // Orbit around center with gentle bob
+            // Orbit around center with gentle bob, easing in more and more
+            // firmly while they find their places again
+            let pull = if flock.returning > 0.0 {
+                flock.returning -= dt;
+                let settled = 1.0 - flock.returning.max(0.0) / RETURN_TIME;
+                (dt * (0.6 + 7.0 * settled * settled)).min(1.0)
+            } else {
+                1.0
+            };
             let n = flock.birds.len();
             for (j, bird) in flock.birds.iter_mut().enumerate() {
                 let angle = time * flock.angular_speed
                     + j as f32 / n as f32 * std::f32::consts::TAU;
                 let bob = (time * 2.0 + bird.phase).sin() * 1.5;
-                bird.pos = vec3(
+                let place = vec3(
                     flock.center.x + angle.cos() * flock.radius,
                     flock.center.y + bob,
                     flock.center.z + angle.sin() * flock.radius,
                 );
+                bird.pos += (place - bird.pos) * pull;
             }
         }
     }

@@ -976,6 +976,8 @@ impl Stage {
         for event in events {
             match event {
                 RaceEvent::Go => {
+                    // The whole field at full revs puts the birds up
+                    birds::startle(&mut self.flocks, self.player.pos, 700.0);
                     // The crowd's away with them
                     self.fireworks = self.fireworks.max(1.6);
                     // On the power just as the lights go: a flying start.

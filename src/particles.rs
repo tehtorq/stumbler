@@ -60,6 +60,16 @@ impl Particles {
         }
     }
 
+    #[cfg(test)]
+    pub fn count(&self) -> usize {
+        self.list.len()
+    }
+
+    #[cfg(test)]
+    pub fn positions(&self) -> impl Iterator<Item = Vec3> + '_ {
+        self.list.iter().map(|p| p.pos)
+    }
+
     /// xorshift32 in [0, 1)
     fn rand(&mut self) -> f32 {
         self.rng ^= self.rng << 13;
