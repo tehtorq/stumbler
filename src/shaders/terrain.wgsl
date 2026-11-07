@@ -1,4 +1,4 @@
-// Terrain: flat per-face colours, sun lighting, drifting cloud shadows, fog.
+// Terrain: flat per-face colours, sun lighting, drifting cloud shadows, fog. Outputs linear HDR.
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -17,22 +17,14 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let albedo = in.color.rgb;
+    let albedo = lin(in.color.rgb);
     let normal = flat_normal(in.world_pos);
-    var lit = sun_lighting(albedo, normal, sun_reaches(in.world_pos, normal));
+    let sun = sun_reaches(in.world_pos, normal) * cloud_light(in.world_pos.xz);
+    var lit = sun_lighting(albedo, normal, sun);
 
     // Dynamic lights (headlights)
     lit += eval_lights(in.world_pos, normal, albedo);
 
-    // Cloud shadows — drifting dark patches (daytime only)
-    let xz = in.world_pos.xz;
-    let cloud_u = xz.x * 0.0003 + globals.wind_time * 0.015;
-    let cloud_v = xz.y * 0.0003 + globals.wind_time * 0.006;
-    let cloud = sin(cloud_u * 6.28) * sin(cloud_v * 6.28)
-              + sin(cloud_u * 12.56 + 1.0) * sin(cloud_v * 12.56 + 2.0) * 0.5;
-    let cloud_shadow = smoothstep(0.1, 0.5, cloud) * 0.15 * day_factor();
-    lit *= (1.0 - cloud_shadow);
-
     lit = apply_fog(lit, in.world_pos);
-    return vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return vec4<f32>(max(lit, vec3<f32>(0.0)), 1.0);
 }

@@ -1,4 +1,4 @@
-// Sky gradient with sun disc, sunset tint and stars. Fullscreen triangle, no vertex buffer.
+// Sky gradient with sun disc, sunset tint and stars, in linear HDR. Fullscreen triangle, no vertex buffer.
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -46,22 +46,23 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Rain cloud: a flat grey sky
     let rain = globals.screen.z;
     zenith = mix(zenith, globals.fog.rgb * 0.9, rain);
-    let horizon = globals.fog.rgb;
+    // Graded by eye as before, then into linear light, with the haze's warm
+    // glow toward the sun added low down
+    var sky = lin(mix(globals.fog.rgb, zenith, pow(t, 0.6))) + (haze_color(dir) - lin(globals.fog.rgb)) * (1.0 - t);
 
-    var sky = mix(horizon, zenith, pow(t, 0.6));
-
-    // Sun disc at projected screen position
+    // Sun disc at projected screen position: far brighter than anything
+    // lit, so it blooms
     let sun_dist = length(in.screen - sun_scr);
 
     if (sun_scr.y > -1.5 && rain < 0.6) {
         let sun_disc = smoothstep(0.1, 0.04, sun_dist);
-        let sun_color = mix(vec3<f32>(1.0, 0.6, 0.2), vec3<f32>(1.0, 0.95, 0.85), day);
-        sky = mix(sky, sun_color, sun_disc);
+        let disc_color = mix(vec3<f32>(1.0, 0.5, 0.15), vec3<f32>(1.0, 0.93, 0.8), day);
+        sky = mix(sky, disc_color * 14.0, sun_disc * (1.0 - rain / 0.6));
 
-        let glow = exp(-sun_dist * sun_dist * 8.0) * 0.4 * day;
-        let warm_glow = exp(-sun_dist * sun_dist * 3.0) * 0.3 * sunset_factor;
-        sky += vec3<f32>(glow * 0.9, glow * 0.8, glow * 0.5);
-        sky += vec3<f32>(warm_glow, warm_glow * 0.4, warm_glow * 0.1);
+        let glow = exp(-sun_dist * sun_dist * 8.0) * 0.5 * day;
+        let warm_glow = exp(-sun_dist * sun_dist * 3.0) * 0.35 * sunset_factor;
+        sky += vec3<f32>(0.85, 0.7, 0.4) * glow;
+        sky += vec3<f32>(1.0, 0.25, 0.05) * warm_glow;
     }
 
     // Stars at night — spherical mapping on world ray direction
@@ -76,9 +77,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let in_cell = abs(fract(cell) - 0.5);
         if (star > 0.97 && max(in_cell.x, in_cell.y) < 0.18) {
             let brightness = fract(sin(dot(sp, vec2<f32>(93.97, 41.23))) * 31415.9);
-            sky += vec3<f32>(star_intensity * (0.4 + 0.6 * brightness));
+            sky += vec3<f32>(star_intensity * (0.2 + 1.3 * brightness * brightness));
         }
     }
 
-    return vec4<f32>(clamp(sky, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return vec4<f32>(max(sky, vec3<f32>(0.0)), 1.0);
 }

@@ -14,11 +14,13 @@ fn sun_reaches(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     }
     let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
     let texel = 1.0 / 2048.0;
+    // Eight taps spiralling out, for a softer edge than four
     var sum = 0.0;
-    for (var i = 0; i < 4; i++) {
-        let angle = 0.785 + f32(i) * 1.5708;
-        let offset = vec2<f32>(cos(angle), sin(angle)) * texel * 1.25;
+    for (var i = 0; i < 8; i++) {
+        let angle = f32(i) * 2.3998;
+        let radius = 0.6 + 0.2 * f32(i);
+        let offset = vec2<f32>(cos(angle), sin(angle)) * texel * radius;
         sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, p.z);
     }
-    return mix(sum * 0.25, 1.0, smoothstep(0.82, 1.0, edge));
+    return mix(sum * 0.125, 1.0, smoothstep(0.82, 1.0, edge));
 }

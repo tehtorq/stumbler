@@ -216,7 +216,7 @@ impl Stage {
             if !sun_casts {
                 draws.push(Draw::mesh(&self.shadow_mesh, shadow_transform(car)));
             }
-            draws.push(Draw::mesh(body, car.body_transform()));
+            draws.push(Draw::paint(body, car.body_transform()));
             if braking {
                 draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::mesh(&self.brake_light_mesh, car.body_transform()) });
             }

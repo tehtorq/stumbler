@@ -4,7 +4,10 @@
 //! - group 0: per-frame `Globals` (camera, sun, fog, lights, sway, screen size)
 //! - group 1 (mesh pipelines): per-draw `Object` model matrix at a dynamic offset
 //!
-//! Renders with 4x MSAA, resolved into the swapchain image.
+//! The world renders in linear HDR with 4x MSAA, resolved into a float
+//! target. Post passes then work out ambient occlusion from the depth
+//! buffer, blur the brightest parts into bloom, and tonemap the lot into the
+//! swapchain image, with the HUD drawn on top of that.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +19,17 @@ use winit::window::Window;
 use crate::geometry::Vertex;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// The lit world before tonemapping: linear light, values above 1 allowed.
+/// Packed into 32 bits where the GPU can render to that (half the memory
+/// traffic of 16-bit floats, which counts on integrated graphics).
+const HDR_PACKED: wgpu::TextureFormat = wgpu::TextureFormat::Rg11b10Ufloat;
+const HDR_WIDE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Ambient occlusion and the distance to the surface, at half resolution.
+const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+/// Depth at half resolution, single-sampled, for the AO pass to read.
+const HALF_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+/// Steps down the bloom chain from half resolution (fewer on a small window).
+const BLOOM_MIPS: u32 = 6;
 const SAMPLE_COUNT: u32 = 4;
 /// Texels a side of the sun's shadow map.
 const SHADOW_SIZE: u32 = 2048;
@@ -50,7 +64,7 @@ pub struct Globals {
     pub crowd: [f32; 4],
 }
 
-/// Times the main render pass on the GPU (profiling only). Results are read
+/// Times the GPU's passes (profiling only). Results are read
 /// back a few frames later through a small ring of buffers, so the pipeline
 /// never stalls waiting for them.
 pub struct GpuTimer {
@@ -60,9 +74,13 @@ pub struct GpuTimer {
     next: usize,
     /// Nanoseconds per timestamp tick.
     period: f32,
-    total_ms: f64,
+    total_ms: [f64; TIMED_PASSES.len()],
     frames: u32,
 }
+
+/// The stretches of the frame timed, each between two timestamps.
+const TIMED_PASSES: [&str; 5] = ["shadow", "main", "ao", "bloom", "post+hud"];
+const TIMER_BYTES: u64 = TIMED_PASSES.len() as u64 * 16;
 
 struct TimerSlot {
     buffer: wgpu::Buffer,
@@ -75,9 +93,13 @@ const TIMER_RING: usize = 4;
 
 impl GpuTimer {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let buffer = |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 16, usage, mapped_at_creation: false });
+        let buffer = |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: TIMER_BYTES, usage, mapped_at_creation: false });
         Self {
-            queries: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("pass timer"), ty: wgpu::QueryType::Timestamp, count: 2 }),
+            queries: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pass timer"),
+                ty: wgpu::QueryType::Timestamp,
+                count: TIMED_PASSES.len() as u32 * 2,
+            }),
             resolve: buffer("timer resolve", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
             ring: (0..TIMER_RING)
                 .map(|_| TimerSlot {
@@ -88,7 +110,7 @@ impl GpuTimer {
                 .collect(),
             next: 0,
             period: queue.get_timestamp_period(),
-            total_ms: 0.0,
+            total_ms: [0.0; TIMED_PASSES.len()],
             frames: 0,
         }
     }
@@ -115,7 +137,9 @@ impl GpuTimer {
             if slot.in_flight && slot.ready.swap(false, Ordering::Acquire) {
                 if let Ok(data) = slot.buffer.slice(..).get_mapped_range() {
                     let t: &[u64] = bytemuck::cast_slice(&data);
-                    self.total_ms += t[1].saturating_sub(t[0]) as f64 * self.period as f64 / 1e6;
+                    for (k, total) in self.total_ms.iter_mut().enumerate() {
+                        *total += t[2 * k + 1].saturating_sub(t[2 * k]) as f64 * self.period as f64 / 1e6;
+                    }
                     self.frames += 1;
                 }
                 slot.buffer.unmap();
@@ -124,9 +148,20 @@ impl GpuTimer {
         }
     }
 
-    /// Average GPU time of the main pass so far, in milliseconds.
-    pub fn average_ms(&self) -> f64 {
-        self.total_ms / self.frames.max(1) as f64
+    /// Average GPU time of each timed pass so far, in milliseconds.
+    pub fn average_ms(&self) -> String {
+        let n = self.frames.max(1) as f64;
+        let parts: Vec<String> = TIMED_PASSES.iter().zip(&self.total_ms).map(|(name, ms)| format!("{name} {:.2}", ms / n)).collect();
+        parts.join(", ")
+    }
+
+    /// Timestamps for timed pass `k`, at its start and/or its end.
+    fn writes(&self, k: usize, start: bool, end: bool) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        (start || end).then_some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.queries,
+            beginning_of_pass_write_index: start.then_some(2 * k as u32),
+            end_of_pass_write_index: end.then_some(2 * k as u32 + 1),
+        })
     }
 }
 
@@ -273,6 +308,8 @@ pub enum MeshKind {
     Crowd = 6,
     /// Cloth: vertex alpha is how free it is to flap.
     Flag = 7,
+    /// Car paint and glass: glossy, catching the sun and reflecting the sky.
+    Paint = 8,
 }
 
 impl<'a> Draw<'a> {
@@ -309,6 +346,10 @@ impl<'a> Draw<'a> {
         Self { kind: MeshKind::Flag, ..Self::mesh(mesh, model) }
     }
 
+    pub fn paint(mesh: &'a Mesh, model: Mat4) -> Self {
+        Self { kind: MeshKind::Paint, ..Self::mesh(mesh, model) }
+    }
+
     pub fn water(mesh: &'a Mesh) -> Self {
         Self { kind: MeshKind::Water, ..Self::mesh(mesh, Mat4::IDENTITY) }
     }
@@ -342,8 +383,9 @@ pub struct Gpu {
     surface: wgpu::Surface<'static>,
     context: GpuContext,
     config: wgpu::SurfaceConfiguration,
-    color_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
+    targets: Targets,
+    post_layouts: PostLayouts,
+    linear_sampler: wgpu::Sampler,
 
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -362,6 +404,12 @@ pub struct Gpu {
     mesh_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
+    ao_pipeline: wgpu::RenderPipeline,
+    half_depth_pipeline: wgpu::RenderPipeline,
+    bloom_prefilter_pipeline: wgpu::RenderPipeline,
+    bloom_down_pipeline: wgpu::RenderPipeline,
+    bloom_up_pipeline: wgpu::RenderPipeline,
+    post_pipeline: wgpu::RenderPipeline,
 
     /// Dev aid: save the next frame to this path (binary PPM).
     pub capture_path: Option<PathBuf>,
@@ -397,10 +445,13 @@ impl Gpu {
         // Dev aid: STUMBLER_PROFILE=1 times the GPU's work with timestamp queries
         let profile = std::env::var_os("STUMBLER_PROFILE").is_some()
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let packed_hdr = adapter.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE);
+        let hdr_format = if packed_hdr { HDR_PACKED } else { HDR_WIDE };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
-                required_features: if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
+                required_features: if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() }
+                    | if packed_hdr { wgpu::Features::RG11B10UFLOAT_RENDERABLE } else { wgpu::Features::empty() },
                 ..Default::default()
             })
             .await
@@ -431,7 +482,6 @@ impl Gpu {
             config.usage |= wgpu::TextureUsages::COPY_SRC; // for frame captures
         }
         surface.configure(&device, &config);
-        let (color_view, depth_view) = create_render_targets(&device, &config);
 
         // --- Group 0: globals ---
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -560,7 +610,7 @@ impl Gpu {
             cache: None,
         });
 
-        let builder = PipelineBuilder { device: &device, format: config.format };
+        let builder = PipelineBuilder { device: &device, format: hdr_format, samples: SAMPLE_COUNT, depth: true };
         let sky_pipeline = builder.build(PipelineDesc {
             label: "sky",
             layout: &globals_only,
@@ -601,7 +651,9 @@ impl Gpu {
             cull: None,
             blend: Some(alpha_blend()),
         });
-        let hud_pipeline = builder.build(PipelineDesc {
+        // The HUD goes straight onto the finished, tonemapped frame
+        let screen_builder = PipelineBuilder { device: &device, format: config.format, samples: 1, depth: false };
+        let hud_pipeline = screen_builder.build(PipelineDesc {
             label: "hud",
             layout: &globals_only,
             shader: &hud_shader,
@@ -612,13 +664,99 @@ impl Gpu {
             blend: Some(alpha_blend()),
         });
 
+        // --- Post: AO, bloom, tonemap ---
+        let texture_entry = |binding, sample_type, multisampled| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled },
+            count: None,
+        };
+        let filterable = wgpu::TextureSampleType::Float { filterable: true };
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post layout"),
+            entries: &[
+                uniform_entry(0, false),
+                texture_entry(1, filterable, false),
+                texture_entry(2, filterable, false),
+                texture_entry(3, filterable, false),
+                sampler_entry(5),
+            ],
+        });
+        // Depth to half resolution, then AO from that (neither can read its own target)
+        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("half depth layout"),
+            entries: &[uniform_entry(0, false), texture_entry(4, wgpu::TextureSampleType::Depth, true)],
+        });
+        let ao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ao layout"),
+            entries: &[uniform_entry(0, false), texture_entry(6, wgpu::TextureSampleType::Float { filterable: false }, false)],
+        });
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom layout"),
+            entries: &[texture_entry(0, filterable, false), sampler_entry(1)],
+        });
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let fullscreen = include_str!("shaders/fullscreen.wgsl");
+        let ao_shader = shader("ao", &format!("{fullscreen}\n{}", include_str!("shaders/ao.wgsl")));
+        let post_shader = shader("post", &format!("{fullscreen}\n{}", include_str!("shaders/post.wgsl")));
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bloom"),
+            source: wgpu::ShaderSource::Wgsl(format!("{fullscreen}\n{}", include_str!("shaders/bloom.wgsl")).into()),
+        });
+        let post_pipeline_layout = layout("post", &[Some(&post_layout)]);
+        let bloom_pipeline_layout = layout("bloom", &[Some(&bloom_layout)]);
+        let fullscreen_pipeline = |label, layout, module, entry, format, blend| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState { module, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let additive = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent::REPLACE,
+        };
+        let ao_pipeline_layout = layout("ao", &[Some(&ao_layout)]);
+        let ao_pipeline = fullscreen_pipeline("ao", &ao_pipeline_layout, &ao_shader, "fs_main", AO_FORMAT, None);
+        let depth_pipeline_layout = layout("half depth", &[Some(&depth_layout)]);
+        let half_depth_pipeline = fullscreen_pipeline("half depth", &depth_pipeline_layout, &ao_shader, "fs_half_depth", HALF_DEPTH_FORMAT, None);
+        let post_pipeline = fullscreen_pipeline("post", &post_pipeline_layout, &post_shader, "fs_main", config.format, None);
+        let bloom_prefilter_pipeline = fullscreen_pipeline("bloom prefilter", &bloom_pipeline_layout, &bloom_shader, "fs_prefilter", hdr_format, None);
+        let bloom_down_pipeline = fullscreen_pipeline("bloom down", &bloom_pipeline_layout, &bloom_shader, "fs_down", hdr_format, None);
+        let bloom_up_pipeline = fullscreen_pipeline("bloom up", &bloom_pipeline_layout, &bloom_shader, "fs_up", hdr_format, Some(additive));
+        let post_layouts = PostLayouts { post: post_layout, depth: depth_layout, ao: ao_layout, bloom: bloom_layout, hdr_format };
+        let targets = Targets::new(&device, &config, &post_layouts, &globals_buffer, &linear_sampler);
+
         Self {
             window,
             surface,
             context: GpuContext { device, queue },
             config,
-            color_view,
-            depth_view,
+            targets,
+            post_layouts,
+            linear_sampler,
             globals_buffer,
             globals_bind_group,
             object_layout,
@@ -634,6 +772,12 @@ impl Gpu {
             mesh_pipeline,
             particle_pipeline,
             hud_pipeline,
+            ao_pipeline,
+            half_depth_pipeline,
+            bloom_prefilter_pipeline,
+            bloom_down_pipeline,
+            bloom_up_pipeline,
+            post_pipeline,
             capture_path: None,
             timer,
             last_draw_calls: 0,
@@ -648,7 +792,7 @@ impl Gpu {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.context.device, &self.config);
-        (self.color_view, self.depth_view) = create_render_targets(&self.context.device, &self.config);
+        self.targets = Targets::new(&self.context.device, &self.config, &self.post_layouts, &self.globals_buffer, &self.linear_sampler);
     }
 
     /// Framebuffer size in pixels.
@@ -713,7 +857,7 @@ impl Gpu {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.timer.as_ref().and_then(|t| t.writes(0, true, true)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -734,21 +878,18 @@ impl Gpu {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
+                    view: &self.targets.color,
                     depth_slice: None,
-                    resolve_target: Some(&view),
+                    resolve_target: Some(&self.targets.hdr),
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(CLEAR_COLOR), store: wgpu::StoreOp::Discard },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    view: &self.targets.depth,
+                    // Kept for the AO and post passes
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites {
-                    query_set: &t.queries,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }),
+                timestamp_writes: self.timer.as_ref().and_then(|t| t.writes(1, true, true)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -760,12 +901,13 @@ impl Gpu {
             self.last_triangles = 0;
             self.last_draw_calls = 0;
             for (i, draw) in draws.iter().enumerate() {
-                if draw.mesh.index_count == 0 {
+                // The HUD waits for the finished frame
+                if draw.mesh.index_count == 0 || draw.pipeline == PipelineKind::Hud {
                     continue;
                 }
                 // The sky goes in once the opaque world is down (it only fills
                 // uncovered pixels) and before anything see-through
-                let see_through = draw.kind == MeshKind::Water || matches!(draw.pipeline, PipelineKind::Particles | PipelineKind::Hud);
+                let see_through = draw.kind == MeshKind::Water || draw.pipeline == PipelineKind::Particles;
                 if see_through && !sky_drawn {
                     pass.set_pipeline(&self.sky_pipeline);
                     pass.draw(0..3, 0..1);
@@ -778,7 +920,7 @@ impl Gpu {
                         PipelineKind::Terrain => &self.terrain_pipeline,
                         PipelineKind::Mesh => &self.mesh_pipeline,
                         PipelineKind::Particles => &self.particle_pipeline,
-                        PipelineKind::Hud => &self.hud_pipeline,
+                        PipelineKind::Hud => unreachable!(),
                     });
                 }
                 if matches!(draw.pipeline, PipelineKind::Mesh | PipelineKind::Particles) {
@@ -796,10 +938,24 @@ impl Gpu {
                 pass.draw(0..3, 0..1);
             }
         }
+        self.encode_post(&mut encoder, &view);
+        {
+            let stamps = self.timer.as_ref().and_then(|t| t.writes(4, false, true));
+            let mut pass = screen_pass(&mut encoder, "hud pass", &view, wgpu::LoadOp::Load, stamps);
+            pass.set_pipeline(&self.hud_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            for draw in draws.iter().filter(|d| d.pipeline == PipelineKind::Hud && d.mesh.index_count > 0) {
+                pass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.mesh.index_buffer.slice(..), draw.mesh.index_format);
+                pass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
+                self.last_triangles += draw.mesh.index_count as u64 / 3;
+                self.last_draw_calls += 1;
+            }
+        }
         if let Some(t) = &self.timer {
             if let Some(readback) = t.slot() {
-                encoder.resolve_query_set(&t.queries, 0..2, &t.resolve, 0);
-                encoder.copy_buffer_to_buffer(&t.resolve, 0, readback, 0, 16);
+                encoder.resolve_query_set(&t.queries, 0..TIMED_PASSES.len() as u32 * 2, &t.resolve, 0);
+                encoder.copy_buffer_to_buffer(&t.resolve, 0, readback, 0, TIMER_BYTES);
             }
         }
         let capture = self.capture_path.take().map(|path| (path, self.encode_capture(&mut encoder, &frame.texture)));
@@ -825,6 +981,46 @@ impl Gpu {
 }
 
 impl Gpu {
+    /// AO and bloom from the resolved frame, then the tonemapped frame into `view`.
+    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let t = &self.targets;
+        {
+            let stamps = self.timer.as_ref().and_then(|t| t.writes(2, true, false));
+            let mut pass = screen_pass(encoder, "half depth pass", &t.half_depth, wgpu::LoadOp::Clear(wgpu::Color::WHITE), stamps);
+            pass.set_pipeline(&self.half_depth_pipeline);
+            pass.set_bind_group(0, &t.depth_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let stamps = self.timer.as_ref().and_then(|t| t.writes(2, false, true));
+            let mut pass = screen_pass(encoder, "ao pass", &t.ao, wgpu::LoadOp::Clear(wgpu::Color::WHITE), stamps);
+            pass.set_pipeline(&self.ao_pipeline);
+            pass.set_bind_group(0, &t.ao_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // Down the chain: the frame into the first mip, each mip into the next
+        for (i, mip) in t.bloom_mips.iter().enumerate() {
+            let stamps = self.timer.as_ref().and_then(|t| t.writes(3, i == 0, false));
+            let mut pass = screen_pass(encoder, "bloom down", mip, wgpu::LoadOp::Clear(wgpu::Color::BLACK), stamps);
+            pass.set_pipeline(if i == 0 { &self.bloom_prefilter_pipeline } else { &self.bloom_down_pipeline });
+            pass.set_bind_group(0, &t.bloom_groups[i], &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // And back up, each mip blurred and added into the one above
+        for i in (1..t.bloom_mips.len()).rev() {
+            let stamps = self.timer.as_ref().and_then(|t| t.writes(3, false, i == 1));
+            let mut pass = screen_pass(encoder, "bloom up", &t.bloom_mips[i - 1], wgpu::LoadOp::Load, stamps);
+            pass.set_pipeline(&self.bloom_up_pipeline);
+            pass.set_bind_group(0, &t.bloom_groups[i + 1], &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let stamps = self.timer.as_ref().and_then(|t| t.writes(4, true, false));
+        let mut pass = screen_pass(encoder, "post pass", view, wgpu::LoadOp::Clear(wgpu::Color::BLACK), stamps);
+        pass.set_pipeline(&self.post_pipeline);
+        pass.set_bind_group(0, &t.post_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     fn encode_capture(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> (wgpu::Buffer, u32) {
         let padded_row = (self.config.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = self.context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -920,23 +1116,133 @@ fn create_object_buffer(
     (buffer, bind_group)
 }
 
-/// Multisampled colour and depth targets matching the surface size.
-fn create_render_targets(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> (wgpu::TextureView, wgpu::TextureView) {
-    let target = |label, format| {
-        device
-            .create_texture(&wgpu::TextureDescriptor {
+/// A pass drawing one colour target and nothing else.
+fn screen_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    view: &'a wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// Everything sized to the window: the multisampled world, its resolve, and
+/// the post passes' textures, with the bind groups that read them.
+struct Targets {
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    hdr: wgpu::TextureView,
+    half_depth: wgpu::TextureView,
+    ao: wgpu::TextureView,
+    /// Half resolution and down
+    bloom_mips: Vec<wgpu::TextureView>,
+    /// Reading the frame, then each bloom mip in turn
+    bloom_groups: Vec<wgpu::BindGroup>,
+    post_group: wgpu::BindGroup,
+    depth_group: wgpu::BindGroup,
+    ao_group: wgpu::BindGroup,
+}
+
+/// The post passes' bind group layouts, and the HDR format chosen.
+struct PostLayouts {
+    post: wgpu::BindGroupLayout,
+    depth: wgpu::BindGroupLayout,
+    ao: wgpu::BindGroupLayout,
+    bloom: wgpu::BindGroupLayout,
+    hdr_format: wgpu::TextureFormat,
+}
+
+impl Targets {
+    fn new(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        layouts: &PostLayouts,
+        globals: &wgpu::Buffer,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        let texture = |label, (width, height): (u32, u32), format, samples, mips, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
-                size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: SAMPLE_COUNT,
+                size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+                mip_level_count: mips,
+                sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage,
                 view_formats: &[],
             })
-            .create_view(&wgpu::TextureViewDescriptor::default())
-    };
-    (target("msaa color", config.format), target("depth", DEPTH_FORMAT))
+        };
+        let hdr_format = layouts.hdr_format;
+        let full = (config.width, config.height);
+        let half = (config.width.div_ceil(2), config.height.div_ceil(2));
+        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let read = attach | wgpu::TextureUsages::TEXTURE_BINDING;
+        let view = |t: wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let color = view(texture("msaa color", full, hdr_format, SAMPLE_COUNT, 1, attach));
+        let depth = view(texture("depth", full, DEPTH_FORMAT, SAMPLE_COUNT, 1, read));
+        let hdr = view(texture("hdr", full, hdr_format, 1, 1, read));
+        let half_depth = view(texture("half depth", half, HALF_DEPTH_FORMAT, 1, 1, read));
+        let ao = view(texture("ao", half, AO_FORMAT, 1, 1, read));
+        let mips = BLOOM_MIPS.min(half.0.min(half.1).max(2).ilog2());
+        let bloom = texture("bloom", half, hdr_format, 1, mips, read);
+        let bloom_mips: Vec<_> = (0..mips)
+            .map(|level| bloom.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() }))
+            .collect();
+        let bloom_groups = std::iter::once(&hdr)
+            .chain(&bloom_mips)
+            .map(|source| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("bloom"),
+                    layout: &layouts.bloom,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                })
+            })
+            .collect();
+        let post_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post"),
+            layout: &layouts.post,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&hdr) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bloom_mips[0]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ao) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        });
+        let depth_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("half depth"),
+            layout: &layouts.depth,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&depth) },
+            ],
+        });
+        let ao_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ao"),
+            layout: &layouts.ao,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&half_depth) },
+            ],
+        });
+        Self { color, depth, hdr, half_depth, ao, bloom_mips, bloom_groups, post_group, depth_group, ao_group }
+    }
 }
 
 fn alpha_blend() -> wgpu::BlendState {
@@ -978,6 +1284,9 @@ struct PipelineDesc<'a> {
 struct PipelineBuilder<'a> {
     device: &'a wgpu::Device,
     format: wgpu::TextureFormat,
+    samples: u32,
+    /// Whether the pass has a depth buffer
+    depth: bool,
 }
 
 impl PipelineBuilder<'_> {
@@ -998,14 +1307,14 @@ impl PipelineBuilder<'_> {
                 cull_mode: desc.cull,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
+            depth_stencil: self.depth.then(|| wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(desc.depth_write),
                 depth_compare: Some(desc.depth_compare),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState { count: SAMPLE_COUNT, ..Default::default() },
+            multisample: wgpu::MultisampleState { count: self.samples, ..Default::default() },
             fragment: Some(wgpu::FragmentState {
                 module: desc.shader,
                 entry_point: Some("fs_main"),

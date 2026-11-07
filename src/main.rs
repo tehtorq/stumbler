@@ -1774,7 +1774,7 @@ impl ApplicationHandler for App {
                         eprintln!("frames: {} in {:.1}s ({:.1} ms/frame), {}k triangles, {} draw calls", stage.frames, stage.time(), stage.time() * 1000.0 / stage.frames as f32, stage.gpu.last_triangles / 1000, stage.gpu.last_draw_calls);
                         if let Some(timer) = &stage.gpu.timer {
                             let n = stage.frames as f64;
-                            eprintln!("profile: cpu update {:.2} ms, cpu draw {:.2} ms, gpu pass {:.2} ms (averages)", stage.cpu_update_ms / n, stage.cpu_draw_ms / n, timer.average_ms());
+                            eprintln!("profile: cpu update {:.2} ms, cpu draw {:.2} ms, gpu ms: {} (averages)", stage.cpu_update_ms / n, stage.cpu_draw_ms / n, timer.average_ms());
                         }
                         if std::env::var_os("STUMBLER_SCREENSHOT_MAP").is_some() && !stage.show_map {
                             stage.toggle_map();

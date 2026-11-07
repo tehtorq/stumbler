@@ -24,6 +24,7 @@ const GLOW: f32 = 4.0;
 const PARTICLE: f32 = 5.0;
 const CROWD: f32 = 6.0;
 const FLAG: f32 = 7.0;
+const PAINT: f32 = 8.0;
 /// Ground cover sinks away between these distances from the camera
 /// (the chunk streamer loads it out to COVER_RANGE, a little beyond).
 const COVER_FADE: vec2<f32> = vec2<f32>(560.0, 740.0);
@@ -142,56 +143,78 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn shade_water(in: VertexOut, normal: vec3<f32>) -> vec4<f32> {
     let depth = in.color.a;
     let day = day_factor();
-    var lit = sun_lighting(in.color.rgb, normal, 1.0);
+    let albedo = lin(in.color.rgb);
+    var lit = sun_lighting(albedo, normal, cloud_light(in.world_pos.xz));
 
     let to_eye = normalize(globals.cam_pos - in.world_pos);
     let facing = max(dot(normal, to_eye), 0.0);
     let fresnel = pow(1.0 - facing, 4.0);
-    lit = mix(lit, globals.fog.rgb, fresnel * 0.6);
+    lit = mix(lit, haze_color(reflect(-to_eye, normal)), fresnel * 0.6);
 
     // Each wave facet catches the sun on its own, so the sun's path sparkles
     let glint = pow(max(dot(reflect(-globals.sun_dir, normal), to_eye), 0.0), 260.0);
-    lit += vec3<f32>(1.0, 0.95, 0.85) * glint * 1.4 * day;
+    lit += sun_color() * glint * 6.0 * day * (1.0 - globals.screen.z);
 
     // Foam laps along the waterline, coming and going
     let lap = 0.55 + 0.45 * sin(globals.wind_time * 1.7 + in.world_pos.x * 0.21 + in.world_pos.z * 0.17);
     let foam = (1.0 - smoothstep(0.0, 0.02, depth)) * 0.45 * lap;
-    lit = mix(lit, vec3<f32>(0.85, 0.9, 0.92) * (0.55 + 0.45 * day), foam);
+    lit = mix(lit, lin(vec3<f32>(0.85, 0.9, 0.92) * (0.55 + 0.45 * day)), foam);
 
     // Clear in the shallows, opaque out in the deep
     let alpha = mix(0.32, 0.86, smoothstep(0.02, 0.7, depth)) + foam * 0.4 + fresnel * 0.1;
-    lit += eval_lights(in.world_pos, normal, in.color.rgb);
+    lit += eval_lights(in.world_pos, normal, albedo);
     lit = apply_fog(lit, in.world_pos);
-    return vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(alpha, 0.0, 1.0));
+    return vec4<f32>(max(lit, vec3<f32>(0.0)), clamp(alpha, 0.0, 1.0));
+}
+
+/// A glossy coat: the sky reflected, strongest at a glancing angle, and a
+/// hot glint off any facet turned just right to the sun (on flat facets the
+/// whole face flashes as the car turns).
+fn gloss(world_pos: vec3<f32>, normal: vec3<f32>, sun: f32) -> vec3<f32> {
+    let to_eye = normalize(globals.cam_pos - world_pos);
+    let r = reflect(-to_eye, normal);
+    let fresnel = 0.01 + 0.3 * pow(1.0 - max(dot(normal, to_eye), 0.0), 5.0);
+    // Paler at the horizon, deeper blue overhead
+    let sky = mix(haze_color(r), lin(globals.fog.rgb) * vec3<f32>(0.45, 0.6, 1.0), clamp(r.y, 0.0, 1.0));
+    let half_dir = normalize(globals.sun_dir + to_eye);
+    let glint = pow(max(dot(normal, half_dir), 0.0), 80.0) * 4.0 * day_factor() * (1.0 - globals.screen.z) * sun;
+    return sky * fresnel + sun_color() * glint;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (is_kind(in.kind, PARTICLE)) {
-        let light = max(in.color.r, max(in.color.g, in.color.b)) > 1.0;
-        let tone = select(in.color.rgb * (0.3 + 0.7 * day_factor()), min(in.color.rgb, vec3<f32>(1.0)), light);
+        let peak = max(in.color.r, max(in.color.g, in.color.b));
+        // A light (fireflies, floodlight pools) shines; the fainter it's
+        // drawn, the less it adds, as blending in linear light brightens more
+        let glow = lin(min(in.color.rgb, vec3<f32>(1.0))) * (0.22 + 3.5 * in.color.a * in.color.a);
+        let tone = select(lin(in.color.rgb * (0.3 + 0.7 * day_factor())), glow, peak > 1.0);
         return vec4<f32>(apply_fog(tone, in.world_pos), in.color.a);
     }
     if (is_kind(in.kind, CROWD) && in.color.r > 2.0) {
-        return vec4<f32>(apply_fog(vec3<f32>(1.0, 1.0, 0.96), in.world_pos), 1.0);
+        return vec4<f32>(apply_fog(vec3<f32>(9.0, 9.0, 8.5), in.world_pos), 1.0);
     }
     let normal = flat_normal(in.world_pos);
     if (is_kind(in.kind, WATER)) {
         return shade_water(in, normal);
     }
-    let sun = sun_reaches(in.world_pos, normal);
-    var lit = sun_lighting(in.color.rgb, normal, sun);
+    let albedo = lin(in.color.rgb);
+    let sun = sun_reaches(in.world_pos, normal) * cloud_light(in.world_pos.xz);
+    var lit = sun_lighting(albedo, normal, sun);
     if (is_kind(in.kind, FOLIAGE) || is_kind(in.kind, COVER)) {
         // Leaves let some sunlight through, so backlit trees glow a little
         // instead of going black
         let through = max(dot(-normal, globals.sun_dir), 0.0);
-        lit += in.color.rgb * vec3<f32>(0.85, 0.95, 0.55) * (0.15 + 0.35 * through) * day_factor() * (0.5 + 0.5 * sun);
+        lit += albedo * vec3<f32>(0.7, 0.9, 0.3) * (0.08 + 0.4 * through) * day_factor() * (0.4 + 0.6 * sun);
     }
     if (is_kind(in.kind, GLOW)) {
         // A faint inner light by day, shining out after dark, and slowly pulsing
         let night = 1.0 - day_factor();
         let pulse = 0.85 + 0.15 * sin(globals.wind_time * 1.3 + in.world_pos.x * 0.05 + in.world_pos.z * 0.07);
-        lit = mix(lit, in.color.rgb * pulse * 1.15, 0.2 + 0.8 * night);
+        lit = mix(lit, albedo * pulse * 2.5, 0.2 + 0.8 * night);
+    }
+    if (is_kind(in.kind, PAINT)) {
+        lit += gloss(in.world_pos, normal, sun);
     }
     // A wet road: dark, level surfaces take on a sheen of the grey sky at
     // a glancing angle (and headlights glare off them a little more)
@@ -201,10 +224,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (wet > 0.01 && is_kind(in.kind, PLAIN) && normal.y > 0.97 && grey && dot(c, vec3<f32>(0.333)) < 0.42) {
         let to_eye = normalize(globals.cam_pos - in.world_pos);
         let fresnel = pow(1.0 - max(dot(to_eye, normal), 0.0), 4.0);
-        lit = mix(lit, globals.fog.rgb * 0.9, fresnel * 0.55 * wet);
+        lit = mix(lit, haze_color(reflect(-to_eye, normal)) * 0.8, fresnel * 0.55 * wet);
         lit *= 1.0 - 0.15 * wet;
     }
-    lit += eval_lights(in.world_pos, normal, in.color.rgb) * (1.0 + 0.5 * wet);
+    lit += eval_lights(in.world_pos, normal, albedo) * (1.0 + 0.5 * wet);
     lit = apply_fog(lit, in.world_pos);
-    return vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), in.color.a);
+    return vec4<f32>(max(lit, vec3<f32>(0.0)), in.color.a);
 }
