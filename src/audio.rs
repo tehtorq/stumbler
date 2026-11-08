@@ -16,6 +16,9 @@ const MAX_VOICES: usize = 24;
 /// Samples between looks at the queue of sounds asked for.
 const QUEUE_EVERY: u32 = 256;
 
+/// How many diesels can be heard at once.
+pub const DIESELS: usize = 2;
+
 /// The one-shot sounds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sound {
@@ -49,6 +52,20 @@ pub enum Sound {
     Whistle,
     /// Rushing under a gantry: the air thrown back off it.
     Swish,
+    /// A cow lowing in the field.
+    Moo,
+    /// A sheep bleating.
+    Baa,
+    /// One stroke of a church or town-hall bell.
+    Toll,
+    /// A halyard slapping a mast, down at the moorings.
+    Tink,
+    /// A dog's bark.
+    Bark,
+    /// A balloon's burner roaring.
+    Burner,
+    /// A campfire's crackle: a log popping.
+    Crackle,
 }
 
 impl Sound {
@@ -69,6 +86,13 @@ impl Sound {
             Sound::Fanfare => 2.2,
             Sound::Pop => 0.12,
             Sound::Whistle => 2.0,
+            Sound::Moo => 1.7,
+            Sound::Baa => 0.8,
+            Sound::Toll => 4.0,
+            Sound::Tink => 0.5,
+            Sound::Bark => 0.3,
+            Sound::Burner => 2.6,
+            Sound::Crackle => 0.25,
             Sound::Swish => 0.45,
         }
     }
@@ -295,6 +319,75 @@ impl Voice {
                 let env = (t / 0.08).min(1.0) * ((2.0 - t) / 0.4).clamp(0.0, 1.0);
                 (tone + self.lp[0] * (0.25 + 0.5 * (-t * 6.0).exp())) * env * 0.11
             }
+            Sound::Moo => {
+                // A low buzz of a voice through an opening mouth: "mmm-oooo",
+                // the pitch lifting then sagging
+                let f0 = (105.0 + 45.0 * (t / 0.5).min(1.0) - 30.0 * ((t - 0.6) / 1.0).clamp(0.0, 1.0)) * detune;
+                self.st[0] = (self.st[0] + f0 * dt).fract();
+                let saw = self.st[0] * 2.0 - 1.0;
+                let open = (t / 0.5).min(1.0);
+                let f1 = self.filters[0].band(saw, 280.0 + 420.0 * open, rate, 0.18);
+                let f2 = self.filters[1].band(saw, 800.0 + 300.0 * open, rate, 0.22);
+                let env = (t / 0.15).min(1.0) * ((1.7 - t) / 0.35).clamp(0.0, 1.0);
+                (f1 + f2 * 0.6) * env * 0.2
+            }
+            Sound::Baa => {
+                // A bleat: a reedy voice wavering hard, "meh-eh-eh"
+                let f0 = (360.0 - 40.0 * t) * detune;
+                self.st[0] = (self.st[0] + f0 * dt).fract();
+                let saw = self.st[0] * 2.0 - 1.0;
+                let waver = 0.55 + 0.45 * (t * 19.0 * TAU).sin();
+                let f1 = self.filters[0].band(saw, 750.0, rate, 0.25);
+                let f2 = self.filters[1].band(saw, 1850.0, rate, 0.3);
+                let env = (t / 0.04).min(1.0) * ((0.8 - t) / 0.25).clamp(0.0, 1.0);
+                (f1 + f2 * 0.7) * waver * env * 0.2
+            }
+            Sound::Toll => {
+                // A big bronze bell: a hum below the strike note and the
+                // bell's own minor-third tierce, the high partials dying first
+                // (A fixed pitch: `detune` drifts once noise has been drawn)
+                let base = 196.0;
+                let partials = [(0.5, 0.5, 0.35), (1.0, 0.8, 0.6), (1.19, 0.6, 0.8), (1.5, 0.35, 1.1), (2.0, 0.45, 1.4), (2.51, 0.2, 2.2), (2.99, 0.15, 3.0)];
+                let mut v = 0.0;
+                for (ratio, amp, decay) in partials {
+                    v += (t * base * ratio * TAU).sin() * amp * (-t * decay).exp();
+                }
+                let clang = if t < 0.12 { self.noise() * (-t * 40.0).exp() * 0.3 } else { 0.0 };
+                (v + clang) * (t / 0.004).min(1.0) * 0.09
+            }
+            Sound::Tink => {
+                // A rope slapping an aluminium mast: a knock and a short ring
+                let n = self.noise();
+                let knock = self.filters[0].band(n, 900.0, rate, 0.8) * (-t * 60.0).exp();
+                let ring = (sine(1840.0) + sine(2950.0) * 0.6 + sine(4100.0) * 0.3) * (-t * 14.0).exp();
+                (knock * 0.5 + ring * 0.08) * (t / 0.002).min(1.0)
+            }
+            Sound::Bark => {
+                // A sharp "ruff": a rough voice dropping in pitch, a puff of breath
+                let f0 = 520.0 - 500.0 * t;
+                self.st[0] = (self.st[0] + f0 * dt).fract();
+                let src = (self.st[0] * 2.0 - 1.0) * 0.7 + self.noise() * 0.3;
+                let f1 = self.filters[0].band(src, 900.0, rate, 0.35);
+                let f2 = self.filters[1].band(src, 1700.0, rate, 0.4);
+                let env = (t / 0.01).min(1.0) * (-t * 11.0).exp();
+                (f1 + f2 * 0.6) * env * 0.45
+            }
+            Sound::Burner => {
+                // A gas burner's roar: rushing flame with a low flutter
+                let n = self.noise();
+                let roar = self.filters[0].band(n, 420.0, rate, 1.1);
+                let body = self.filters[1].run(n, 130.0, rate, 0.9).0;
+                let flutter = 0.75 + 0.25 * (t * 37.0 * TAU).sin() * self.chance();
+                let env = (t / 0.08).min(1.0) * ((2.6 - t) / 0.3).clamp(0.0, 1.0);
+                (roar * 0.6 + body * 0.8) * flutter * env * 0.8
+            }
+            Sound::Crackle => {
+                // A sap pocket bursting: a sharp tick, then a few tiny ones
+                let n = self.noise();
+                let tick = self.filters[0].band(n, 2600.0, rate, 0.7) * (-t * 90.0).exp();
+                let after = if (t * 37.0).fract() < 0.08 && t > 0.03 { n * 0.4 * (-t * 14.0).exp() } else { 0.0 };
+                (tick * 0.9 + after * 0.3) * (t / 0.001).min(1.0)
+            }
             Sound::Swish => {
                 // A rush of air, bright as you go under and falling away,
                 // with a hollow thud from the structure overhead
@@ -349,6 +442,11 @@ pub struct AudioParams {
     /// (loudness, pan, behind).
     train: [AtomicU32; 4],
     bell: [AtomicU32; 3],
+    /// Diesels near you (fishing boats, tractors, combines): per slot, how
+    /// loud here, firing strokes a second, and where (pan, behind).
+    diesel: [[AtomicU32; 4]; DIESELS],
+    /// The murmur of folk about: how loud here, and where.
+    chatter: [AtomicU32; 3],
     /// The space around you: how much it rings (0 dry .. 1), how long
     /// (0 short .. 1 long), and a slap-back echo off the nearest hillside
     /// (loudness, seconds).
@@ -385,6 +483,8 @@ impl AudioParams {
             engine_level: level(1.0),
             train: std::array::from_fn(|_| level(0.0)),
             bell: std::array::from_fn(|_| level(0.0)),
+            diesel: std::array::from_fn(|_| std::array::from_fn(|_| level(0.0))),
+            chatter: std::array::from_fn(|_| level(0.0)),
             room: std::array::from_fn(|_| level(0.0)),
             queue: Mutex::new(Vec::new()),
             seed: AtomicU32::new(0x2545_f491),
@@ -480,6 +580,19 @@ impl AudioParams {
     pub fn set_bell(&self, level: f32, place: Place) {
         Self::set(&self.bell[0], level.clamp(0.0, 1.0));
         Self::set_place(&self.bell[1..3], place);
+    }
+
+    /// Diesel `slot`: `level` here, `rate` firing strokes a second, and where.
+    pub fn set_diesel(&self, slot: usize, level: f32, rate: f32, place: Place) {
+        Self::set(&self.diesel[slot][0], level.clamp(0.0, 1.0));
+        Self::set(&self.diesel[slot][1], rate);
+        Self::set_place(&self.diesel[slot][2..4], place);
+    }
+
+    /// The chatter of a busy street: `level` here, and where.
+    pub fn set_chatter(&self, level: f32, place: Place) {
+        Self::set(&self.chatter[0], level.clamp(0.0, 1.0));
+        Self::set_place(&self.chatter[1..3], place);
     }
 
     fn set_place(v: &[AtomicU32], place: Place) {
@@ -1139,6 +1252,11 @@ struct EngineSource {
     bell_time: f32,
     train_ear: Spatial,
     bell_ear: Spatial,
+    /// Each diesel: where in its firing stroke, filter state, and its ear.
+    diesels: [(f32, [f32; 2], Svf, Spatial); DIESELS],
+    /// The chatter: three voices, each with its syllable clock, pace,
+    /// loudness, pitch and eased level, and formant filters; then the ear.
+    babble: ([[f32; 5]; 3], [[Svf; 2]; 3], Spatial),
     room: Room,
     voices: Vec<Voice>,
     queue_count: u32,
@@ -1207,6 +1325,8 @@ impl EngineSource {
             chuff_lp: [0.0; 2],
             bell_time: 0.0,
             train_ear: Spatial::default(),
+            diesels: std::array::from_fn(|_| (0.0, [0.0; 2], Svf::default(), Spatial::default())),
+            babble: ([[0.0, 4.0, 0.5, 500.0, 0.0], [0.3, 5.3, 0.5, 650.0, 0.0], [0.6, 3.7, 0.5, 420.0, 0.0]], [[Svf::default(); 2]; 3], Spatial::default()),
             bell_ear: Spatial::default(),
             room: Room::new(sample_rate),
             voices: Vec::with_capacity(MAX_VOICES),
@@ -1548,6 +1668,56 @@ impl EngineSource {
             let ring = (u * 1180.0 * TAU).sin() + (u * 2950.0 * TAU).sin() * 0.5 + (u * 4130.0 * TAU).sin() * 0.25;
             let v = ring * (-u * 8.0).exp() * 0.07 * bell_level;
             let (l, r) = self.bell_ear.place(v, p.get_place(&p.bell[1..3]), self.sample_rate as f32);
+            other_l += l;
+            other_r += r;
+        }
+
+        // ── Diesels: a thump each firing stroke, a rattle over it ──
+        for k in 0..DIESELS {
+            let level = p.get(&p.diesel[k][0]);
+            if level < 0.002 {
+                continue;
+            }
+            let rate = p.get(&p.diesel[k][1]);
+            let n = self.noise_n(3);
+            let (phase, lp, rattle, ear) = &mut self.diesels[k];
+            *phase += rate * dt;
+            let u = phase.fract();
+            lp[0] += 0.12 * (n - lp[0]);
+            lp[1] += 0.01 * (lp[0] - lp[1]);
+            let thump = ((*phase * 0.5).fract() * TAU).sin() * 0.3 + (lp[0] - lp[1]) * 3.0;
+            let clatter = rattle.band(n, 1100.0, self.sample_rate as f32, 0.6) * 0.25;
+            let v = (thump * (-u * 9.0).exp() + clatter * (0.4 + 0.6 * (-u * 5.0).exp())) * 0.35 * level;
+            let (l, r) = ear.place(v, p.get_place(&p.diesel[k][2..4]), self.sample_rate as f32);
+            other_l += l;
+            other_r += r;
+        }
+        // ── Chatter: several voices' worth of murmured syllables ──
+        let chatter = p.get(&p.chatter[0]);
+        if chatter > 0.002 {
+            let rate = self.sample_rate as f32;
+            let n = [self.noise_n(4), self.noise_n(5), self.noise_n(1)];
+            let picks = [self.noise_n(5) * 0.5 + 0.5, self.noise_n(4) * 0.5 + 0.5, self.noise_n(1) * 0.5 + 0.5];
+            let (voices, formants, ear) = &mut self.babble;
+            let mut v = 0.0;
+            for k in 0..3 {
+                let st = &mut voices[k];
+                // Syllables at each voice's own pace, now and then a pause
+                st[0] += dt * st[1];
+                if st[0] >= 1.0 {
+                    st[0] -= 1.0;
+                    let pick = picks[k];
+                    st[1] = 3.0 + 4.0 * pick;
+                    st[2] = if pick < 0.15 { 0.0 } else { 0.3 + 0.7 * (pick * 7.3).fract() };
+                    st[3] = 380.0 + 450.0 * (pick * 3.7).fract();
+                }
+                st[4] += (st[2] * (st[0] * std::f32::consts::PI).sin() - st[4]) * 0.004;
+                let f1 = formants[k][0].band(n[k], st[3], rate, 0.3);
+                let f2 = formants[k][1].band(n[k], st[3] * 2.7, rate, 0.35);
+                v += (f1 + f2 * 0.45) * st[4];
+            }
+            let v = v * 0.15 * chatter;
+            let (l, r) = ear.place(v, p.get_place(&p.chatter[1..3]), rate);
             other_l += l;
             other_r += r;
         }
@@ -2115,6 +2285,23 @@ mod tests {
                 p.set_scene(scene.0, scene.1, scene.2);
             }, |_, _| ());
         }
+        // The world going about its day, engine off
+        let quiet = |p: &AudioParams| { p.set_engine_level(0.0); p.set_ambience(1.0, 1.0); };
+        for (k, (name, sound, times)) in [("cow", Sound::Moo, 3), ("sheep", Sound::Baa, 4), ("clock-striking-three", Sound::Toll, 3), ("halyards-at-moorings", Sound::Tink, 8), ("dog", Sound::Bark, 4), ("balloon-burner", Sound::Burner, 1)].into_iter().enumerate() {
+            clip(d, &format!("6{k}-{name}"), 7.0, move |p| {
+                quiet(p);
+                for n in 0..times {
+                    let gap = if sound == Sound::Tink { 0.7 } else if sound == Sound::Toll { 2.2 } else { 7.0 / times as f32 * 0.8 };
+                    p.play(sound, 0.9, Place { pan: (n as f32 * 0.7).sin() * 0.5, behind: 0.0 }, 0.3 + n as f32 * gap);
+                }
+            }, |_, _| ());
+        }
+        clip(d, "66-fishing-boat-passing", 8.0, quiet, |p, u| {
+            let near = 1.0 - (u - 0.5).abs() * 1.6;
+            p.set_diesel(0, near.max(0.05), 10.0, Place { pan: u * 2.0 - 1.0, behind: 0.0 });
+        });
+        clip(d, "67-tractor-ploughing", 6.0, quiet, |p, _| p.set_diesel(0, 0.8, 13.0, Place::CENTRE));
+        clip(d, "68-busy-street-chatter", 6.0, quiet, |p, _| p.set_chatter(0.8, Place::CENTRE));
         println!("wrote clips to {dir}");
     }
 

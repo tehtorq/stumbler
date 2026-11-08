@@ -73,6 +73,10 @@ impl World {
         let names: Vec<&'static str> = layout.circuits.iter().map(|c| c.name).collect();
         let network = road::install(|| build_network(layout, routes));
         eprintln!("[timing] roads, railway, landmarks and trails {:.2}s", t0.elapsed().as_secs_f32());
+        // Piers and anglers along the shores, found while the rest loads
+        std::thread::spawn(|| {
+            crate::harbour::get();
+        });
 
         // Circuits, then the gravel stages
         let circuits: Vec<CircuitInfo> = network.paths.iter()

@@ -33,6 +33,22 @@ fn is_kind(kind: f32, k: f32) -> bool {
     return abs(kind - k) < 0.5;
 }
 
+/// Whether a home's window with this `bedtime` (0..1, from early to bed
+/// to night owl) is lit at `clock` (0..1 from midnight): nearly all in the
+/// evening, going out one by one from ten till two, a few night owls
+/// after that, early risers from five, and some by day.
+fn home_light(bedtime: f32, clock: f32) -> bool {
+    let h = clock * 24.0;
+    if (h >= 16.5 && h < 22.0) { return bedtime > 0.1; }
+    if (h >= 22.0 || h < 2.0) {
+        let late = (h - 22.0 + 24.0) % 24.0 / 4.0;
+        return bedtime > 0.1 + 0.86 * late;
+    }
+    if (h < 5.0) { return bedtime > 0.96; }
+    if (h < 7.5) { return bedtime > 0.7; }
+    return bedtime > 0.6;
+}
+
 /// Swell on open water: a few crossing waves, gentle and slow.
 fn wave_height(p: vec2<f32>, t: f32) -> f32 {
     return sin(p.x * 0.13 + t * 1.1) * 0.5
@@ -208,10 +224,15 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         lit += albedo * vec3<f32>(0.7, 0.9, 0.3) * (0.08 + 0.4 * through) * day_factor() * (0.4 + 0.6 * sun);
     }
     if (is_kind(in.kind, GLOW)) {
-        // A faint inner light by day, shining out after dark, and slowly pulsing
-        let night = 1.0 - day_factor();
-        let pulse = 0.85 + 0.15 * sin(globals.wind_time * 1.3 + in.world_pos.x * 0.05 + in.world_pos.z * 0.07);
-        lit = mix(lit, albedo * pulse * 2.5, 0.2 + 0.8 * night);
+        if (in.color.a < 0.999 && !home_light(in.color.a, globals.extra.y)) {
+            // Lights out: just dark glass
+            lit = sun_lighting(lin(vec3<f32>(0.2, 0.26, 0.3)), normal, sun);
+        } else {
+            // A faint inner light by day, shining out after dark, and slowly pulsing
+            let night = 1.0 - day_factor();
+            let pulse = 0.85 + 0.15 * sin(globals.wind_time * 1.3 + in.world_pos.x * 0.05 + in.world_pos.z * 0.07);
+            lit = mix(lit, albedo * pulse * 2.5, 0.2 + 0.8 * night);
+        }
     }
     if (is_kind(in.kind, PAINT)) {
         lit += gloss(in.world_pos, normal, sun);
@@ -229,5 +250,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
     lit += (eval_lights(in.world_pos, normal, albedo) + eval_street(in.world_pos, normal, albedo)) * (1.0 + 0.5 * wet);
     lit = apply_fog(lit, in.world_pos);
-    return vec4<f32>(max(lit, vec3<f32>(0.0)), in.color.a);
+    // A glowing window's alpha is its bedtime, not see-through
+    return vec4<f32>(max(lit, vec3<f32>(0.0)), select(in.color.a, 1.0, is_kind(in.kind, GLOW)));
 }

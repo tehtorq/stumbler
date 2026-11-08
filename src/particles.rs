@@ -415,6 +415,60 @@ impl Particles {
         }
     }
 
+    /// Dust thrown up behind farm machinery at `at`, earth or chaff
+    /// coloured, `rate` puffs a second.
+    pub fn field_dust(&mut self, at: Vec3, color: [f32; 3], rate: f32, dt: f32) {
+        self.place_accum += dt * rate;
+        while self.place_accum >= 1.0 {
+            self.place_accum -= 1.0;
+            let pos = at + vec3(self.spread(2.0), 0.3, self.spread(2.0));
+            let vel = vec3(self.spread(1.2) + 1.2, 1.2 + self.rand() * 1.4, self.spread(1.2) + 0.8);
+            let tint = 0.9 + self.rand() * 0.15;
+            self.push(Particle { tumble: 0.0, gravity: 0.6, drag: 1.2,
+                pos, vel, life: 1.0, decay: 0.28, size: 1.6, growth: 2.2,
+                color: color.map(|c| c * tint), alpha: 0.35,
+            });
+        }
+    }
+
+    /// A puff of wood smoke from a house's chimney at `at`, drifting with
+    /// `drift`; `thick` (0..1) makes it denser and fuller.
+    pub fn house_smoke(&mut self, at: Vec3, drift: Vec3, thick: f32) {
+        let vel = drift + vec3(self.spread(0.5), 2.2 + self.rand() * 1.0, self.spread(0.5));
+        let grey = 0.72 + self.rand() * 0.18;
+        self.push(Particle { tumble: 0.0, gravity: 0.0, drag: 0.4,
+            pos: at, vel, life: 1.0, decay: 0.22, size: 0.6 + 0.3 * thick, growth: 0.9 + 0.6 * thick,
+            color: [grey, grey, grey * 1.02], alpha: 0.1 + 0.12 * thick,
+        });
+    }
+
+    /// A campfire at `at`: tongues of flame and embers drifting up, both
+    /// shining, `rate` licks a second.
+    pub fn campfire(&mut self, at: Vec3, rate: f32, dt: f32) {
+        self.place_accum += dt * rate;
+        while self.place_accum >= 1.0 {
+            self.place_accum -= 1.0;
+            let pos = at + vec3(self.spread(0.8), 0.2, self.spread(0.8));
+            if self.rand() < 0.25 {
+                // An ember, floating high and winking out
+                let vel = vec3(self.spread(1.2), 4.0 + self.rand() * 3.0, self.spread(1.2));
+                self.push(Particle { tumble: 0.0, gravity: 0.0, drag: 0.6, pos, vel, life: 1.0, decay: 0.7, size: 0.15, growth: -0.1, color: [2.6, 1.0, 0.25], alpha: 0.9 });
+            } else {
+                let vel = vec3(self.spread(0.4), 2.5 + self.rand() * 1.5, self.spread(0.4));
+                self.push(Particle { tumble: 0.0, gravity: 0.0, drag: 0.8, pos, vel, life: 1.0, decay: 2.6, size: 0.9, growth: -0.7, color: [2.4, 1.2, 0.3], alpha: 0.8 });
+            }
+        }
+    }
+
+    /// A lick of flame from a balloon's burner at `at`, shining.
+    pub fn burner(&mut self, at: Vec3) {
+        let vel = vec3(self.spread(0.8), 9.0 + self.rand() * 4.0, self.spread(0.8));
+        self.push(Particle { tumble: 0.0, gravity: 0.0, drag: 0.5,
+            pos: at, vel, life: 1.0, decay: 4.0, size: 0.9, growth: -0.4,
+            color: [2.4, 1.4, 0.4], alpha: 0.85,
+        });
+    }
+
     /// One puff of locomotive smoke from `at`, drifting with `drift`.
     pub fn chimney_smoke(&mut self, at: Vec3, drift: Vec3) {
         let vel = drift + vec3(self.spread(1.5), 7.0 + self.rand() * 3.0, self.spread(1.5));

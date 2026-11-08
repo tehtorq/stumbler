@@ -67,12 +67,12 @@ const TEAMS: [[f32; 4]; 8] = [
     [0.86, 0.12, 0.1, 1.0], [0.1, 0.3, 0.85, 1.0], [0.95, 0.75, 0.1, 1.0], [0.08, 0.55, 0.3, 1.0],
     [0.92, 0.45, 0.08, 1.0], [0.08, 0.6, 0.7, 1.0], [0.5, 0.15, 0.65, 1.0], [0.12, 0.12, 0.14, 1.0],
 ];
-const SHIRTS: [[f32; 3]; 12] = [
+pub(crate) const SHIRTS: [[f32; 3]; 12] = [
     [0.86, 0.16, 0.14], [0.14, 0.38, 0.82], [0.95, 0.8, 0.14], [0.14, 0.66, 0.3], [0.94, 0.5, 0.1], [0.72, 0.2, 0.66],
     [0.93, 0.93, 0.9], [0.12, 0.13, 0.16], [0.1, 0.62, 0.74], [0.96, 0.46, 0.62], [0.4, 0.42, 0.46], [0.55, 0.72, 0.18],
 ];
-const SKINS: [[f32; 3]; 5] = [[0.93, 0.76, 0.62], [0.84, 0.64, 0.48], [0.65, 0.44, 0.3], [0.42, 0.28, 0.2], [0.96, 0.82, 0.7]];
-const HAIR: [[f32; 3]; 4] = [[0.1, 0.08, 0.07], [0.32, 0.2, 0.1], [0.72, 0.56, 0.24], [0.66, 0.66, 0.68]];
+pub(crate) const SKINS: [[f32; 3]; 5] = [[0.93, 0.76, 0.62], [0.84, 0.64, 0.48], [0.65, 0.44, 0.3], [0.42, 0.28, 0.2], [0.96, 0.82, 0.7]];
+pub(crate) const HAIR: [[f32; 3]; 4] = [[0.1, 0.08, 0.07], [0.32, 0.2, 0.1], [0.72, 0.56, 0.24], [0.66, 0.66, 0.68]];
 const BUNTING: [[f32; 3]; 5] = [[0.9, 0.15, 0.12], [0.96, 0.96, 0.92], [0.12, 0.34, 0.82], [0.98, 0.8, 0.12], [0.12, 0.62, 0.34]];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -393,6 +393,7 @@ pub fn person(b: &mut Builder, at: Vec3, facing: Vec2, seed: f32, keen: f32) {
     let phase = hash(seed, 4.0) * 0.49;
     let tone = |c: [f32; 3], arm: bool| [c[0], c[1], c[2], phase + if arm { 0.5 } else { 0.0 }];
     let layer = std::mem::replace(&mut b.layer, Layer::Crowd);
+    let first = b.crowd_verts.len();
     let planting = std::mem::replace(&mut b.planting, false);
     let height = 1.25 + 0.2 * hash(seed, 5.0);
     let right = vec3(facing.y, 0.0, -facing.x);
@@ -421,6 +422,11 @@ pub fn person(b: &mut Builder, at: Vec3, facing: Vec2, seed: f32, keen: f32) {
     }
     b.layer = layer;
     b.planting = planting;
+    // Modelled a unit to the metre; the world is two units to it
+    for v in &mut b.crowd_verts[first..] {
+        let p = at + (Vec3::from(v.pos) - at) * crate::props::PERSON_SCALE;
+        v.pos = p.into();
+    }
 }
 
 /// A grandstand: rows rising from a wall at the front to a roofed back wall.

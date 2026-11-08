@@ -297,9 +297,102 @@ pub fn build(b: &mut Builder, inside: &impl Fn(Vec2) -> bool) {
     for farm in all() {
         farmstead(b, farm, inside);
         for field in farm.fields.iter().filter(|f| f.crop == Crop::Pasture) {
-            livestock(b, farm, field, inside);
+            // (The flocks and herds on them are `livestock`'s)
+            bales(b, farm, field, inside);
+        }
+        for field in farm.fields.iter().filter(|f| matches!(f.crop, Crop::Wheat | Crop::Shoots | Crop::Rapeseed)) {
+            if hash(field.seed, 21.0) < 0.4 {
+                let l = Vec2::new((hash(field.seed, 22.0) - 0.5) * field.half.x, (hash(field.seed, 23.0) - 0.5) * field.half.y);
+                let p = field.centre + farm.along * l.x + farm.out * l.y;
+                if inside(p) {
+                    scarecrow(b, vec3(p.x, ground(p, 1.0), p.y), farm.out * -1.0, field.seed);
+                }
+            }
         }
     }
+}
+
+/// Round bales of hay left along a pasture's edge after the cut.
+fn bales(b: &mut Builder, farm: &Farm, field: &Field, inside: &impl Fn(Vec2) -> bool) {
+    if hash(field.seed, 30.0) > 0.6 {
+        return;
+    }
+    let n = 3 + (hash(field.seed, 31.0) * 4.0) as usize;
+    let k = crate::props::PERSON_SCALE;
+    for i in 0..n {
+        let along = -field.half.x + 10.0 + i as f32 * 9.0 + hash(field.seed, i as f32) * 3.0;
+        if along > field.half.x - 6.0 {
+            break;
+        }
+        let p = field.centre + farm.along * along + farm.out * (field.half.y - 7.0);
+        if !inside(p) {
+            continue;
+        }
+        let y = ground(p, 2.0);
+        let axis = Vec2::from_angle(hash(field.seed, 40.0 + i as f32) * 6.28);
+        let a = vec3(axis.x, 0.0, axis.y) * 0.6 * k;
+        let c = vec3(p.x, y + 0.75 * k, p.y);
+        b.limb(c - a, c + a, 0.75 * k, 0.75 * k, 10, i as f32, HAY);
+    }
+}
+
+/// A scarecrow on its post, arms out, in an old coat and a battered hat.
+fn scarecrow(b: &mut Builder, foot: Vec3, facing: Vec2, seed: f32) {
+    let k = crate::props::PERSON_SCALE;
+    let wood = [0.42, 0.3, 0.2, 1.0];
+    let straw = [0.86, 0.74, 0.35, 1.0];
+    let coats = [[0.35, 0.3, 0.45, 1.0], [0.5, 0.25, 0.2, 1.0], [0.3, 0.4, 0.3, 1.0], [0.55, 0.45, 0.3, 1.0]];
+    let coat = coats[(hash(seed, 24.0) * 4.0) as usize % 4];
+    let f = vec3(facing.x, 0.0, facing.y);
+    let r = vec3(facing.y, 0.0, -facing.x);
+    let yaw = facing.x.atan2(facing.y);
+    b.limb(foot - Vec3::Y * 0.3, foot + Vec3::Y * 2.2 * k, 0.05 * k, 0.05 * k, 4, 0.0, wood);
+    let shoulders = foot + Vec3::Y * 1.75 * k;
+    b.limb(shoulders - r * 0.75 * k, shoulders + r * 0.75 * k, 0.04 * k, 0.04 * k, 4, 0.0, wood);
+    // The coat, arms out along the crossbar, straw at the cuffs
+    b.block(foot + Vec3::Y * 1.0 * k, 0.24 * k, 0.8 * k, 0.14 * k, yaw + std::f32::consts::FRAC_PI_2, coat, coat);
+    for s in [-1.0, 1.0] {
+        b.limb(shoulders + r * s * 0.2 * k, shoulders + r * s * 0.65 * k - Vec3::Y * 0.05 * k, 0.09 * k, 0.08 * k, 4, 0.3, coat);
+        let cuff = shoulders + r * s * 0.68 * k;
+        b.tri(cuff, cuff + r * s * 0.18 * k - Vec3::Y * 0.12 * k, cuff + r * s * 0.15 * k + Vec3::Y * 0.08 * k, straw);
+    }
+    // A sack of a head, and the hat
+    let head = shoulders + Vec3::Y * 0.12 * k;
+    b.block(head, 0.15 * k, 0.32 * k, 0.15 * k, yaw, [0.75, 0.65, 0.45, 1.0], [0.75, 0.65, 0.45, 1.0]);
+    let tilt = r * 0.03 * k;
+    b.column(head + Vec3::Y * 0.3 * k + tilt, 0.3 * k, 0.3 * k, 0.03 * k, 8, [0.15, 0.13, 0.12, 1.0]);
+    b.column(head + Vec3::Y * 0.33 * k + tilt, 0.15 * k, 0.13 * k, 0.2 * k, 8, [0.15, 0.13, 0.12, 1.0]);
+    let _ = f;
+}
+
+/// A washing line between two posts, the wash hung out and flapping.
+fn washing_line(b: &mut Builder, a: Vec3, c: Vec3, seed: f32) {
+    let k = crate::props::PERSON_SCALE;
+    let wood = [0.45, 0.33, 0.22, 1.0];
+    let high = 1.9 * k;
+    for p in [a, c] {
+        b.limb(p - Vec3::Y * 0.3, p + Vec3::Y * high, 0.05 * k, 0.05 * k, 4, 0.0, wood);
+    }
+    let (ta, tc) = (a + Vec3::Y * high, c + Vec3::Y * high);
+    b.limb(ta, tc, 0.012 * k, 0.012 * k, 3, 0.0, [0.85, 0.85, 0.8, 1.0]);
+    const WASH: [[f32; 3]; 7] = [[0.95, 0.95, 0.92], [0.85, 0.2, 0.15], [0.2, 0.35, 0.7], [0.95, 0.8, 0.2], [0.3, 0.6, 0.4], [0.9, 0.6, 0.7], [0.95, 0.95, 0.92]];
+    let layer = std::mem::replace(&mut b.layer, crate::props::Layer::Flag);
+    let len = ta.distance(tc);
+    let dir = (tc - ta) / len;
+    let mut at = 0.4 * k;
+    let mut n = 0;
+    while at < len - 0.8 * k {
+        let roll = hash(seed, n as f32);
+        // Shirts and towels, now and then a sheet
+        let (w, h) = if roll < 0.2 { (1.6 * k, 1.3 * k) } else { (0.6 * k, 0.7 * k) };
+        let p0 = ta + dir * at;
+        let p1 = ta + dir * (at + w);
+        let colour = WASH[(hash(seed, n as f32 + 50.0) * 7.0) as usize % 7];
+        b.cloth([p0, p1, p1 - Vec3::Y * h, p0 - Vec3::Y * h], [0.0, 0.0, 0.5, 0.5], colour);
+        at += w + 0.25 * k;
+        n += 1;
+    }
+    b.layer = layer;
 }
 
 fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
@@ -310,20 +403,25 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
     let sign = x_out.dot(vec3(farm.out.x, 0.0, farm.out.y)).signum();
     let at = |along: f32, out: f32| farm.world(Vec2::new(along, out));
     // Point on a building's face: `out` from its centre toward the road, `along`, `up`
-    let face = |base: Vec3, out: f32, along: f32, up: f32| base + rot * vec3(-sign * out, up, 0.0) + vec3(farm.along.x, 0.0, farm.along.y) * along;
+    // `up` as laid out: drawn `BUILDING_TALL` times higher
+    let tall = crate::props::BUILDING_TALL;
+    let face = |base: Vec3, out: f32, along: f32, up: f32| base + rot * vec3(-sign * out, up * tall, 0.0) + vec3(farm.along.x, 0.0, farm.along.y) * along;
     let window = |b: &mut Builder, base: Vec3, out: f32, along: f32, up: f32, w: f32, h: f32| {
         let o = out + 0.05;
-        b.quad(face(base, o, along - w, up), face(base, o, along + w, up), face(base, o, along + w, up + h), face(base, o, along - w, up + h), WINDOW);
+        // Its alpha is when the household goes to bed (the shader's `home_light`)
+        let bedtime = 0.05 + 0.94 * hash(base.x * 0.37 + along, base.z * 0.73 + up);
+        let lamp = [WINDOW[0], WINDOW[1], WINDOW[2], bedtime];
+        b.quad(face(base, o, along - w, up), face(base, o, along + w, up), face(base, o, along + w, up + h), face(base, o, along - w, up + h), lamp);
     };
 
     // Farmhouse, facing the road
     let p = at(-50.0, 108.0);
     if inside(p) {
         let base = footing(b, farm, p, Vec2::new(9.0, 6.0), yaw);
-        b.solid_block(base, 6.0, 7.5, 9.0, yaw, HOUSE_WALL, HOUSE_WALL);
-        b.roof(base + Vec3::Y * 7.5, 6.0, 4.5, 9.0, yaw, HOUSE_ROOF);
+        b.solid_block(base, 6.0, 7.5 * tall, 9.0, yaw, HOUSE_WALL, HOUSE_WALL);
+        b.roof(base + Vec3::Y * 7.5 * tall, 6.0, 4.5 * tall, 9.0, yaw, HOUSE_ROOF);
         let chimney = base + rot * vec3(0.0, 0.0, 6.0);
-        b.block(chimney + Vec3::Y * 9.0, 0.8, 5.0, 0.8, yaw, [0.6, 0.4, 0.32, 1.0], DARK);
+        b.block(chimney + Vec3::Y * 9.0 * tall, 0.9, 5.0 * tall, 0.9, yaw, [0.6, 0.4, 0.32, 1.0], DARK);
         let front = 6.05;
         b.quad(face(base, front, -1.2, 0.5), face(base, front, 1.2, 0.5), face(base, front, 1.2, 4.0), face(base, front, -1.2, 4.0), DOOR);
         b.glowing = true;
@@ -340,8 +438,8 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
     let p = at(40.0, 120.0);
     if inside(p) {
         let base = footing(b, farm, p, Vec2::new(13.0, 10.0), yaw);
-        b.solid_block(base, 10.0, 9.0, 13.0, yaw, BARN_RED, BARN_RED);
-        b.roof(base + Vec3::Y * 9.0, 10.0, 6.5, 13.0, yaw, BARN_ROOF);
+        b.solid_block(base, 10.0, 9.0 * tall, 13.0, yaw, BARN_RED, BARN_RED);
+        b.roof(base + Vec3::Y * 9.0 * tall, 10.0, 6.5 * tall, 13.0, yaw, BARN_ROOF);
         let o = 10.06;
         let (w, h) = (4.0, 7.0);
         b.quad(face(base, o, -w, 0.5), face(base, o, w, 0.5), face(base, o, w, h), face(base, o, -w, h), BARN_DOOR);
@@ -365,12 +463,18 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
     let p = at(68.0, 143.0);
     if inside(p) {
         let base = vec3(p.x, ground(p, 4.0) - 0.5, p.y);
-        b.column(base, 4.0, 4.0, 18.0, 12, SILO);
+        b.column(base, 4.0, 4.0, 18.0 * tall, 12, SILO);
         for y in [5.0, 10.0, 15.0] {
-            b.column(base + Vec3::Y * y, 4.06, 4.06, 0.4, 12, SILO_BAND);
+            b.column(base + Vec3::Y * y * tall, 4.06, 4.06, 0.5, 12, SILO_BAND);
         }
-        b.cone(base + Vec3::Y * 18.0, 4.3, 3.2, 12, SILO_BAND);
-        b.post(base, 4.0, 21.0);
+        b.cone(base + Vec3::Y * 18.0 * tall, 4.3, 3.2 * tall, 12, SILO_BAND);
+        b.post(base, 4.0, 21.0 * tall);
+    }
+
+    // The wash out on the line behind the farmhouse
+    let (wa, wc) = (at(-62.0, 124.0), at(-42.0, 124.0));
+    if inside(wa) {
+        washing_line(b, vec3(wa.x, ground(wa, 0.5), wa.y), vec3(wc.x, ground(wc, 0.5), wc.y), farm.seed);
     }
 
     // Round hay bales stacked by the barn
@@ -429,14 +533,39 @@ fn farmstead(b: &mut Builder, farm: &Farm, inside: &impl Fn(Vec2) -> bool) {
 /// Floor level for a building with footprint `half` about `p` (along the
 /// road, out from it): on sloping ground it stands at the uphill corner on a
 /// stone plinth down to the lowest, so no wall is buried.
-fn footing(b: &mut Builder, farm: &Farm, p: Vec2, half: Vec2, yaw: f32) -> Vec3 {
+/// The lowest ground under a footprint, and the highest.
+fn footing_levels(farm: &Farm, p: Vec2, half: Vec2) -> (f32, f32) {
     let heights = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)]
         .map(|(a, o)| {
             let q = p + farm.along * a * half.x + farm.out * o * half.y;
             crate::terrain::terrain_height(q.x, q.y)
         });
-    let lo = heights.iter().copied().fold(f32::MAX, f32::min);
-    let hi = heights.iter().copied().fold(f32::MIN, f32::max);
+    (heights.iter().copied().fold(f32::MAX, f32::min), heights.iter().copied().fold(f32::MIN, f32::max))
+}
+
+/// The flocks and herds out at pasture: where, and whether they're sheep
+/// (as `livestock` decides) or cows.
+pub(crate) fn herds() -> Vec<(Vec2, bool)> {
+    all().iter().flat_map(|farm| {
+        let sheep = hash(farm.seed, 11.0) < 0.5;
+        farm.fields.iter().filter(|f| f.crop == Crop::Pasture).map(move |f| (f.centre, sheep))
+    }).collect()
+}
+
+/// The top of each farmhouse's chimney (as `farmstead` puts it up), with
+/// the farm's seed.
+pub(crate) fn chimneys() -> Vec<(Vec3, f32)> {
+    all().iter().map(|farm| {
+        let yaw = (-farm.along.x).atan2(-farm.along.y);
+        let p = farm.world(Vec2::new(-50.0, 108.0));
+        let floor = footing_levels(farm, p, Vec2::new(9.0, 6.0)).1 + 0.2;
+        let chimney = vec3(p.x, floor, p.y) + Quat::from_rotation_y(yaw) * vec3(0.0, 0.0, 6.0);
+        (chimney + Vec3::Y * 14.0 * crate::props::BUILDING_TALL, farm.seed)
+    }).collect()
+}
+
+fn footing(b: &mut Builder, farm: &Farm, p: Vec2, half: Vec2, yaw: f32) -> Vec3 {
+    let (lo, hi) = footing_levels(farm, p, half);
     if hi - lo > 0.4 {
         let stone = [0.55, 0.52, 0.48, 1.0];
         b.block(vec3(p.x, lo - 0.6, p.y), half.y + 0.4, hi - lo + 0.8, half.x + 0.4, yaw, stone, stone);
@@ -471,62 +600,6 @@ fn tractor(b: &mut Builder, at: Vec3, side: Vec2, facing: Vec2, red: bool) {
 }
 
 /// Cows or sheep grazing a pasture, each farm keeping one kind.
-fn livestock(b: &mut Builder, farm: &Farm, field: &Field, inside: &impl Fn(Vec2) -> bool) {
-    let sheep = hash(farm.seed, 11.0) < 0.5;
-    let count = 6 + (hash(field.seed, 12.0) * 5.0) as usize;
-    for k in 0..count {
-        let seed = field.seed + k as f32 * 3.7;
-        let l = Vec2::new((hash(seed, 1.0) - 0.5) * 2.0 * (field.half.x - 6.0), (hash(seed, 2.0) - 0.5) * 2.0 * (field.half.y - 6.0));
-        let p = field.centre + farm.along * l.x + farm.out * l.y;
-        if !inside(p) {
-            continue;
-        }
-        let a = hash(seed, 3.0) * std::f32::consts::TAU;
-        let dir = Vec2::new(a.cos(), a.sin());
-        let at = vec3(p.x, ground(p, 1.5), p.y);
-        if sheep { sheep_at(b, at, dir, seed) } else { cow_at(b, at, dir, seed) }
-    }
-}
-
-fn cow_at(b: &mut Builder, at: Vec3, dir: Vec2, seed: f32) {
-    const WHITE: [f32; 4] = [0.92, 0.9, 0.86, 1.0];
-    const BLACK: [f32; 4] = [0.1, 0.09, 0.09, 1.0];
-    const BROWN: [f32; 4] = [0.55, 0.32, 0.18, 1.0];
-    let coat = if hash(seed, 5.0) < 0.3 { BROWN } else { WHITE };
-    let f = vec3(dir.x, 0.0, dir.y);
-    let s = vec3(-dir.y, 0.0, dir.x);
-    let yaw = (-dir.x).atan2(-dir.y);
-    for (a, k) in [(1.2, -1.0), (1.2, 1.0), (-1.2, -1.0), (-1.2, 1.0)] {
-        b.block(at + f * a + s * k * 0.55, 0.18, 1.3, 0.18, yaw, BLACK, BLACK);
-    }
-    b.block(at + Vec3::Y * 1.2, 0.85, 1.3, 1.7, yaw, coat, coat);
-    if coat == WHITE {
-        // Patches
-        for k in 0..2 {
-            let o = f * (hash(seed, k as f32 + 6.0) - 0.5) * 2.0 + Vec3::Y * 1.5;
-            b.block(at + o, 0.88, 0.8, 0.5, yaw, BLACK, BLACK);
-        }
-    }
-    // Head down, grazing
-    let head = at + f * 2.0 + Vec3::Y * 0.6;
-    b.block(head, 0.45, 0.9, 0.55, yaw, if coat == WHITE { BLACK } else { coat }, BLACK);
-    b.block(head + f * 0.5, 0.35, 0.4, 0.2, yaw, [0.85, 0.6, 0.6, 1.0], [0.85, 0.6, 0.6, 1.0]);
-    b.post(at, 1.4, 2.5);
-}
-
-fn sheep_at(b: &mut Builder, at: Vec3, dir: Vec2, seed: f32) {
-    const FLEECE: [f32; 4] = [0.93, 0.92, 0.86, 1.0];
-    const FACE: [f32; 4] = [0.15, 0.13, 0.12, 1.0];
-    let f = vec3(dir.x, 0.0, dir.y);
-    let s = vec3(-dir.y, 0.0, dir.x);
-    let yaw = (-dir.x).atan2(-dir.y);
-    for (a, k) in [(0.6, -1.0), (0.6, 1.0), (-0.6, -1.0), (-0.6, 1.0)] {
-        b.block(at + f * a + s * k * 0.35, 0.1, 0.8, 0.1, yaw, FACE, FACE);
-    }
-    b.blob(at + Vec3::Y * 1.2, 1.0, 0.75, FLEECE, seed);
-    b.block(at + f * 1.0 + Vec3::Y * 0.55, 0.25, 0.6, 0.35, yaw, FACE, FACE);
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

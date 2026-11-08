@@ -21,6 +21,14 @@ const WOOD: [f32; 4] = [0.45, 0.3, 0.18, 1.0];
 const ROOF_COLORS: [[f32; 4]; 4] = [[0.7, 0.25, 0.15, 1.0], [0.45, 0.25, 0.2, 1.0], [0.35, 0.37, 0.42, 1.0], [0.6, 0.35, 0.15, 1.0]];
 const WALL_COLORS: [[f32; 4]; 4] = [[0.92, 0.88, 0.78, 1.0], [0.85, 0.82, 0.75, 1.0], [0.95, 0.93, 0.9, 1.0], [0.82, 0.72, 0.6, 1.0]];
 
+/// The world's scale: a unit is about half a metre (the car is 9.5 long,
+/// and speed reads 1.8 km/h a unit a second). People and the things made
+/// for them are modelled a unit to the metre and scaled up by this.
+pub const PERSON_SCALE: f32 = 2.0;
+/// Buildings' storeys, doors and windows are drawn this much taller than
+/// they're laid out (a storey 3.8 laid out stands about 6, three metres).
+pub const BUILDING_TALL: f32 = 1.6;
+
 /// A base this close to the ground is taken to be standing on it (see
 /// `Builder::planted`).
 const PLANT_REACH: f32 = 0.8;
@@ -349,6 +357,12 @@ pub fn generate_props(lo: Vec2, hi: Vec2) -> Props {
     for &c in landmarks::cairns().iter().filter(|&&c| inside(c)) {
         cairn(&mut b, c);
     }
+    source!("harbour");
+    crate::harbour::build(&mut b, &inside);
+    source!("picnics");
+    crate::picnics::build(&mut b, &inside);
+    source!("campsites");
+    crate::camps::build(&mut b, &inside);
     Props {
         mesh: (b.verts, b.idxs),
         glow: (b.glow_verts, b.glow_idxs),
@@ -490,18 +504,8 @@ fn build_landmark(b: &mut Builder, l: &Landmark) {
             b.column(base, 7.0, 4.5, 27.0, 8, WHITE);
             b.solid_post(base, 7.0, 27.0);
             b.cone(base + Vec3::Y * 27.0, 5.5, 6.0, 8, DARK);
-            // Four sails on a hub facing `yaw`
-            let r = Quat::from_rotation_y(yaw);
-            let hub = base + Vec3::Y * 24.0 + r * vec3(0.0, 0.0, -6.0);
-            for k in 0..4 {
-                let a = k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
-                let dir = r * vec3(a.cos(), a.sin(), 0.0);
-                let across = r * vec3(-a.sin(), a.cos(), 0.0) * 2.2;
-                let tip = hub + dir * 20.0;
-                let root = hub + dir * 3.0;
-                b.quad(root, tip, tip + across, root + across, WOOD);
-                b.quad(root + across, tip + across, tip, root, [0.85, 0.8, 0.7, 1.0]);
-            }
+            // The hub; `machinery` turns the sails on it
+            let (hub, _) = crate::machinery::windmill_hub(p);
             b.block(hub - Vec3::Y * 1.0, 1.0, 2.0, 1.0, yaw, DARK, DARK);
         }
         Kind::Lighthouse => {
@@ -557,10 +561,11 @@ fn build_landmark(b: &mut Builder, l: &Landmark) {
         Kind::Cabin => {
             let y = ground(p, 8.0);
             let base = vec3(p.x, y - 0.5, p.y);
-            b.solid_block(base, 6.0, 6.0, 8.0, yaw, WOOD, WOOD);
-            b.roof(base + Vec3::Y * 6.0, 6.0, 4.5, 8.0, yaw, [0.25, 0.3, 0.22, 1.0]);
+            let t = BUILDING_TALL;
+            b.solid_block(base, 6.0, 6.0 * t, 8.0, yaw, WOOD, WOOD);
+            b.roof(base + Vec3::Y * 6.0 * t, 6.0, 4.5 * t, 8.0, yaw, [0.25, 0.3, 0.22, 1.0]);
             let chimney = base + Quat::from_rotation_y(yaw) * vec3(3.0, 0.0, 4.0);
-            b.block(chimney, 0.9, 12.5, 0.9, yaw, STONE, DARK);
+            b.block(chimney, 0.9, 12.5 * t, 0.9, yaw, STONE, DARK);
             let woodpile = base + Quat::from_rotation_y(yaw) * vec3(9.0, 0.0, 0.0);
             b.solid_block(woodpile, 1.5, 1.6, 3.0, yaw, [0.55, 0.38, 0.22, 1.0], [0.6, 0.45, 0.28, 1.0]);
         }
@@ -591,8 +596,8 @@ fn build_landmark(b: &mut Builder, l: &Landmark) {
             b.block(vec3(end.x, terrain::WATER_LEVEL - 0.2, end.y), 1.1, 0.9, 3.2, face, RED, WOOD);
             let house = p - dir * 6.0;
             let y = ground(house, 6.0);
-            b.solid_block(vec3(house.x, y - 0.5, house.y), 5.0, 5.0, 4.0, face, [0.4, 0.5, 0.6, 1.0], WOOD);
-            b.roof(vec3(house.x, y + 4.5, house.y), 5.0, 3.0, 4.0, face, [0.3, 0.25, 0.22, 1.0]);
+            b.solid_block(vec3(house.x, y - 0.5, house.y), 5.0, 5.0 * BUILDING_TALL, 4.0, face, [0.4, 0.5, 0.6, 1.0], WOOD);
+            b.roof(vec3(house.x, y - 0.5 + 5.0 * BUILDING_TALL, house.y), 5.0, 3.0 * BUILDING_TALL, 4.0, face, [0.3, 0.25, 0.22, 1.0]);
         }
         Kind::Viewpoint => {
             // A bench facing the view, a coin telescope and a signpost
@@ -644,11 +649,12 @@ fn village(b: &mut Builder, centre: Vec2, seed: f32) {
     if clear(centre) {
         let y = ground(centre, 8.0);
         let base = vec3(centre.x, y - 0.5, centre.y);
-        b.solid_block(base, 6.0, 9.0, 11.0, face, WHITE, WHITE);
-        b.roof(base + Vec3::Y * 9.0, 6.0, 5.0, 11.0, face, ROOF_COLORS[2]);
+        let t = BUILDING_TALL;
+        b.solid_block(base, 6.0, 9.0 * t, 11.0, face, WHITE, WHITE);
+        b.roof(base + Vec3::Y * 9.0 * t, 6.0, 5.0 * t, 11.0, face, ROOF_COLORS[2]);
         let tower = base + Quat::from_rotation_y(face) * vec3(0.0, 0.0, -13.0);
-        b.solid_block(tower, 3.5, 22.0, 3.5, face, WHITE, WHITE);
-        b.cone(tower + Vec3::Y * 22.0, 4.5, 9.0, 4, ROOF_COLORS[2]);
+        b.solid_block(tower, 3.5, 22.0 * t, 3.5, face, WHITE, WHITE);
+        b.cone(tower + Vec3::Y * 22.0 * t, 4.5, 9.0 * t, 4, ROOF_COLORS[2]);
     }
     let houses = 7 + (seed as usize % 4);
     for k in 0..houses {
@@ -660,11 +666,11 @@ fn village(b: &mut Builder, centre: Vec2, seed: f32) {
         }
         let h = hash(q.x, q.y);
         let (hx, hz) = (4.0 + h * 2.5, 5.5 + h * 3.0);
-        let height = 4.5 + (k % 3) as f32 * 1.5;
+        let height = (4.5 + (k % 3) as f32 * 1.5) * BUILDING_TALL;
         let yaw = face + if k % 2 == 0 { 0.0 } else { std::f32::consts::FRAC_PI_2 } + (h - 0.5) * 0.3;
         let y = ground(q, hz);
         let base = vec3(q.x, y - 0.5, q.y);
         b.solid_block(base, hx, height, hz, yaw, WALL_COLORS[k % 4], WALL_COLORS[k % 4]);
-        b.roof(base + Vec3::Y * height, hx, 3.0 + h * 2.0, hz, yaw, ROOF_COLORS[(k + 1) % 4]);
+        b.roof(base + Vec3::Y * height, hx, (3.0 + h * 2.0) * BUILDING_TALL, hz, yaw, ROOF_COLORS[(k + 1) % 4]);
     }
 }

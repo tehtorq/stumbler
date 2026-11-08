@@ -11,11 +11,15 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 mod ai_cars;
+mod aloft;
 mod audio;
 mod biplane;
 mod birds;
+mod boats;
+mod breakdowns;
 mod boosts;
 mod camera;
+mod camps;
 mod car;
 mod chunks;
 mod debug;
@@ -24,19 +28,26 @@ mod collectibles;
 mod collisions;
 mod farms;
 mod gamepad;
+mod harbour;
 mod cover;
 mod geometry;
 mod gpu;
 mod hud;
 mod landmarks;
 mod layout;
+mod nightlife;
 mod noise;
 mod lights;
+mod livestock;
+mod machinery;
 mod loading;
+mod machines;
 mod map;
+mod market;
 mod marker;
 mod particles;
 mod physics;
+mod picnics;
 mod progress;
 mod props;
 mod race;
@@ -44,11 +55,14 @@ mod raceday;
 mod railway;
 mod rescue;
 mod road;
+mod roadworks;
 mod roadside;
 mod routes;
 mod screen;
 mod secrets;
 mod skids;
+mod smoke;
+mod soundscape;
 mod stages;
 mod speedlines;
 mod terrain;
@@ -56,11 +70,15 @@ mod track;
 mod tuning;
 mod venue;
 mod waterways;
+mod waterfowl;
 mod weather;
 mod trackside;
+mod traffic;
 mod trails;
+mod travellers;
 mod tracks;
 mod towns;
+mod townsfolk;
 mod trees;
 mod wildlife;
 mod world;
@@ -227,9 +245,44 @@ struct Stage {
     collectibles: Vec<collectibles::Collectible>,
     flocks: Vec<birds::Flock>,
     wildlife: wildlife::Wildlife,
+    boats: boats::Boats,
+    keepers: machinery::Keepers,
+    townsfolk: townsfolk::Townsfolk,
+    picnics: picnics::Picnics,
+    travellers: travellers::Travellers,
+    road_traffic: traffic::Traffic,
+    waterfowl: waterfowl::Waterfowl,
+    livestock: livestock::Livestock,
+    nightlife: nightlife::Nightlife,
+    nightlife_mesh: DynamicMesh,
+    livestock_mesh: DynamicMesh,
+    camps: camps::Camps,
+    camp_mesh: DynamicMesh,
+    market_mesh: DynamicMesh,
+    waterfowl_mesh: DynamicMesh,
+    vehicle_mesh: DynamicMesh,
+    vehicle_lamp_mesh: DynamicMesh,
+    works_mesh: DynamicMesh,
+    works_lamp_mesh: DynamicMesh,
+    breakdown_mesh: DynamicMesh,
+    breakdown_lamp_mesh: DynamicMesh,
+    smoke: smoke::Smoke,
+    aloft: aloft::Aloft,
+    soundscape: soundscape::Soundscape,
     /// Fishes the player out of lakes.
     rescue: rescue::WaterRescue,
     wildlife_mesh: DynamicMesh,
+    boat_mesh: DynamicMesh,
+    boat_glow_mesh: DynamicMesh,
+    sail_mesh: DynamicMesh,
+    townsfolk_mesh: DynamicMesh,
+    picnic_mesh: DynamicMesh,
+    anglers: harbour::Anglers,
+    angler_mesh: DynamicMesh,
+    traveller_mesh: DynamicMesh,
+    machine_mesh: DynamicMesh,
+    aloft_mesh: DynamicMesh,
+    beam_mesh: DynamicMesh,
     sway_events: Vec<SwayEvent>,
     /// The quickest lap driven on each circuit this session (by circuit
     /// index): its time and the recording raced against as a ghost.
@@ -313,6 +366,8 @@ struct Stage {
     game_audio: Option<audio::GameAudio>,
     gamepad: Option<gamepad::Gamepad>,
     day_time: f32, // 0..1 where 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+    /// Days gone by since the start (each midnight passed).
+    day: u32,
     wind_time: f32,
     /// When the last frame started, and frames per second smoothed for display.
     last_frame: Option<Instant>,
@@ -503,8 +558,43 @@ impl Stage {
             collectibles,
             flocks: birds::create_flocks(&centroids),
             wildlife: wildlife::Wildlife::new(0x5eed_1234),
+            boats: boats::Boats::new(0xb0a7_5eed),
+            keepers: machinery::Keepers::default(),
+            townsfolk: townsfolk::Townsfolk::default(),
+            picnics: picnics::Picnics::default(),
+            travellers: travellers::Travellers::default(),
+            road_traffic: traffic::Traffic::default(),
+            waterfowl: waterfowl::Waterfowl::default(),
+            livestock: livestock::Livestock::default(),
+            nightlife: nightlife::Nightlife::default(),
+            nightlife_mesh: DynamicMesh::new(&gpu, "nightlife"),
+            livestock_mesh: DynamicMesh::new(&gpu, "livestock"),
+            camps: camps::Camps,
+            camp_mesh: DynamicMesh::new(&gpu, "campers"),
+            market_mesh: DynamicMesh::new(&gpu, "market"),
+            waterfowl_mesh: DynamicMesh::new(&gpu, "waterfowl"),
+            vehicle_mesh: DynamicMesh::new(&gpu, "traffic"),
+            vehicle_lamp_mesh: DynamicMesh::new(&gpu, "traffic lamps"),
+            works_mesh: DynamicMesh::new(&gpu, "road works"),
+            works_lamp_mesh: DynamicMesh::new(&gpu, "road works lights"),
+            breakdown_mesh: DynamicMesh::new(&gpu, "breakdowns"),
+            breakdown_lamp_mesh: DynamicMesh::new(&gpu, "breakdown lamps"),
+            smoke: smoke::Smoke::default(),
+            aloft: aloft::Aloft::default(),
+            soundscape: soundscape::Soundscape::default(),
             rescue: rescue::WaterRescue::default(),
             wildlife_mesh: DynamicMesh::new(&gpu, "wildlife"),
+            boat_mesh: DynamicMesh::new(&gpu, "boats"),
+            boat_glow_mesh: DynamicMesh::new(&gpu, "boat lights"),
+            sail_mesh: DynamicMesh::new(&gpu, "windmill sails"),
+            townsfolk_mesh: DynamicMesh::new(&gpu, "townsfolk"),
+            picnic_mesh: DynamicMesh::new(&gpu, "picnics"),
+            anglers: harbour::Anglers::default(),
+            angler_mesh: DynamicMesh::new(&gpu, "anglers"),
+            traveller_mesh: DynamicMesh::new(&gpu, "travellers"),
+            machine_mesh: DynamicMesh::new(&gpu, "farm machines"),
+            aloft_mesh: DynamicMesh::new(&gpu, "balloons"),
+            beam_mesh: DynamicMesh::new(&gpu, "lighthouse beams"),
             raceday: raceday::RaceDay::new(&gpu),
             world,
             map_image,
@@ -554,6 +644,7 @@ impl Stage {
             game_audio: audio::GameAudio::new(),
             gamepad: gamepad::Gamepad::new(),
             // Dev aid: STUMBLER_DAY_TIME=0.9 starts at night (0..1, 0.5 = noon)
+            day: 0,
             day_time: std::env::var("STUMBLER_DAY_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(0.35),
             wind_time: 0.0,
             frames: 0,
@@ -753,7 +844,11 @@ impl Stage {
         let dt = (now - self.last_time).clamp(0.001, 0.05);
         self.last_time = now;
         if !self.debug.freeze_time {
+            let before = self.day_time;
             self.day_time = (self.day_time + dt / DAY_LENGTH).fract();
+            if self.day_time < before {
+                self.day += 1;
+            }
         }
         self.weather.update(now, dt);
         let grip = weather::grip();
@@ -782,8 +877,10 @@ impl Stage {
             };
             self.key_down(key);
         }
-        let traffic = ai_cars::traffic(std::iter::once((&self.player, self.braking))
+        let mut traffic = ai_cars::traffic(std::iter::once((&self.player, self.braking))
             .chain(self.cars.iter().map(|c| (&c.physics, c.last_input.brake > 0.1))));
+        // The everyday traffic on the roads, for the drivers to keep clear of
+        traffic.extend(self.road_traffic.as_traffic().into_iter().map(|(pos, vel, braking)| ai_cars::Traffic { pos, vel, braking }));
         let demo_track = self.race.as_ref().map_or(0, |r| r.circuit);
         let mut input = match &mut self.demo_driver {
             Some(driver) => driver.input(&self.ai_tracks[demo_track], &self.player, &traffic, dt),
@@ -865,7 +962,33 @@ impl Stage {
         }
         self.sway_events.retain(|s| s.strength > 0.02);
         birds::update_flocks(&mut self.flocks, self.player.pos, dt, now);
-        self.wildlife.update(self.player.pos, self.player.vel, dt);
+        self.wildlife.update(self.player.pos, self.player.vel, self.day_time, dt);
+        self.waterfowl.update(self.player.pos, self.player.vel, dt);
+        self.livestock.update(self.player.pos, self.player.vel, self.day_time, dt);
+        let facing = { let f = self.player.forward(); Vec2::new(f.x, f.z).normalize_or_zero() };
+        self.nightlife.update(self.player.pos, self.player.vel, facing, self.day_time, dt);
+        self.boats.update(self.player.pos, self.day_time, self.weather.rain, dt);
+        // The lighthouse keepers watch for anything moving: boats, and the car
+        let mut movers: Vec<Vec3> = self.boats.afloat().collect();
+        if self.player.speed.abs() > 4.0 {
+            movers.push(self.player.pos);
+        }
+        self.keepers.update(self.camera.pos, &movers, dt);
+        // Townsfolk keep an eye on the traffic
+        let mut traffic: Vec<(Vec3, Vec3)> = vec![(self.player.pos, self.player.vel)];
+        traffic.extend(self.cars.iter().map(|c| &c.physics).filter(|c| c.pos.distance(self.player.pos) < 700.0).map(|c| (c.pos, c.vel)));
+        // The racers keep the gaps; walkers and cyclists mind the everyday traffic too
+        let cars_only = traffic.clone();
+        traffic.extend(self.road_traffic.as_traffic().into_iter().map(|(p, v, _)| (p, v)));
+        self.townsfolk.update(self.player.pos, &traffic, self.day, self.day_time, self.weather.rain, dt);
+        self.picnics.update(self.player.pos, self.day_time, self.weather.rain);
+        self.travellers.update(self.player.pos, &traffic, self.day_time, self.weather.rain, dt);
+        let works = roadworks::today(self.day);
+        self.road_traffic.update(self.player.pos, &cars_only, &self.townsfolk, &works, self.wind_time, self.day_time, dt);
+        machines::update(&mut self.particles, self.player.pos, self.day_time, self.wind_time, dt);
+        self.smoke.update(&mut self.particles, self.camera.pos, self.day_time, dt);
+        self.camps.update(&mut self.particles, self.camera.pos, self.day_time, self.weather.rain, dt);
+        self.aloft.update(&mut self.particles, self.player.pos, self.day_time, self.weather.rain, dt);
 
         if let Some(a) = self.audio() {
             a.set_speed(self.player.speed);
@@ -1001,6 +1124,7 @@ impl Stage {
             }
         }
         self.train_sounds();
+        self.world_sounds(dt);
         self.acoustics(dt);
         self.celebrate(dt);
         self.raceday.follow(self.player.pos, self.player.heading(), dt);
@@ -1425,6 +1549,38 @@ impl Stage {
                 for car in &mut self.cars {
                     collisions::car_vs_moving(&mut car.physics, &solids);
                 }
+            }
+        }
+
+        // The everyday traffic: solid to everyone, and stops when hit
+        let vehicles = self.road_traffic.solids();
+        if !vehicles.is_empty() {
+            if let Some(hit) = collisions::car_vs_moving(&mut self.player, &vehicles) {
+                if hit.impact_speed > 3.0 {
+                    self.sound_at(audio::Sound::Crunch, (hit.impact_speed / 25.0).min(1.2), hit.point);
+                    self.particles.burst(hit.point, [0.6, 0.58, 0.55], 8, 6.0);
+                    self.road_traffic.shunt(hit.point);
+                }
+            }
+            for car in self.cars.iter_mut().filter(|c| c.physics.pos.distance_squared(self.player.pos) < 900.0 * 900.0) {
+                if collisions::car_vs_moving(&mut car.physics, &vehicles).is_some_and(|h| h.impact_speed > 3.0) {
+                    self.road_traffic.shunt(car.physics.pos);
+                }
+            }
+        }
+
+        // The road works' barriers and digger
+        let mut works = roadworks::solids(self.day, self.player.pos);
+        works.extend(breakdowns::solids(self.day, self.day_time, self.player.pos));
+        works.extend(self.livestock.solids(self.player.pos));
+        if !works.is_empty() {
+            if let Some(hit) = collisions::car_vs_moving(&mut self.player, &works) {
+                if hit.impact_speed > 3.0 {
+                    self.sound_at(audio::Sound::Clang, (hit.impact_speed / 25.0).min(1.2), hit.point);
+                }
+            }
+            for car in self.cars.iter_mut().filter(|c| c.physics.pos.distance_squared(self.player.pos) < 500.0 * 500.0) {
+                collisions::car_vs_moving(&mut car.physics, &works);
             }
         }
 

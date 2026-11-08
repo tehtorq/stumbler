@@ -12,6 +12,17 @@ use crate::terrain::{self, terrain_height, WATER_LEVEL};
 
 /// How many of each are kept around the player.
 const DEER_HERDS: usize = 4;
+/// Deer are out most at dawn and dusk.
+fn deer_herds(clock: f32) -> usize {
+    let h = clock * 24.0;
+    if (5.0..8.0).contains(&h) || (17.5..20.5).contains(&h) {
+        DEER_HERDS * 2
+    } else if (8.0..17.5).contains(&h) {
+        DEER_HERDS - 1
+    } else {
+        2
+    }
+}
 const RABBITS: usize = 10;
 const BUTTERFLIES: usize = 14;
 /// Spawn between these distances from the player; forget beyond the last.
@@ -56,6 +67,8 @@ struct Animal {
 
 pub struct Wildlife {
     animals: Vec<Animal>,
+    /// How many deer herds should be about at this hour.
+    herds: usize,
     rng: u32,
     next_herd: u32,
     /// Spawn ring (dev aid STUMBLER_WILDLIFE_CLOSE=1 brings it in for screenshots).
@@ -65,7 +78,7 @@ pub struct Wildlife {
 impl Wildlife {
     pub fn new(seed: u32) -> Self {
         let close = std::env::var_os("STUMBLER_WILDLIFE_CLOSE").is_some();
-        Self { animals: Vec::new(), rng: seed | 1, next_herd: 1, ring: if close { (35.0, 70.0) } else { (SPAWN_NEAR, SPAWN_FAR) } }
+        Self { animals: Vec::new(), herds: DEER_HERDS, rng: seed | 1, next_herd: 1, ring: if close { (35.0, 70.0) } else { (SPAWN_NEAR, SPAWN_FAR) } }
     }
 
     fn rand(&mut self) -> f32 {
@@ -75,8 +88,10 @@ impl Wildlife {
         (self.rng & 0xffffff) as f32 / 0x1000000 as f32
     }
 
-    pub fn update(&mut self, player: Vec3, player_vel: Vec3, dt: f32) {
+    /// `clock` is the time of day (0..1 from midnight).
+    pub fn update(&mut self, player: Vec3, player_vel: Vec3, clock: f32, dt: f32) {
         let me = Vec2::new(player.x, player.z);
+        self.herds = deer_herds(clock);
         let speed = Vec2::new(player_vel.x, player_vel.z).length();
         self.animals.retain(|a| a.pos.distance(me) < FORGET);
         self.spawn(me);
@@ -115,7 +130,7 @@ impl Wildlife {
             let p = me + Vec2::new(a.cos(), a.sin()) * d;
             let Some(habitat) = habitat(p) else { continue };
             let herds = self.animals.iter().filter(|a| matches!(a.species, Species::Deer { .. })).map(|a| a.herd).collect::<std::collections::HashSet<_>>().len();
-            if habitat.deer && herds < DEER_HERDS {
+            if habitat.deer && herds < self.herds {
                 let herd = self.next_herd;
                 self.next_herd += 1;
                 let n = 2 + (self.rand() * 4.0) as usize;

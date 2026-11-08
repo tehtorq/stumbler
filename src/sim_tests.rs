@@ -1886,3 +1886,466 @@ fn race_finish_sweep() {
         println!("{name}: {} failed {failed:?}; per race {:.1} knocks, {:.1}s off road", failed.len(), knocks as f32 / runs as f32, off / runs as f32);
     }
 }
+
+/// Piers go out over water from dry land and leave room for their boats;
+/// anglers stand on the bank, facing the water.
+#[test]
+fn piers_reach_out_over_the_water() {
+    network();
+    let start = std::time::Instant::now();
+    let h = crate::harbour::get();
+    println!("{} piers, {} anglers, {} moorings, sited in {:.2}s", h.piers.len(), h.anglers.len(), h.moorings.len(), start.elapsed().as_secs_f32());
+    for p in &h.piers {
+        let town = crate::towns::all().iter().map(|t| t.centre.distance(p.root)).fold(f32::MAX, f32::min);
+        println!("  pier at {:6.0} {:6.0} heading {:5.2} {:5.2}, {:3.0} long, {:5.0} from a town", p.root.x, p.root.y, p.dir.x, p.dir.y, p.length, town);
+    }
+    assert!(h.piers.len() >= 10, "only {} piers", h.piers.len());
+    assert!(h.anglers.len() >= 30, "only {} anglers", h.anglers.len());
+    for p in &h.piers {
+        assert!(terrain::raw_height(p.root.x, p.root.y) > terrain::WATER_LEVEL);
+        let end = p.root + p.dir * (p.length - 2.0);
+        assert!(terrain::raw_height(end.x, end.y) < terrain::WATER_LEVEL - 2.0);
+    }
+    for a in &h.anglers {
+        assert!(terrain::raw_height(a.pos.x, a.pos.y) > terrain::WATER_LEVEL);
+        let ahead = a.pos + a.facing * 13.0;
+        assert!(terrain::raw_height(ahead.x, ahead.y) < terrain::WATER_LEVEL);
+    }
+    for m in &h.moorings {
+        assert!(terrain::raw_height(m.pos.x, m.pos.y) < terrain::WATER_LEVEL - 1.0);
+    }
+}
+
+/// Boats fill the water round a pier and keep to it as they sail.
+#[test]
+fn boats_keep_to_open_water() {
+    network();
+    let h = crate::harbour::get();
+    let pier = &h.piers[0];
+    let start = pier.root + pier.dir * 300.0;
+    let mut boats = crate::boats::Boats::new(7);
+    let me = Vec3::new(start.x, 0.0, start.y);
+    boats.update(me, 0.5, 0.0, 0.016);
+    let (count, _) = boats.positions().fold((0, ()), |(n, _), _| (n + 1, ()));
+    assert!(count > 0, "no boats near {start}");
+    for _ in 0..(120.0 / 0.05) as usize {
+        boats.update(me, 0.5, 0.0, 0.05);
+    }
+    for p in boats.positions() {
+        assert!(terrain::raw_height(p.x, p.y) < terrain::WATER_LEVEL - 1.0, "a boat ran aground at {p}");
+    }
+    let t0 = std::time::Instant::now();
+    let mut tris = 0;
+    for k in 0..100 {
+        let ((_, i), _) = boats.build_mesh(me, k as f32 * 0.016);
+        tris = i.len() / 3;
+    }
+    println!("{count} boats, still afloat after two minutes; mesh {:.3} ms, {tris} triangles", t0.elapsed().as_secs_f32() * 10.0);
+}
+
+/// Dev aid: where to look at anglers and moorings.
+#[test]
+#[ignore]
+fn harbour_report() {
+    network();
+    let h = crate::harbour::get();
+    for a in h.anglers.iter().take(8) {
+        println!("angler at {:6.0} {:6.0} facing {:5.2} {:5.2}", a.pos.x, a.pos.y, a.facing.x, a.facing.y);
+    }
+    for m in h.moorings.iter().take(12) {
+        println!("{:?} at {:6.0} {:6.0}", m.craft, m.pos.x, m.pos.y);
+    }
+}
+
+/// A lighthouse sweeps the water, and when a boat moves near its beam it
+/// follows it for a while before going back to scanning.
+#[test]
+fn lighthouses_follow_what_moves() {
+    network();
+    let l = crate::landmarks::all().iter().find(|l| l.kind == crate::landmarks::Kind::Lighthouse).expect("a lighthouse");
+    let cam = Vec3::new(l.pos.x, 0.0, l.pos.y);
+    let mut keepers = crate::machinery::Keepers::default();
+    keepers.update(cam, &[], 0.1);
+    let start = keepers.aims()[0];
+    // It scans: the beam wanders over the water
+    let mut moved = 0.0f32;
+    for _ in 0..300 {
+        keepers.update(cam, &[], 0.1);
+        moved = moved.max(keepers.aims()[0].distance(start));
+    }
+    assert!(moved > 60.0, "the beam stayed put ({moved:.0})");
+    // A boat right where it's looking, sailing across: it locks on
+    let aim = keepers.aims()[0];
+    let mut boat = aim;
+    let mut near = 0;
+    for k in 0..80 {
+        boat += Vec3::new(1.0, 0.0, 0.5);
+        keepers.update(cam, &[boat], 0.1);
+        if k > 30 && Vec2::new(keepers.aims()[0].x - boat.x, keepers.aims()[0].z - boat.z).length() < 15.0 {
+            near += 1;
+        }
+    }
+    assert!(near > 30, "only on the boat {near} of 50 frames");
+}
+
+/// Townsfolk keep to the pavements and the square, use the zebra crossing,
+/// and get out of the way of a car driven at them.
+#[test]
+fn townsfolk_mind_the_traffic() {
+    network();
+    let town = &crate::towns::all()[0];
+    let me = Vec3::new(town.centre.x, 0.0, town.centre.y);
+    let mut folk = crate::townsfolk::Townsfolk::default();
+    let dt = 0.05;
+    let mut crossed = 0;
+    let mut was_crossing = vec![false; 64];
+    for _ in 0..(240.0 / dt) as usize {
+        folk.update(me, &[], 0, 0.5, 0.0, dt);
+        for (k, (at, crossing, _, ok)) in folk.report().into_iter().enumerate() {
+            assert!(ok || crossing, "someone wandered off to {at}");
+            if was_crossing[k] && !crossing {
+                crossed += 1;
+            }
+            was_crossing[k] = crossing;
+        }
+    }
+    let count = folk.report().len();
+    println!("{count} townsfolk in {}, {crossed} crossings in four minutes", town.name);
+    let (a, b) = (town.world(crate::towns::CROSSING + 30.0, 0.0), town.world(crate::towns::CROSSING, 0.0));
+    println!("view from {a} toward {b}, yaw {:.0}", (-(b - a).x).atan2(-(b - a).y).to_degrees());
+    assert!(count >= 15);
+    assert!(crossed >= 2, "only {crossed} crossed");
+    // A car along the pavement, through the middle of the street
+    let side = folk.report().iter().filter(|r| r.0.y.abs() > crate::towns::KERB).map(|r| r.0.y.signum()).next().unwrap_or(1.0);
+    let o = side * (crate::towns::KERB + 3.0);
+    let mut fled = 0;
+    let mut s = -crate::towns::HALF_LEN;
+    while s < crate::towns::HALF_LEN {
+        let p = town.world(s, o);
+        let ahead = town.world(s + 1.0, o);
+        let vel = (ahead - p).normalize() * 15.0;
+        let car = Vec3::new(p.x, 0.0, p.y);
+        folk.update(me, &[(car, Vec3::new(vel.x, 0.0, vel.y))], 0, 0.5, 0.0, dt);
+        fled = fled.max(folk.report().iter().filter(|r| r.2).count());
+        s += 15.0 * dt;
+    }
+    println!("{fled} ran from the car at once");
+    assert!(fled >= 1);
+}
+
+/// Everything is in proportion to the car (a unit is about half a metre):
+/// a person stands about two thirds of its wheelbase, a storey is taller
+/// than a person, and a yacht is twice the car's length.
+#[test]
+fn people_and_buildings_are_in_scale_with_the_car() {
+    let mut b = crate::props::Builder::default();
+    crate::venue::person(&mut b, Vec3::ZERO, Vec2::Y, 1.0, 0.0);
+    let top = b.crowd_verts.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+    let wheelbase = crate::physics::WHEELBASE;
+    let car_length = 9.5;
+    println!("person {top:.2} tall, wheelbase {wheelbase:.2} (real 1.75 m on 2.6 m: 0.67)");
+    assert!((0.55..0.8).contains(&(top / wheelbase)), "a person is {:.2} wheelbases tall", top / wheelbase);
+    let storey = 3.8 * crate::props::BUILDING_TALL;
+    assert!(storey > top * 1.5, "a storey ({storey:.1}) should be well over head height ({top:.1})");
+    let (yacht, _) = crate::boats::size(crate::harbour::Craft::Yacht);
+    assert!(yacht > car_length * 1.8, "a yacht ({yacht}) is barely longer than the car");
+}
+
+/// The world keeps hours: pubs fill in the evening and the streets empty
+/// in the small hours; fishing boats are out at dawn, yachts only by day.
+#[test]
+fn the_world_keeps_hours() {
+    network();
+    let town = &crate::towns::all()[0];
+    let me = Vec3::new(town.centre.x, 0.0, town.centre.y);
+    let count = |clock: f32| {
+        let mut folk = crate::townsfolk::Townsfolk::default();
+        for _ in 0..20 {
+            folk.update(me, &[], 0, clock, 0.0, 0.05);
+        }
+        folk.report().len()
+    };
+    let (noon, evening, small_hours) = (count(0.5), count(20.0 / 24.0), count(3.0 / 24.0));
+    println!("{} in {}: {noon} at noon, {evening} at eight in the evening, {small_hours} at three in the morning", "townsfolk", town.name);
+    assert!(small_hours * 3 < noon, "the small hours should be quiet");
+    let pubs = town.pubs().len();
+    if pubs > 0 {
+        assert!(evening > small_hours + pubs * 2, "the pubs should be busy in the evening");
+    }
+}
+
+/// Lay-bys sit off the road on level ground, and every picnic spot has
+/// somewhere to park.
+#[test]
+fn laybys_and_picnic_spots() {
+    network();
+    let t0 = std::time::Instant::now();
+    let spots = crate::picnics::spots();
+    let laybys = spots.iter().filter(|s| s.place == crate::picnics::Place::Layby).count();
+    println!("{} picnic spots ({laybys} lay-bys) in {:.2}s", spots.len(), t0.elapsed().as_secs_f32());
+    for s in spots.iter().take(3) {
+        let at = s.park - s.park_dir * 30.0 + s.out * 6.0;
+        let yaw = (-(s.picnic - at).x).atan2(-(s.picnic - at).y).to_degrees();
+        println!("  {:?}: STUMBLER_AT={:.0},{:.0},{:.0}", s.place, at.x, at.y, yaw);
+    }
+    assert!(laybys >= 10, "only {laybys} lay-bys");
+    let net = network();
+    for s in spots {
+        assert!(terrain::raw_height(s.picnic.x, s.picnic.y) > terrain::WATER_LEVEL, "a picnic in the water at {}", s.picnic);
+        if s.place == crate::picnics::Place::Layby {
+            let road = net.nearest(s.edge.x, s.edge.y).expect("a lay-by by a road");
+            assert!(road.dist < road.half_width() + 2.0, "a lay-by {:.0} from its road", road.dist);
+        }
+    }
+}
+
+/// Cyclists keep to the roads and pull over for a car coming up behind;
+/// walkers keep to the trails.
+#[test]
+fn cyclists_and_walkers_keep_to_their_ways() {
+    let net = network();
+    let road = net.paths.iter().find(|p| p.kind == crate::road::PathKind::Road).unwrap();
+    let p = road.points[road.points.len() / 2];
+    let me = Vec3::new(p.x, 0.0, p.y);
+    let mut folk = crate::travellers::Travellers::default();
+    for _ in 0..400 {
+        folk.update(me, &[], 0.5, 0.0, 0.05);
+    }
+    let report = folk.report();
+    let riders = report.iter().filter(|r| r.0).count();
+    println!("{} out: {riders} cyclists, {} walkers", report.len(), report.len() - riders);
+    assert!(riders > 0 && report.len() > riders, "both cyclists and walkers should be out by day");
+    for (cyclist, at, off, hw) in &report {
+        assert!(off.abs() < hw + 8.0, "a {} strayed {off:.1} from the centreline at {at}", if *cyclist { "cyclist" } else { "walker" });
+    }
+    // A car right behind each cyclist: they pull over onto the verge
+    let cars: Vec<(Vec3, Vec3)> = report.iter().filter(|r| r.0).map(|r| (Vec3::new(r.1.x + 25.0, 0.0, r.1.y), Vec3::new(-20.0, 0.0, 0.0))).collect();
+    for _ in 0..60 {
+        folk.update(me, &cars, 0.5, 0.0, 0.05);
+    }
+    let pulled = folk.report().iter().filter(|r| r.0 && r.2 > r.3).count();
+    println!("{pulled} pulled over");
+    assert!(pulled > 0);
+    // Nobody about in the dead of night
+    let mut night = crate::travellers::Travellers::default();
+    for _ in 0..100 {
+        night.update(me, &[], 0.1, 0.0, 0.05);
+    }
+    assert!(night.report().is_empty());
+}
+
+/// In the rain the townsfolk thin out, boats make for the piers, the
+/// anglers without an umbrella pack up, and nobody picnics.
+#[test]
+fn the_world_shelters_from_the_rain() {
+    network();
+    let town = &crate::towns::all()[0];
+    let me = Vec3::new(town.centre.x, 0.0, town.centre.y);
+    let folk = |rain: f32| {
+        let mut f = crate::townsfolk::Townsfolk::default();
+        for _ in 0..20 {
+            f.update(me, &[], 0, 0.5, rain, 0.05);
+        }
+        f.report().len()
+    };
+    let (dry, wet) = (folk(0.0), folk(0.9));
+    println!("townsfolk: {dry} in the dry, {wet} in the rain");
+    assert!(wet * 3 < dry * 2);
+    // Boats near the first pier turn for home
+    let pier = &crate::harbour::get().piers[0];
+    let sea = pier.root + pier.dir * 300.0;
+    let at_sea = Vec3::new(sea.x, 0.0, sea.y);
+    let mut boats = crate::boats::Boats::new(3);
+    for _ in 0..100 {
+        boats.update(at_sea, 0.5, 0.0, 0.05);
+    }
+    boats.update(at_sea, 0.5, 0.9, 0.05);
+    println!("{} boats making for a pier", boats.homeward());
+    assert!(boats.homeward() > 0);
+    // Anglers by the pier: fewer out in the rain
+    let count = |rain: f32| crate::harbour::Anglers::default().refresh(Vec3::new(pier.root.x, 0.0, pier.root.y), 0.5, rain).map_or(0, |(v, _)| v.len());
+    let (dry, wet) = (count(0.0), count(0.9));
+    println!("anglers' mesh: {dry} vertices in the dry, {wet} in the rain");
+    assert!(wet < dry);
+    // Nobody picnics in the rain
+    let spot = &crate::picnics::spots()[0];
+    let mut picnics = crate::picnics::Picnics::default();
+    picnics.update(Vec3::new(spot.picnic.x, 0.0, spot.picnic.y), 0.55, 0.9);
+    assert_eq!(picnics.cars().count(), 0);
+}
+
+/// Everyday traffic keeps to the road and its lane, and keeps its distance.
+#[test]
+fn everyday_traffic_keeps_its_distance() {
+    let net = network();
+    let road = net.paths.iter().find(|p| p.kind == crate::road::PathKind::Road).unwrap();
+    let p = road.points[road.points.len() / 3];
+    let me = Vec3::new(p.x, 0.0, p.y);
+    let folk = crate::townsfolk::Townsfolk::default();
+    let mut traffic = crate::traffic::Traffic::default();
+    let mut seen = 0;
+    for step in 0..2400 {
+        traffic.update(me, &[], &folk, &[], 0.0, 0.5, 0.05);
+        let cars = traffic.as_traffic();
+        seen = seen.max(cars.len());
+        if step % 20 != 0 {
+            continue;
+        }
+        for (i, (a, va, _)) in cars.iter().enumerate() {
+            let s = net.nearest(a.x, a.z).expect("on a road");
+            assert!(s.dist < s.half_width(), "a vehicle {:.0} off the centreline at {a}", s.dist);
+            for (b, vb, _) in cars.iter().skip(i + 1) {
+                if va.dot(*vb) > 0.0 {
+                    assert!(a.distance(*b) > 6.0, "two vehicles ran into each other at {a}");
+                }
+            }
+        }
+    }
+    println!("up to {seen} vehicles about");
+    assert!(seen >= 4);
+}
+
+/// Ducks, swans and herons turn up along a shore, and keep to the water.
+#[test]
+fn waterfowl_on_the_shore() {
+    network();
+    let me = Vec3::new(2390.0, 0.0, 4366.0);
+    let mut birds = crate::waterfowl::Waterfowl::default();
+    for _ in 0..600 {
+        birds.update(me, Vec3::ZERO, 0.05);
+    }
+    let (ducks, swans, herons) = birds.census();
+    println!("{ducks} ducks, {swans} swans, {herons} herons");
+    assert!(ducks + swans + herons > 0);
+}
+
+/// Dev aid: where Rookby's café and pub tables are, to go and look.
+#[test]
+#[ignore]
+fn table_report() {
+    network();
+    let town = &crate::towns::all()[0];
+    let eye = town.world(-crate::towns::SQUARE_HALF - 30.0, -town.square * 6.0);
+    let look = town.world(-10.0, town.square * (crate::towns::FRONT + 12.0)) - eye;
+    println!("square: STUMBLER_AT={:.1},{:.1},{:.0}", eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+    for (l, pub_, parasol) in town.tables() {
+        let p = town.world(l.x, l.y);
+        let eye = town.world(l.x - 25.0, l.y.signum() * 10.0);
+        let look = p - eye;
+        println!("{} table at {p}: STUMBLER_AT={:.1},{:.1},{:.0} (parasol {parasol})", if pub_ { "pub" } else { "cafe" }, eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+    }
+}
+
+/// Campsites are pitched off the trails on dry, level ground.
+#[test]
+fn campsites_off_the_trails() {
+    network();
+    let camps = crate::camps::all();
+    println!("{} campsites", camps.len());
+    for c in camps.iter().take(2) {
+        let eye = c.centre + c.facing * 30.0;
+        let look = c.centre - eye;
+        println!("  camp at {}: STUMBLER_AT={:.0},{:.0},{:.0}", c.centre, eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+    }
+    assert!(camps.len() >= 8, "only {} campsites", camps.len());
+    for c in camps {
+        assert!(terrain::raw_height(c.centre.x, c.centre.y) > terrain::WATER_LEVEL, "a camp in the water");
+    }
+}
+
+/// Road works go up somewhere new each day.
+#[test]
+fn road_works_move_day_to_day() {
+    let net = network();
+    let (a, b) = (crate::roadworks::today(0), crate::roadworks::today(1));
+    println!("{} works on day 0, {} on day 1", a.len(), b.len());
+    assert!(!a.is_empty() && !b.is_empty());
+    let same = a.iter().filter(|w| b.iter().any(|v| v.path == w.path && v.from == w.from)).count();
+    assert!(same < a.len(), "the same works two days running");
+    let w = a[0];
+    let path = &net.paths[w.path];
+    let i = w.from as usize;
+    let eye = path.points[i] - path.tangent(i) * 60.0 - path.tangent(i).perp() * 30.0;
+    let look = path.points[i + 13] - eye;
+    println!("works at {}: STUMBLER_AT={:.0},{:.0},{:.0}", path.points[i], eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+}
+
+/// Cars break down on the verges, off the carriageway.
+#[test]
+fn breakdowns_on_the_verge() {
+    let net = network();
+    let list = crate::breakdowns::report(0, 0.5);
+    println!("{} breakdowns at noon on day 0", list.len());
+    assert!(!list.is_empty());
+    for (p, d, u) in list.iter().take(2) {
+        let eye = Vec2::new(p.x, p.z) - *d * 40.0 + d.perp() * 15.0;
+        let look = Vec2::new(p.x, p.z) - eye;
+        println!("  at {p} ({:.0}% through): STUMBLER_AT={:.0},{:.0},{:.0}", u * 100.0, eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+    }
+    for (p, ..) in &list {
+        let s = net.nearest(p.x, p.z).unwrap();
+        assert!(s.dist > s.half_width(), "a breakdown on the carriageway");
+    }
+}
+
+/// The post van does its round: out in the morning, it calls at the farm
+/// gates and pillar boxes it comes to.
+#[test]
+fn the_post_van_calls() {
+    network();
+    let farm = &crate::farms::all()[0];
+    let me = Vec3::new(farm.gate.x, 0.0, farm.gate.y);
+    let folk = crate::townsfolk::Townsfolk::default();
+    let mut traffic = crate::traffic::Traffic::default();
+    let mut calls = 0;
+    for _ in 0..(600.0 / 0.05) as usize {
+        traffic.update(me, &[], &folk, &[], 0.0, 10.0 / 24.0, 0.05);
+        calls = calls.max(traffic.post_calls());
+    }
+    println!("the post van made {calls} calls");
+    assert!(calls > 0);
+}
+
+/// Some towns hold a market each day, and every town some days.
+#[test]
+fn market_days() {
+    network();
+    let towns = crate::towns::all();
+    let today: Vec<&str> = (0..towns.len()).filter(|&t| crate::market::market_on(t, 0, 0.45)).map(|t| towns[t].name.as_str()).collect();
+    println!("market today in {today:?}");
+    for t in 0..towns.len() {
+        assert!((0..20).any(|d| crate::market::market_on(t, d, 0.45)), "{} never holds a market", towns[t].name);
+        assert!(!crate::market::market_on(t, 0, 0.8), "a market in the evening");
+    }
+    if let Some(t) = (0..towns.len()).find(|&t| crate::market::market_on(t, 0, 0.45)) {
+        let town = &towns[t];
+        let l = crate::market::stalls(town)[1].0;
+        let eye = town.world(l.x - 45.0, -town.square * 4.0);
+        let look = town.world(l.x, l.y) - eye;
+        println!("  {}: STUMBLER_AT={:.1},{:.1},{:.0}", town.name, eye.x, eye.y, (-look.x).atan2(-look.y).to_degrees());
+    }
+}
+
+/// Flocks and herds keep to their fields; sheep run from a car driven past.
+#[test]
+fn livestock_keep_to_their_fields() {
+    network();
+    let (farm, field) = crate::farms::all().iter()
+        .find_map(|f| f.fields.iter().find(|x| x.crop == crate::farms::Crop::Pasture).map(|x| (f, x))).unwrap();
+    let mut stock = crate::livestock::Livestock::default();
+    let mut ran = 0;
+    // Drive along the field's edge, quickly
+    for k in 0..400 {
+        let along = -field.half.x + (k as f32 / 400.0) * field.half.x * 2.0;
+        let p = field.centre + farm.along * along - farm.out * (field.half.y + 10.0);
+        let vel = Vec3::new(farm.along.x, 0.0, farm.along.y) * 30.0;
+        stock.update(Vec3::new(p.x, 0.0, p.y), vel, 0.5, 0.05);
+        let report = stock.report();
+        ran = ran.max(report.iter().filter(|r| r.2).count());
+        for (at, bound, ..) in report {
+            assert!(at.x.abs() <= bound.x + 0.01 && at.y.abs() <= bound.y + 0.01, "an animal got out of its field: {at} in {bound}");
+        }
+    }
+    println!("{} animals, up to {ran} running at once", stock.report().len());
+    assert!(!stock.report().is_empty());
+}

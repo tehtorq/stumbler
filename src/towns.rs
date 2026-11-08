@@ -10,28 +10,41 @@ use std::sync::OnceLock;
 use glam::{Vec2, Vec3, vec3};
 
 use crate::landmarks::{self, Kind};
-use crate::props::{hash, Builder};
+use crate::props::{hash, Builder, BUILDING_TALL};
 use crate::road::{PathKind, RoadNetwork, RoadPath, Structure, ROAD_HALF_WIDTH, SAMPLE_SPACING};
 use crate::roadside::{lettering, text_units};
 use crate::terrain::{self, terrain_height, WATER_LEVEL};
 
 /// Half the length of a town's main street.
 pub const HALF_LEN: f32 = 150.0;
+/// Café and pub tables stand this far out, this far apart.
+pub(crate) const TABLE_OUT: f32 = FRONT - 2.4;
+const TABLE_EVERY: f32 = 5.0;
+/// Chairs either side of a table, along the street.
+pub(crate) const CHAIR_OFF: f32 = 1.5;
+/// Folk walking the pavement keep this far from the fronts (the tables
+/// stand on the inner half).
+pub(crate) const STROLL_OUT: f32 = FRONT - 4.2;
 /// The pavement starts here, out from the street's centreline...
-const KERB: f32 = ROAD_HALF_WIDTH + 0.5;
+pub(crate) const KERB: f32 = ROAD_HALF_WIDTH + 0.5;
 /// ...and the buildings stand here, behind it.
-const FRONT: f32 = ROAD_HALF_WIDTH + 8.0;
+pub(crate) const FRONT: f32 = ROAD_HALF_WIDTH + 8.0;
 /// Deepest a building goes back from its front.
 const DEEPEST: f32 = 18.0;
 /// The square: half its width along the street, and how far back it goes.
-const SQUARE_HALF: f32 = 26.0;
-const SQUARE_DEPTH: f32 = 46.0;
+pub(crate) const SQUARE_HALF: f32 = 26.0;
+pub(crate) const SQUARE_DEPTH: f32 = 46.0;
+/// The zebra crossing, this far along the street from the middle.
+pub(crate) const CROSSING: f32 = SQUARE_HALF + 9.0;
+/// The benches round the fountain: along the street, and the share of the
+/// way back across the square.
+pub(crate) const BENCHES: [(f32, f32); 4] = [(-12.0, 0.3), (12.0, 0.3), (-12.0, 0.7), (12.0, 0.7)];
 /// The town hall's half width and depth, behind the square.
 const HALL_HALF: Vec2 = Vec2::new(18.0, 9.0);
 /// Centreline kept either side of the middle: the street, then the signs.
 const REACH: f32 = HALF_LEN + 40.0;
 /// Pavements and the square stand this far above the ground.
-const PAVE: f32 = 0.25;
+pub(crate) const PAVE: f32 = 0.25;
 /// Lamps stand this far apart along each side.
 const LAMP_EVERY: f32 = 32.0;
 const LAMP_HEIGHT: f32 = 8.0;
@@ -96,7 +109,7 @@ impl Town {
 
     /// The centreline `s` along the street from the middle, and the unit
     /// normal to its left there.
-    fn frame(&self, s: f32) -> (Vec2, Vec2) {
+    pub(crate) fn frame(&self, s: f32) -> (Vec2, Vec2) {
         let f = (s / SAMPLE_SPACING + self.mid()).clamp(0.0, (self.points.len() - 1) as f32);
         let k = (f.floor() as usize).min(self.points.len() - 2);
         let t = f - k as f32;
@@ -137,6 +150,35 @@ impl Town {
         let back = l.y * self.square;
         let square = l.x.abs() < SQUARE_HALF.max(HALL_HALF.x) + 4.0 + margin && back > 0.0 && back < FRONT + SQUARE_DEPTH + HALL_HALF.y * 2.0 + 6.0 + margin;
         street || square
+    }
+
+    /// Tables out on the pavement in front of the cafés and pubs: each
+    /// one's place (along, out) in the town's frame, whether it's a pub's,
+    /// and whether it has a parasol.
+    pub(crate) fn tables(&self) -> Vec<(Vec2, bool, bool)> {
+        let mut list = Vec::new();
+        for lot in &self.lots {
+            let (cafe, pub_) = match lot.usage {
+                Use::Shop(n) => (matches!(n, "CAFE" | "DINER" | "BAKERY" | "ICE CREAM"), false),
+                Use::Pub(_) => (false, true),
+                Use::House => (false, false),
+            };
+            if !cafe && !pub_ {
+                continue;
+            }
+            let count = (((lot.half_w * 2.0 - 3.0) / TABLE_EVERY).floor() as i32).clamp(1, 3);
+            for k in 0..count {
+                let s = lot.s + (k as f32 - (count - 1) as f32 * 0.5) * TABLE_EVERY;
+                list.push((Vec2::new(s, lot.side * TABLE_OUT), pub_, cafe && hash(lot.seed, 40.0 + k as f32) < 0.7));
+            }
+        }
+        list
+    }
+
+    /// The pubs along the street: where each front's middle is (along the
+    /// street), which side it's on, and half its width.
+    pub(crate) fn pubs(&self) -> Vec<(f32, f32, f32)> {
+        self.lots.iter().filter(|l| matches!(l.usage, Use::Pub(_))).map(|l| (l.s, l.side, l.half_w)).collect()
     }
 
     /// Trees standing in the square.
@@ -415,11 +457,45 @@ pub fn build(b: &mut Builder, inside: &impl Fn(Vec2) -> bool) {
         }
         square(b, town, inside);
         street_furniture(b, town, inside);
-        townsfolk(b, town, inside);
         for end in [-1.0, 1.0] {
             entry_sign(b, town, end, inside);
         }
     }
+}
+
+/// The top of every chimney in the towns (as `building` puts them up), with
+/// a seed for whoever lives there.
+pub(crate) fn chimneys() -> Vec<(Vec3, f32)> {
+    let mut list = Vec::new();
+    for town in all().iter().filter(|t| t.style != Style::Adobe) {
+        for lot in &town.lots {
+            let (p, along, back, _) = lot_frame(town, lot.s, lot.side);
+            let centre = p + back * (FRONT + lot.depth * 0.5);
+            let (hw, hd) = (lot.half_w, lot.depth * 0.5);
+            let floor = footing_levels(centre, along, back, Vec2::new(hw, hd)).1;
+            let ground_floor = if lot.usage == Use::House { 4.0 } else { 4.6 };
+            let tall = (ground_floor + (lot.storeys - 1) as f32 * 3.8 + 0.6) * BUILDING_TALL;
+            let rise = (2.6 + hash(lot.seed, 14.0) * 2.0) * BUILDING_TALL;
+            let chimney = centre + along * (hw - 1.2) * if hash(lot.seed, 15.0) < 0.5 { 1.0 } else { -1.0 };
+            list.push((vec3(chimney.x, floor + tall + rise + 2.4, chimney.y), lot.seed));
+        }
+    }
+    list
+}
+
+/// Where each town hall's clock bell hangs (up in the tower, as `square`
+/// builds it).
+pub(crate) fn clock_towers() -> Vec<Vec3> {
+    all().iter().map(|town| {
+        let side = town.square;
+        let (p, along, back, _) = lot_frame(town, 0.0, side);
+        let hall_d = SQUARE_DEPTH + HALL_HALF.y + 1.0;
+        let centre = p + back * (FRONT + hall_d);
+        let floor = footing_levels(centre, along, back, HALL_HALF).1;
+        let front = centre - back * HALL_HALF.y;
+        let tower = front + back * 3.5;
+        vec3(tower.x, floor + 25.0 * BUILDING_TALL - 4.0, tower.y)
+    }).collect()
 }
 
 /// Whether the chunk could hold any of the town: tried every so often along it.
@@ -475,11 +551,17 @@ fn pavements(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
 /// Floor level for a building of half extents `half` (along, back) whose
 /// middle is `centre`: on sloping ground it stands at the highest corner on a
 /// stone plinth down to the lowest.
-fn footing(b: &mut Builder, centre: Vec2, along: Vec2, back: Vec2, half: Vec2, yaw: f32) -> f32 {
+/// The lowest ground under a footprint, and the floor level on it.
+fn footing_levels(centre: Vec2, along: Vec2, back: Vec2, half: Vec2) -> (f32, f32) {
     let heights = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)]
         .map(|(a, o)| { let q = centre + along * a * half.x + back * o * half.y; terrain_height(q.x, q.y) });
     let lo = heights.iter().copied().fold(f32::MAX, f32::min);
     let hi = heights.iter().copied().fold(f32::MIN, f32::max) + PAVE;
+    (lo, hi)
+}
+
+fn footing(b: &mut Builder, centre: Vec2, along: Vec2, back: Vec2, half: Vec2, yaw: f32) -> f32 {
+    let (lo, hi) = footing_levels(centre, along, back, half);
     if hi - lo > 0.4 {
         b.block(lift(centre, lo - 0.6), half.y + 0.3, hi - lo + 0.6, half.x + 0.3, yaw, STONE, STONE);
     }
@@ -495,20 +577,46 @@ struct Facade {
 }
 
 impl Facade {
+    /// `y` as laid out: drawn `BUILDING_TALL` times higher.
     fn at(&self, a: f32, y: f32, out: f32) -> Vec3 {
-        self.origin + self.right * a + Vec3::Y * y + self.out * (0.06 + out)
+        self.origin + self.right * a + Vec3::Y * y * BUILDING_TALL + self.out * (0.06 + out)
     }
 
     fn panel(&self, b: &mut Builder, a0: f32, a1: f32, y0: f32, y1: f32, out: f32, color: [f32; 4]) {
         b.quad(self.at(a0, y0, out), self.at(a1, y0, out), self.at(a1, y1, out), self.at(a0, y1, out), color);
     }
 
-    /// A framed window: lit (glowing after dark) or dark glass.
-    fn window(&self, b: &mut Builder, a: f32, y: f32, w: f32, h: f32, lit: bool, frame: [f32; 4]) {
+    /// A framed window in someone's home. Whoever lives there has their own
+    /// hours (`bedtime`, the shader's `home_light`): `late` ones stay up later.
+    fn window(&self, b: &mut Builder, a: f32, y: f32, w: f32, h: f32, late: bool, frame: [f32; 4]) {
         self.panel(b, a - w - 0.15, a + w + 0.15, y - 0.25, y + h + 0.15, 0.0, frame);
-        b.glowing = lit;
-        self.panel(b, a - w, a + w, y, y + h, 0.04, if lit { WINDOW } else { GLASS });
+        let p = self.at(a, y, 0.0);
+        let roll = hash(p.x * 0.73, p.z * 0.37 + y);
+        let bedtime = if late { 0.3 + 0.69 * roll } else { 0.02 + 0.5 * roll };
+        b.glowing = true;
+        self.panel(b, a - w, a + w, y, y + h, 0.04, [WINDOW[0], WINDOW[1], WINDOW[2], bedtime]);
         b.glowing = false;
+        // Life at the window: curtains drawn back, now and then someone
+        // standing there (dark against the light when it's lit), a cat on the sill
+        let roll = |k: f32| hash(p.x * 0.31 + k, p.z * 0.57 + y * 1.7 + k);
+        if roll(1.0) < 0.75 {
+            const CURTAINS: [[f32; 4]; 6] = [[0.7, 0.2, 0.18, 1.0], [0.25, 0.35, 0.6, 1.0], [0.85, 0.8, 0.65, 1.0], [0.3, 0.5, 0.35, 1.0], [0.75, 0.6, 0.3, 1.0], [0.55, 0.3, 0.45, 1.0]];
+            let c = CURTAINS[(roll(2.0) * 6.0) as usize % 6];
+            let drawn = 0.1 + 0.14 * roll(3.0);
+            self.panel(b, a - w, a - w + w * 2.0 * drawn, y, y + h, 0.055, c);
+            self.panel(b, a + w - w * 2.0 * drawn, a + w, y, y + h, 0.055, c);
+            self.panel(b, a - w - 0.05, a + w + 0.05, y + h - 0.12, y + h, 0.06, c);
+        }
+        if roll(4.0) < 0.12 {
+            let dark = [0.12, 0.1, 0.1, 1.0];
+            let x = a + (roll(5.0) - 0.5) * w * 0.6;
+            self.panel(b, x - 0.42, x + 0.42, y, y + 0.55, 0.048, dark);
+            self.panel(b, x - 0.2, x + 0.2, y + 0.58, y + 0.9, 0.048, dark);
+        }
+        if roll(6.0) < 0.06 {
+            let x = a + (roll(7.0) - 0.5) * w;
+            cat(b, self.at(x, y - 0.1, 0.18), self.right, self.out, roll(8.0));
+        }
         // A sill to catch the light
         self.panel(b, a - w - 0.3, a + w + 0.3, y - 0.25, y - 0.1, 0.12, frame);
     }
@@ -544,6 +652,8 @@ fn building(b: &mut Builder, town: &Town, lot: &Lot, inside: &impl Fn(Vec2) -> b
     b.tag("deck");
     let ground_floor = if lot.usage == Use::House { 4.0 } else { 4.6 };
     let height = ground_floor + (lot.storeys - 1) as f32 * 3.8 + 0.6;
+    // As drawn
+    let tall = height * BUILDING_TALL;
     let (wall, roof, trim) = match town.style {
         Style::Plaster => (choose(&PLASTER, hash(seed, 11.0)), choose(&SLATE, hash(seed, 12.0)), FRAME),
         Style::Brick => (choose(&BRICK, hash(seed, 11.0)), choose(&TILE, hash(seed, 12.0)), FRAME),
@@ -551,7 +661,7 @@ fn building(b: &mut Builder, town: &Town, lot: &Lot, inside: &impl Fn(Vec2) -> b
         Style::Adobe => (choose(&ADOBE, hash(seed, 11.0)), choose(&ADOBE, hash(seed, 12.0)), [0.45, 0.3, 0.2, 1.0]),
     };
     let base = lift(centre, floor);
-    b.solid_block(base, hd, height, hw, yaw, wall, wall);
+    b.solid_block(base, hd, tall, hw, yaw, wall, wall);
 
     // As you face the front from the street, your right is along -along
     // when the building is on the left, so follow the roadside signs' rule
@@ -561,21 +671,21 @@ fn building(b: &mut Builder, town: &Town, lot: &Lot, inside: &impl Fn(Vec2) -> b
 
     // The roof: pitched with a chimney, or flat behind a parapet in the desert
     if town.style == Style::Adobe {
-        b.block(base + Vec3::Y * (height - 0.5), hd + 0.2, 0.5, hw + 0.2, yaw, trim, roof);
+        b.block(base + Vec3::Y * (tall - 0.5), hd + 0.2, 0.5, hw + 0.2, yaw, trim, roof);
         // Beam ends poking out under the roofline
         let beams = (hw / 1.6) as i32;
         for k in -beams..=beams {
             face.panel(b, k as f32 * 1.6 - 0.18, k as f32 * 1.6 + 0.18, height - 1.3, height - 0.95, 0.4, [0.4, 0.27, 0.17, 1.0]);
         }
         if hash(seed, 14.0) < 0.35 {
-            let tank = base + Vec3::Y * height + vec3(back.x, 0.0, back.y) * hd * 0.4;
+            let tank = base + Vec3::Y * tall + vec3(back.x, 0.0, back.y) * hd * 0.4;
             b.column(tank, 1.3, 1.3, 2.2, 8, [0.6, 0.62, 0.64, 1.0]);
         }
     } else {
-        let rise = 2.6 + hash(seed, 14.0) * 2.0;
-        b.roof(base + Vec3::Y * height, hd, rise, hw, yaw, roof);
+        let rise = (2.6 + hash(seed, 14.0) * 2.0) * BUILDING_TALL;
+        b.roof(base + Vec3::Y * tall, hd, rise, hw, yaw, roof);
         let chimney = base + vec3(along.x, 0.0, along.y) * (hw - 1.2) * if hash(seed, 15.0) < 0.5 { 1.0 } else { -1.0 };
-        b.block(chimney + Vec3::Y * (height + rise * 0.5), 0.7, rise * 0.5 + 1.6, 0.7, yaw, [0.55, 0.36, 0.3, 1.0], DARK);
+        b.block(chimney + Vec3::Y * (tall + rise * 0.5), 0.8, rise * 0.5 + 2.4, 0.8, yaw, [0.55, 0.36, 0.3, 1.0], DARK);
         // A cornice along the top of the front
         face.panel(b, -hw - 0.1, hw + 0.1, height - 0.45, height - 0.05, 0.15, trim);
     }
@@ -601,7 +711,7 @@ fn building(b: &mut Builder, town: &Town, lot: &Lot, inside: &impl Fn(Vec2) -> b
         for k in 0..across {
             let a = -hw + (k as f32 + 0.5) * 2.0 * hw / across as f32;
             let lit = hash(seed + storey as f32, k as f32 + 20.0) < 0.55;
-            face.window(b, a, y, 0.55, 1.7, lit, trim);
+            face.window(b, a, y, 0.8, 1.7, lit, trim);
         }
     }
 
@@ -636,7 +746,8 @@ fn building(b: &mut Builder, town: &Town, lot: &Lot, inside: &impl Fn(Vec2) -> b
             for a in [-hw * 0.6, hw * 0.6] {
                 if (a - d).abs() > 2.4 {
                     b.glowing = true;
-                    face.panel(b, a - 1.3, a + 1.3, 1.0, 2.9, 0.05, WINDOW);
+                    // Lit until closing time, around eleven
+                    face.panel(b, a - 1.3, a + 1.3, 1.0, 2.9, 0.05, [WINDOW[0], WINDOW[1], WINDOW[2], 0.32]);
                     b.glowing = false;
                 }
             }
@@ -740,7 +851,7 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
     }
 
     // Benches facing it
-    for (s, d) in [(-12.0, 0.3), (12.0, 0.3), (-12.0, 0.7), (12.0, 0.7)] {
+    for (s, d) in BENCHES {
         let p = at(s, SQUARE_DEPTH * d);
         if !inside(p) {
             continue;
@@ -757,9 +868,11 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
         let floor = footing(b, centre, along, back, HALL_HALF, yaw);
         b.tag("deck");
         let base = lift(centre, floor);
+        // Laid out at `height`; drawn `BUILDING_TALL` times higher like the rest
         let height = 11.0;
-        b.solid_block(base, HALL_HALF.y, height, HALL_HALF.x, yaw, STONE, STONE);
-        b.roof(base + Vec3::Y * height, HALL_HALF.y, 3.0, HALL_HALF.x, yaw, choose(&SLATE, hash(town.seed, 21.0)));
+        let tall = height * BUILDING_TALL;
+        b.solid_block(base, HALL_HALF.y, tall, HALL_HALF.x, yaw, STONE, STONE);
+        b.roof(base + Vec3::Y * tall, HALL_HALF.y, 3.0 * BUILDING_TALL, HALL_HALF.x, yaw, choose(&SLATE, hash(town.seed, 21.0)));
         let front = centre - back * HALL_HALF.y;
         let out = -back;
         let face = Facade { origin: lift(front, floor), right: vec3(-out.y, 0.0, out.x), out: vec3(out.x, 0.0, out.y) };
@@ -774,7 +887,7 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
             // A column standing proud between each pair
             let c = face.at(a + 1.75, 0.0, 1.6);
             if a + 1.75 < HALL_HALF.x - 1.0 && (a + 1.75).abs() > 4.0 {
-                b.column(c, 0.45, 0.4, height - 0.7, 8, WHITE);
+                b.column(c, 0.6, 0.55, tall - 0.7 * BUILDING_TALL, 8, WHITE);
             }
         }
         // Steps up to the doors, under the tower
@@ -784,13 +897,13 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
         b.glowing = false;
 
         let tower = lift(front + back * 3.5, floor);
-        let top = 25.0;
+        let top = 25.0 * BUILDING_TALL;
         b.solid_block(tower, 3.5, top, 3.5, yaw, STONE, STONE);
-        b.block(tower + Vec3::Y * (height - 0.2), 3.8, 0.6, 3.8, yaw, WHITE, WHITE);
+        b.block(tower + Vec3::Y * (tall - 0.2), 3.8, 0.6, 3.8, yaw, WHITE, WHITE);
         b.block(tower + Vec3::Y * (top - 0.4), 3.9, 0.6, 3.9, yaw, WHITE, WHITE);
         // A pyramid cap
         let r = glam::Quat::from_rotation_y(yaw);
-        let apex = tower + Vec3::Y * (top + 6.0);
+        let apex = tower + Vec3::Y * (top + 6.0 * BUILDING_TALL);
         let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, z)| tower + Vec3::Y * (top + 0.2) + r * vec3(x * 4.0, 0.0, z * 4.0));
         for k in 0..4 {
             b.tri(corners[k], corners[(k + 1) % 4], apex, choose(&SLATE, hash(town.seed, 22.0)));
@@ -804,7 +917,7 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
             let a = yaw + k as f32 * std::f32::consts::FRAC_PI_2;
             let n = glam::Quat::from_rotation_y(a) * Vec3::X;
             let right = vec3(-n.z, 0.0, n.x);
-            let c = tower + Vec3::Y * (top - 4.0) + n * 3.56;
+            let c = tower + Vec3::Y * (top - 4.5) + n * 3.56;
             b.glowing = true;
             for j in 0..12 {
                 let t0 = std::f32::consts::TAU * j as f32 / 12.0;
@@ -824,17 +937,111 @@ fn square(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
     }
 }
 
+/// A swing's A-frame and top bar, running along `along`.
+fn swing_frame(b: &mut Builder, foot: Vec3, along: Vec2) {
+    let k = crate::props::PERSON_SCALE;
+    let a = vec3(along.x, 0.0, along.y);
+    let out = vec3(-along.y, 0.0, along.x);
+    let steel = [0.25, 0.45, 0.3, 1.0];
+    let top = 2.2 * k;
+    for e in [-1.0, 1.0] {
+        let apex = foot + a * e * 1.8 * k + Vec3::Y * top;
+        for s in [-1.0, 1.0] {
+            b.limb(foot + a * e * 1.8 * k + out * s * 0.9 * k, apex, 0.05 * k, 0.05 * k, 4, 0.0, steel);
+        }
+    }
+    b.limb(foot - a * 1.8 * k + Vec3::Y * top, foot + a * 1.8 * k + Vec3::Y * top, 0.06 * k, 0.06 * k, 4, 0.0, steel);
+}
+
+/// A red pillar box.
+fn pillar_box(b: &mut Builder, foot: Vec3) {
+    let k = crate::props::PERSON_SCALE;
+    let red = [0.78, 0.08, 0.06, 1.0];
+    b.column(foot, 0.27 * k, 0.27 * k, 1.35 * k, 10, red);
+    b.column(foot + Vec3::Y * 1.35 * k, 0.3 * k, 0.24 * k, 0.12 * k, 10, red);
+    b.column(foot, 0.3 * k, 0.3 * k, 0.1 * k, 10, DARK);
+    b.post(foot, 0.3 * k, 1.5 * k);
+}
+
+/// A red telephone box, its door toward `face`, lit inside after dark.
+fn phone_box(b: &mut Builder, foot: Vec3, face: Vec2) {
+    let k = crate::props::PERSON_SCALE;
+    let red = [0.78, 0.08, 0.06, 1.0];
+    let yaw = face.x.atan2(face.y);
+    b.solid_block(foot, 0.5 * k, 2.4 * k, 0.5 * k, yaw, red, red);
+    b.block(foot + Vec3::Y * 2.4 * k, 0.55 * k, 0.12 * k, 0.55 * k, yaw, red, red);
+    // Windows on every side, lit
+    let f = vec3(face.x, 0.0, face.y);
+    let r = vec3(face.y, 0.0, -face.x);
+    b.glowing = true;
+    for (n, s) in [(f, r), (-f, -r), (r, -f), (-r, f)] {
+        let c = foot + n * 0.51 * k + Vec3::Y * 1.5 * k;
+        let (w, h) = (s * 0.34 * k, Vec3::Y * 0.7 * k);
+        b.quad(c - w - h, c + w - h, c + w + h, c - w + h, [1.0, 0.92, 0.7, 1.0]);
+    }
+    b.glowing = false;
+}
+
+/// A cat sat on a windowsill at `at`, looking out (`out`), along `right`.
+fn cat(b: &mut Builder, at: Vec3, right: Vec3, out: Vec3, roll: f32) {
+    const COATS: [[f32; 4]; 4] = [[0.85, 0.5, 0.2, 1.0], [0.08, 0.08, 0.09, 1.0], [0.55, 0.55, 0.55, 1.0], [0.95, 0.94, 0.9, 1.0]];
+    let coat = COATS[(roll * 4.0) as usize % 4];
+    let k = crate::props::PERSON_SCALE;
+    let yaw = (-out.z).atan2(out.x) + std::f32::consts::FRAC_PI_2;
+    b.block(at, 0.09 * k, 0.2 * k, 0.12 * k, yaw, coat, coat);
+    let head = at + Vec3::Y * 0.2 * k + out * 0.05 * k;
+    b.block(head, 0.07 * k, 0.11 * k, 0.07 * k, yaw, coat, coat);
+    for s in [-1.0, 1.0] {
+        let ear = head + Vec3::Y * 0.11 * k + right * s * 0.045 * k;
+        b.tri(ear - right * 0.025 * k, ear + right * 0.025 * k, ear + Vec3::Y * 0.06 * k, coat);
+    }
+    // The tail hanging down over the sill's edge
+    let root = at - out * 0.1 * k + Vec3::Y * 0.03 * k;
+    b.limb(root, root + out * 0.18 * k - Vec3::Y * 0.22 * k + right * 0.06 * k, 0.02 * k, 0.015 * k, 4, 0.0, coat);
+}
+
+/// A café table: a round top on a pedestal, a chair either side along the
+/// street, and maybe a striped parasol.
+fn cafe_table(b: &mut Builder, foot: Vec3, along: Vec2, parasol: bool, seed: f32) {
+    let k = crate::props::PERSON_SCALE;
+    let metal = [0.2, 0.22, 0.24, 1.0];
+    b.column(foot, 0.05 * k, 0.05 * k, 0.72 * k, 6, metal);
+    b.column(foot + Vec3::Y * 0.72 * k, 0.4 * k, 0.4 * k, 0.04 * k, 8, WHITE);
+    let yaw = along.x.atan2(along.y);
+    for s in [-1.0, 1.0] {
+        let c = foot + vec3(along.x, 0.0, along.y) * s * CHAIR_OFF;
+        // Seat at the height the sitters' figures are made for
+        b.block(c, 0.22 * k, 0.6 * k, 0.22 * k, yaw, metal, [0.6, 0.45, 0.3, 1.0]);
+        b.block(c + vec3(along.x, 0.0, along.y) * s * 0.2 * k + Vec3::Y * 0.6 * k, 0.22 * k, 0.45 * k, 0.03 * k, yaw, metal, metal);
+    }
+    if parasol {
+        let top = foot + Vec3::Y * 2.3 * k;
+        b.column(foot + Vec3::Y * 0.76 * k, 0.03 * k, 0.03 * k, 1.55 * k, 4, metal);
+        let colour = [[0.8, 0.15, 0.12, 1.0], [0.15, 0.4, 0.3, 1.0], [0.2, 0.3, 0.6, 1.0]][(hash(seed, 3.0) * 3.0) as usize % 3];
+        let ribs = 8;
+        for r in 0..ribs {
+            let rim = |r: usize| {
+                let a = r as f32 / ribs as f32 * std::f32::consts::TAU;
+                top + vec3(a.cos(), 0.0, a.sin()) * 1.25 * k - Vec3::Y * 0.4 * k
+            };
+            b.tri(top, rim(r), rim(r + 1), if r % 2 == 0 { colour } else { WHITE });
+        }
+    }
+}
+
 fn bench(b: &mut Builder, at: Vec3, facing: Vec2) {
     let f = vec3(facing.x, 0.0, facing.y);
     let s = vec3(-facing.y, 0.0, facing.x);
     let yaw = (-facing.y).atan2(facing.x);
-    for k in [-1.0, 1.0] {
-        b.block(at + s * k * 1.2, 0.15, 0.5, 0.25, yaw, IRON, IRON);
+    // Sized for people (a unit to the metre, scaled up)
+    let k = crate::props::PERSON_SCALE;
+    for e in [-1.0, 1.0] {
+        b.block(at + s * e * 1.2 * k, 0.15 * k, 0.5 * k, 0.25 * k, yaw, IRON, IRON);
     }
     // Seat and back rest on the legs
     b.tag("deck");
-    b.block(at + Vec3::Y * 0.5, 0.25, 0.12, 1.5, yaw, BENCH, BENCH);
-    b.block(at - f * 0.3 + Vec3::Y * 0.6, 0.06, 0.6, 1.5, yaw, BENCH, BENCH);
+    b.block(at + Vec3::Y * 0.5 * k, 0.25 * k, 0.12 * k, 1.5 * k, yaw, BENCH, BENCH);
+    b.block(at - f * 0.3 * k + Vec3::Y * 0.6 * k, 0.06 * k, 0.6 * k, 1.5 * k, yaw, BENCH, BENCH);
     b.tag("towns");
 }
 
@@ -863,8 +1070,35 @@ fn street_furniture(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool
         }
     }
 
+    // The swings in the square's front corner (the kids are `townsfolk`'s)
+    let swings = town.world(19.0, town.square * (FRONT + 7.0));
+    if inside(swings) {
+        let along = (town.world(20.0, town.square * (FRONT + 7.0)) - swings).normalize_or_zero();
+        swing_frame(b, lift(swings, paved(swings) - 0.05), along);
+    }
+
+    // A pillar box on the pavement, a phone box by the square
+    let post = town.world(-HALF_LEN * 0.4, -town.square * (KERB + 1.8));
+    if inside(post) {
+        pillar_box(b, lift(post, paved(post) - 0.05));
+    }
+    let phone = town.world(SQUARE_HALF + 3.5, town.square * (FRONT - 1.6));
+    if inside(phone) {
+        let face = town.frame(SQUARE_HALF + 3.5).1 * -town.square;
+        phone_box(b, lift(phone, paved(phone) - 0.05), face);
+    }
+
+    // Tables out in front of the cafés and pubs
+    for (l, _, parasol) in town.tables() {
+        let p = town.world(l.x, l.y);
+        if inside(p) {
+            let along = (town.world(l.x + 1.0, l.y) - p).normalize_or_zero();
+            cafe_table(b, lift(p, paved(p) - 0.05), along, parasol, town.seed + l.x);
+        }
+    }
+
     // The crossing, just past the square
-    let s = SQUARE_HALF + 9.0;
+    let s = CROSSING;
     let p = town.world(s, 0.0);
     if inside(p) {
         let stripes = ((ROAD_HALF_WIDTH * 2.0 - 2.0) / 3.0) as i32;
@@ -938,36 +1172,6 @@ fn bunting(b: &mut Builder, from: Vec3, to: Vec3, seed: i32) {
         b.cloth([a, c, tip, tip], [0.0, 0.0, 0.6, 0.6], color);
     }
     b.layer = layer;
-}
-
-/// People out on the pavements and in the square.
-fn townsfolk(b: &mut Builder, town: &Town, inside: &impl Fn(Vec2) -> bool) {
-    for side in [1.0, -1.0] {
-        let mut s = -HALF_LEN + 6.0;
-        while s < HALF_LEN - 6.0 {
-            let seed = town.seed + s * 0.13 + side * 7.0;
-            if hash(seed, 1.0) < 0.45 {
-                let o = KERB + 1.8 + (FRONT - KERB - 3.0) * hash(seed, 2.0);
-                let p = town.world(s, side * o);
-                if inside(p) {
-                    // Most watch the road; some look in the shop windows
-                    let n = town.frame(s).1 * side;
-                    let facing = if hash(seed, 3.0) < 0.75 { -n } else { n };
-                    crate::venue::person(b, lift(p, paved(p)), facing, seed, 0.15 * hash(seed, 4.0));
-                }
-            }
-            s += 7.0 + 6.0 * hash(seed, 5.0);
-        }
-    }
-    let f = town.world(0.0, town.square * (FRONT + SQUARE_DEPTH * 0.5));
-    for k in 0..8 {
-        let seed = town.seed + k as f32 * 5.3;
-        let a = hash(seed, 6.0) * std::f32::consts::TAU;
-        let p = f + Vec2::from_angle(a) * (6.0 + 12.0 * hash(seed, 7.0));
-        if inside(p) {
-            crate::venue::person(b, lift(p, paved(p)), Vec2::from_angle(hash(seed, 8.0) * std::f32::consts::TAU), seed, 0.0);
-        }
-    }
 }
 
 /// The town's name on a white board at the roadside as you arrive, and

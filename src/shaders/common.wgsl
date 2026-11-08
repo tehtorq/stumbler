@@ -19,7 +19,7 @@ struct Globals {
     street: array<vec4<f32>, 32>, // nearest streetlights: lamp xyz, w = how far on
     street_count: u32,
     post: vec4<f32>,  // AO strength, bloom strength, exposure, vignette
-    extra: vec4<f32>, // x = sun shadows on
+    extra: vec4<f32>, // x = sun shadows on, y = clock (0..1 from midnight)
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;

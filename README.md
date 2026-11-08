@@ -252,6 +252,22 @@ solid, with impulses at the contact point so glancing blows spin you.
 | `chunks.rs`, `props.rs` | Streams terrain, trees, road surface, water and scenery in chunks on worker threads |
 | `trees.rs`, `cover.rs` | Trees and shrubs per biome; grass, flowers, ferns, reeds and stones near the camera |
 | `wildlife.rs` | Deer, rabbits and butterflies around the player |
+| `townsfolk.rs` | People in the towns: strolling, browsing, using the zebra crossing, on the benches, jumping clear of cars |
+| `picnics.rs` | Lay-bys along the roads and picnic tables at viewpoints; families, parked cars and dogs out by day |
+| `travellers.rs` | Cyclists on the roads, walkers and their dogs on the trails |
+| `machines.rs` | Tractors ploughing (dust, gulls) and combines in the wheat, by the clock |
+| `smoke.rs` | Wood smoke from chimneys in towns, farms and cabins, by the hour and the cold |
+| `aloft.rs` | Hot-air balloons on calm mornings and evenings, paragliders over the summits |
+| `soundscape.rs` | Where the world's sounds come from: diesels, chatter, livestock, dogs, halyards, the clock striking, balloon burners |
+| `traffic.rs` | Everyday cars, vans and buses on the roads: lanes, gaps, crossings, bus stops |
+| `waterfowl.rs` | Ducks and swans on the water, herons in the shallows; they paddle or fly off from the car |
+| `camps.rs` | Campsites off the trails: tents, logs, a fire lit evenings and mornings, campers round it |
+| `roadworks.rs` | Road works somewhere new each day: cones, barriers, a digger, workers, temporary lights the traffic obeys |
+| `breakdowns.rs` | Cars broken down on the verges, bonnet up and hazards on, and the recovery truck coming |
+| `market.rs` | Market days in the town squares: stalls, sellers, shoppers with bags |
+| `livestock.rs` | Sheep and cows alive in their pastures: grazing, scattering from cars, sheepdogs, milking time |
+| `machinery.rs` | Windmill sails turning, lighthouse beams sweeping after dark |
+| `harbour.rs`, `boats.rs` | Piers, anglers and moorings along the shores; yachts and fishing boats on the water |
 | `terrain.rs` | Height field (flattened under roads) and biome colours |
 | `physics.rs`, `collisions.rs` | Car physics and contacts |
 | `ai_cars.rs` | AI drivers: speed profiles, pure-pursuit steering, racecraft |
@@ -304,6 +320,9 @@ prints their levels, to compare before and after a change.
 of the generated world. Run it before and after touching world generation: it
 should only change when the world is meant to.
 
+`cargo test --release harbour_report -- --ignored --nocapture` lists where some
+anglers and moored boats are, to go and look at them with `STUMBLER_AT`.
+
 `cargo test --release render_ -- --ignored` draws `layout.ppm` (the whole map)
 and `sketches.ppm` (each circuit as built, over its real outline in blue) and
 prints each circuit's length against the real one and its shape error;
@@ -330,6 +349,10 @@ Dev aids:
 - Vsync is off (the frame rate is uncapped); `STUMBLER_VSYNC=1` turns it on.
   Screenshot runs report the frame time and triangle count
 - `STUMBLER_WILDLIFE_CLOSE=1` spawns animals near the player
+- `STUMBLER_BOATS_CLOSE=1` sails the yachts and fishing boats close in
+- `STUMBLER_TRAVELLERS_CLOSE=1` brings cyclists and walkers out close by
+- `STUMBLER_TRAFFIC_CLOSE=1` brings the everyday cars, vans and buses out close by
+- `STUMBLER_BIRDS_CLOSE=1` brings ducks, swans and herons in close along the shore
 - `STUMBLER_CACHE=path` keeps the routes there instead of
   `~/.cache/stumbler/routes.bin`; `STUMBLER_CACHE=` keeps none, to time a first run
 - `STUMBLER_PROFILE=1` times each GPU pass (shadow, main, AO, bloom, post+HUD; timestamp queries) and

@@ -108,7 +108,12 @@ impl Stage {
                 .filter(|c| c.pos.distance(self.player.pos) < 300.0)
                 .collect();
             nearby.sort_by(|a, b| a.pos.distance_squared(self.player.pos).total_cmp(&b.pos.distance_squared(self.player.pos)));
-            for car in nearby.into_iter().take(lights::MAX_LIGHTS - 2) {
+            // A campfire's glow on the camp round it
+            frame_lights.extend(self.camps.fire_light(self.camera.pos, self.day_time, night, self.wind_time));
+            // The nearest lighthouse beam lights where it lands
+            frame_lights.extend(self.keepers.spot_lights(self.camera.pos, beam, 1));
+            let room = lights::MAX_LIGHTS - frame_lights.len();
+            for car in nearby.into_iter().take(room) {
                 frame_lights.push(headlight(car, Vec3::ZERO, 110.0, beam * 1.5));
             }
         }
@@ -165,7 +170,7 @@ impl Stage {
             street_count,
             _pad: [0; 3],
             post: self.debug.graphics.post(),
-            extra: [self.debug.graphics.shadows as u32 as f32, 0.0, 0.0, 0.0],
+            extra: [self.debug.graphics.shadows as u32 as f32, self.day_time, 0.0, 0.0],
         };
 
         // --- Per-frame meshes ---
@@ -175,6 +180,44 @@ impl Stage {
         self.bird_mesh.update(&self.gpu, &v, &i);
         let (v, i) = self.wildlife.build_mesh(self.camera.pos);
         self.wildlife_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.waterfowl.build_mesh(self.camera.pos, self.wind_time);
+        self.waterfowl_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.livestock.build_mesh(self.camera.pos, self.wind_time);
+        self.livestock_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.nightlife.build_mesh(self.camera.pos);
+        self.nightlife_mesh.update(&self.gpu, &v, &i);
+        let ((v, i), (gv, gi)) = self.boats.build_mesh(self.camera.pos, self.wind_time);
+        self.boat_mesh.update(&self.gpu, &v, &i);
+        self.boat_glow_mesh.update(&self.gpu, &gv, &gi);
+        let (sails, beams) = crate::machinery::build(self.camera.pos, self.wind_time, night, &self.keepers);
+        self.sail_mesh.update(&self.gpu, &sails.verts, &sails.idxs);
+        let (v, i) = self.townsfolk.build_mesh(self.camera.pos);
+        self.townsfolk_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.picnics.build_mesh(self.camera.pos, self.wind_time);
+        self.picnic_mesh.update(&self.gpu, &v, &i);
+        if let Some((v, i)) = self.anglers.refresh(self.camera.pos, self.day_time, self.weather.rain) {
+            self.angler_mesh.update(&self.gpu, &v, &i);
+        }
+        let (v, i) = self.travellers.build_mesh(self.camera.pos);
+        self.traveller_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.camps.build_mesh(self.camera.pos, self.day_time, self.weather.rain, self.wind_time);
+        self.camp_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = crate::market::build_mesh(self.camera.pos, self.day, self.day_time);
+        self.market_mesh.update(&self.gpu, &v, &i);
+        let ((v, i), (lv, li)) = self.road_traffic.build_mesh(self.camera.pos, night, self.wind_time);
+        self.vehicle_mesh.update(&self.gpu, &v, &i);
+        self.vehicle_lamp_mesh.update(&self.gpu, &lv, &li);
+        let ((v, i), (lv, li)) = crate::roadworks::build_mesh(self.day, self.camera.pos, self.wind_time);
+        self.works_mesh.update(&self.gpu, &v, &i);
+        self.works_lamp_mesh.update(&self.gpu, &lv, &li);
+        let ((v, i), (lv, li)) = crate::breakdowns::build_mesh(self.day, self.day_time, self.camera.pos, self.wind_time, night);
+        self.breakdown_mesh.update(&self.gpu, &v, &i);
+        self.breakdown_lamp_mesh.update(&self.gpu, &lv, &li);
+        let (v, i) = crate::machines::build_mesh(self.player.pos, self.camera.pos, self.day_time, self.wind_time);
+        self.machine_mesh.update(&self.gpu, &v, &i);
+        let (v, i) = self.aloft.build_mesh(self.camera.pos, self.player.pos, self.day_time, self.wind_time);
+        self.aloft_mesh.update(&self.gpu, &v, &i);
+        self.beam_mesh.update(&self.gpu, &beams.verts, &beams.idxs);
         // Skid marks fade, so rebuild them now and then even with no new ones
         if self.skids.changed || time - self.skid_mesh_time > 0.5 {
             let (v, i) = self.skids.mesh(self.camera.pos, 900.0, time);
@@ -211,6 +254,26 @@ impl Stage {
             Draw::mesh(self.collectible_mesh.mesh(), identity),
             Draw::mesh(self.bird_mesh.mesh(), identity),
             Draw::mesh(self.wildlife_mesh.mesh(), identity),
+            Draw::mesh(self.waterfowl_mesh.mesh(), identity),
+            Draw::mesh(self.livestock_mesh.mesh(), identity),
+            Draw::mesh(self.nightlife_mesh.mesh(), identity),
+            Draw::mesh(self.boat_mesh.mesh(), identity),
+            Draw::glow(self.boat_glow_mesh.mesh()),
+            Draw::mesh(self.sail_mesh.mesh(), identity),
+            Draw::mesh(self.townsfolk_mesh.mesh(), identity),
+            Draw::mesh(self.picnic_mesh.mesh(), identity),
+            Draw::mesh(self.angler_mesh.mesh(), identity),
+            Draw::mesh(self.traveller_mesh.mesh(), identity),
+            Draw::mesh(self.camp_mesh.mesh(), identity),
+            Draw::mesh(self.market_mesh.mesh(), identity),
+            Draw::mesh(self.vehicle_mesh.mesh(), identity),
+            Draw::glow(self.vehicle_lamp_mesh.mesh()),
+            Draw::mesh(self.works_mesh.mesh(), identity),
+            Draw::glow(self.works_lamp_mesh.mesh()),
+            Draw::mesh(self.breakdown_mesh.mesh(), identity),
+            Draw::glow(self.breakdown_lamp_mesh.mesh()),
+            Draw::mesh(self.machine_mesh.mesh(), identity),
+            Draw::mesh(self.aloft_mesh.mesh(), identity),
         ]);
 
         // The circuit being raced, or else the nearest within reach
@@ -230,7 +293,9 @@ impl Stage {
         }
 
         let all_cars = std::iter::once((&self.player, &self.body_mesh, self.braking))
-            .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()], c.last_input.brake > 0.1 && c.physics.speed > 1.0)));
+            .chain(self.cars.iter().map(|c| (&c.physics, &self.ai_body_meshes[c.color_idx % self.ai_body_meshes.len()], c.last_input.brake > 0.1 && c.physics.speed > 1.0)))
+            // Parked up at the picnic spots
+            .chain(self.picnics.cars().map(|(c, paint)| (c, &self.ai_body_meshes[paint % self.ai_body_meshes.len()], false)));
         for (car, body, braking) in all_cars {
             if car.pos.distance_squared(self.camera.pos) > CAR_DRAW_DISTANCE * CAR_DRAW_DISTANCE {
                 continue;
@@ -327,6 +392,7 @@ impl Stage {
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.speed_line_mesh.mesh(), identity) });
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.rain_mesh.mesh(), identity) });
         draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.guide_mesh.mesh(), identity) });
+        draws.push(Draw { kind: gpu::MeshKind::Particle, ..Draw::new(PipelineKind::Particles, self.beam_mesh.mesh(), identity) });
         // The maps' picture of the island goes under the rest of the HUD
         draws.push(Draw::new(PipelineKind::Hud, self.map_mesh.mesh(), identity));
         draws.push(Draw::new(PipelineKind::Hud, self.hud_mesh.mesh(), identity));
