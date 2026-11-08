@@ -1313,8 +1313,21 @@ impl Stage {
             .into_iter()
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .unwrap_or((0.0, 0.0));
+        // Water in earshot (the sea or a lake), for the lap of waves
+        let mut wet_points = 0;
+        for k in 0..8 {
+            let dir = Vec2::from_angle(k as f32 * std::f32::consts::TAU / 8.0);
+            for d in [40.0, 100.0] {
+                let p = me + dir * d;
+                if physics::Ground::water(&WorldGround, p.x, p.y).is_some() {
+                    wet_points += 1;
+                }
+            }
+        }
+        let water = (wet_points as f32 / 6.0).min(1.0);
         if let Some(a) = self.audio() {
             a.set_room(wet, decay, echo, echo_delay);
+            a.set_scene(forest, water, street);
         }
     }
 

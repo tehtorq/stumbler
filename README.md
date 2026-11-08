@@ -289,7 +289,16 @@ the car's numbers (acceleration, braking, cornering, turn-in, a held drift);
 the AI's drifts pay for themselves; `race_quality_report` (`RQ_ONLY=<circuit>`,
 `RQ_SEEDS=<n>`) and `personality_report` sum up full 8-car races.
 
-`stage_report` times a lone AI car down each gravel stage.
+`stage_report` times a lone AI car down each gravel stage. `chicane_report`
+shows where a lone AI car runs under its own speed plan, and
+`race_finish_sweep` (`RQ_ONLY=<circuit>`) counts races that don't finish.
+
+Sound is all synthesised in `audio.rs`. `cargo test --release audio_clips --
+--ignored` renders short labelled WAVs of each sound (engine through the gears,
+crashes, skids, ambience day and night, woods, shore, town, and engine-off
+stems of the ambience) into `target/audio-clips` (or `$STUMBLER_AUDIO_OUT`);
+`tools/audio_report.sh <dir>` draws a spectrogram beside each (needs `sox`) and
+prints their levels, to compare before and after a change.
 
 `cargo test --release world_fingerprint -- --ignored --nocapture` prints a hash
 of the generated world. Run it before and after touching world generation: it

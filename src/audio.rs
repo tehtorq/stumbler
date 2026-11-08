@@ -19,7 +19,7 @@ const QUEUE_EVERY: u32 = 256;
 /// The one-shot sounds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sound {
-    /// A car into a post, wall or barrier: a metallic clang.
+    /// A car into a post, wall or barrier: a heavy thud and crumpling panels.
     Clang,
     /// Car into car: crumpling panels over a thump.
     Crunch,
@@ -67,7 +67,7 @@ impl Sound {
             Sound::Pickup => 0.45,
             Sound::Chime => 0.6,
             Sound::Fanfare => 2.2,
-            Sound::Pop => 0.07,
+            Sound::Pop => 0.12,
             Sound::Whistle => 2.0,
             Sound::Swish => 0.45,
         }
@@ -85,14 +85,34 @@ struct Voice {
     t: f32,
     seed: u32,
     lp: [f32; 2],
+    /// Oscillator phases and odd bits of state (bubbles, ticks).
+    st: [f32; 4],
+    filters: [Svf; 3],
 }
 
 impl Voice {
+    fn new(sound: Sound, gain: f32, place: Place, delay: f32, seed: u32) -> Self {
+        Self { sound, gain, place, ear: Spatial::default(), delay, t: 0.0, seed, lp: [0.0; 2], st: [0.0; 4], filters: [Svf::default(); 3] }
+    }
+
     fn noise(&mut self) -> f32 {
         self.seed ^= self.seed << 13;
         self.seed ^= self.seed >> 17;
         self.seed ^= self.seed << 5;
         (self.seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+
+    /// 0..1.
+    fn chance(&mut self) -> f32 {
+        self.noise() * 0.5 + 0.5
+    }
+
+    /// A low note whose pitch drops from `from` to `to` (Hz) as it dies, at
+    /// rate `drop`: the thud of a heavy body, on oscillator `k`.
+    fn thud(&mut self, k: usize, t: f32, dt: f32, from: f32, to: f32, drop: f32) -> f32 {
+        let f = to + (from - to) * (-t * drop).exp();
+        self.st[k] = (self.st[k] + f * dt).fract();
+        (self.st[k] * TAU).sin()
     }
 
     /// The next sample, or None once it's over.
@@ -106,55 +126,99 @@ impl Voice {
         if t >= self.sound.length() {
             return None;
         }
+        let rate = 1.0 / dt;
         let sine = |f: f32| (t * f * TAU).sin();
         // A random detune per voice, so no two knocks are quite alike
         let detune = 1.0 + ((self.seed & 0xff) as f32 / 255.0 - 0.5) * 0.12;
+        // The first sample: what strikes the resonators
+        let strike = if t < dt { 1.0 } else { 0.0 };
+        let g = self.gain.min(1.5);
         let v = match self.sound {
             Sound::Clang => {
-                // Inharmonic partials ring like struck metal; harder hits
-                // are brighter
-                let bright = self.gain.min(1.0);
-                let ring = sine(180.0 * detune) * 0.5 + sine(267.0 * detune) * 0.35 + sine(412.0 * detune) * 0.25 * bright + sine(731.0 * detune) * 0.12 * bright;
-                let body = sine(55.0) * (-t * 22.0).exp();
-                let click = self.noise() * (-t * 90.0).exp();
-                (ring * (-t * 7.0).exp() * 0.5 + body * 0.6 + click * 0.5) * 0.5
+                // Into a wall or barrier: the car's weight landing as a low
+                // thud, panels crumpling in a crackle that thins out, a dull
+                // knock from the barrier and bits rattling down after
+                let thud = self.thud(0, t, dt, 115.0, 40.0, 26.0) * (-t * 12.0).exp();
+                let density = 0.4 * (-t * 15.0).exp() * (0.4 + g);
+                let grain = if self.chance() < density { self.noise() } else { 0.0 };
+                let bed = self.noise() * (-t * 35.0).exp() * 0.35;
+                let crunch = self.filters[0].band(grain + bed, (900.0 + 500.0 * g) * detune, rate, 1.0);
+                let knock = self.filters[1].band(strike * 3.0 + grain * 0.15, 165.0 * detune, rate, 0.25);
+                if t > 0.05 && self.st[2] <= 0.0 && self.chance() < 0.0012 * g * (-t * 3.0).exp() {
+                    self.st[2] = 0.004;
+                }
+                let tick = if self.st[2] > 0.0 { self.st[2] -= dt; self.noise() } else { 0.0 };
+                let debris = self.filters[2].band(tick, 2400.0 * detune, rate, 0.7);
+                (thud * 0.85 + crunch * 1.3 + knock * 0.45 + debris * 0.35) * 0.55
             }
             Sound::Crunch => {
-                // Crackling panels: noise, band-limited, chopped into grains
+                // Car into car: a lighter thud, a longer crumple of panels
+                // and plastic, and the tyres scuffing against each other
+                let thud = self.thud(0, t, dt, 120.0, 55.0, 30.0) * (-t * 17.0).exp();
+                let density = 0.5 * (-t * 8.0).exp() * (0.4 + g);
+                let grain = if self.chance() < density { self.noise() } else { 0.0 };
+                let panels = self.filters[0].band(grain, 1500.0 * detune, rate, 1.0);
+                let plastic = self.filters[1].band(grain, 650.0 * detune, rate, 0.7);
                 let n = self.noise();
-                self.lp[0] += 0.4 * (n - self.lp[0]);
-                self.lp[1] += 0.06 * (self.lp[0] - self.lp[1]);
-                let band = self.lp[0] - self.lp[1];
-                let grain = if ((t * 180.0) as u32).wrapping_mul(2654435761) >> 30 == 0 { 0.4 } else { 1.0 };
-                let thump = sine(48.0) * (-t * 16.0).exp();
-                let ring = (sine(330.0 * detune) + sine(517.0 * detune) * 0.6) * (-t * 14.0).exp();
-                (band * 2.2 * grain * (-t * 9.0).exp() + thump * 0.6 + ring * 0.15) * 0.28
+                self.lp[0] += 0.05 * (n - self.lp[0]);
+                let scuff = self.lp[0] * (t * 30.0).min(1.0) * (-t * 6.0).exp();
+                if t > 0.08 && self.st[2] <= 0.0 && self.chance() < 0.001 * g * (-t * 3.0).exp() {
+                    self.st[2] = 0.004;
+                }
+                let tick = if self.st[2] > 0.0 { self.st[2] -= dt; self.noise() } else { 0.0 };
+                let debris = self.filters[2].band(tick, 3000.0 * detune, rate, 0.7);
+                (thud * 0.6 + panels * 1.2 + plastic * 0.7 + scuff * 0.8 + debris * 0.3) * 0.5
             }
             Sound::Thunk => {
-                // A hollow trunk knocked, then leaves shaken loose
-                let knock = sine(92.0 * detune) * (-t * 13.0).exp() + sine(185.0 * detune) * 0.4 * (-t * 22.0).exp();
-                let click = self.noise() * (-t * 120.0).exp();
+                // A trunk knocked: two woody notes that die almost at once,
+                // the bark cracking, then the leaves shaken loose
+                let k1 = self.filters[0].band(strike * 4.0, 140.0 * detune, rate, 0.12);
+                let k2 = self.filters[1].band(strike * 3.0, 380.0 * detune, rate, 0.18);
+                let grain = if self.chance() < 0.35 * (-t * 40.0).exp() { self.noise() } else { 0.0 };
+                let crack = self.filters[2].band(grain, 2200.0, rate, 1.0);
+                let thud = self.thud(0, t, dt, 90.0, 50.0, 30.0) * (-t * 20.0).exp();
                 let n = self.noise();
                 self.lp[0] += 0.5 * (n - self.lp[0]);
-                let rustle = (n - self.lp[0]) * (t * 10.0).min(1.0) * (-t * 3.5).exp();
-                (knock * 0.7 + click * 0.35 + rustle * 0.35) * 0.5
+                // Leaves: bright noise that flutters as they shake
+                self.st[1] += (self.noise() * 0.5 - self.st[1]) * 0.002;
+                let flutter = 0.6 + 4.0 * self.st[1].abs();
+                let rustle = (n - self.lp[0]) * flutter * (t * 8.0).min(1.0) * (-t * 2.8).exp();
+                (k1 * 0.5 + k2 * 0.35 + crack * 0.8 + thud * 0.5 + rustle * 0.3) * 0.5
             }
             Sound::Splash => {
-                // A whump, then spray falling back: noise whose brightness
-                // falls away
+                // A whump, then spray falling back (noise whose brightness
+                // falls away), and bubbles glooping up after
                 let n = self.noise();
                 let open = 0.5 * (-t * 2.2).exp() + 0.03;
                 self.lp[0] += open * (n - self.lp[0]);
                 let env = (t * 80.0).min(1.0) * (-t * 2.6).exp();
-                let whump = sine(42.0) * (-t * 9.0).exp();
-                (self.lp[0] * 1.6 * env + whump * 0.6) * 0.32
+                let whump = self.thud(0, t, dt, 70.0, 30.0, 15.0) * (-t * 8.0).exp();
+                // A bubble: a short note that rises as it goes
+                if self.st[2] <= 0.0 && t > 0.15 && self.chance() < 0.0025 * (-t * 1.2).exp() {
+                    self.st[2] = 0.001;
+                    self.st[3] = 250.0 + self.chance() * 600.0;
+                }
+                let mut bubble = 0.0;
+                if self.st[2] > 0.0 {
+                    let age = self.st[2];
+                    self.st[2] += dt;
+                    self.st[1] = (self.st[1] + self.st[3] * (1.0 + age * 25.0) * dt).fract();
+                    bubble = (self.st[1] * TAU).sin() * (-age * 45.0).exp();
+                    if age > 0.08 {
+                        self.st[2] = 0.0;
+                    }
+                }
+                (self.lp[0] * 1.6 * env + whump * 0.7 + bubble * 0.25) * 0.32
             }
             Sound::Landing => {
-                let thud = sine(46.0) * (-t * 13.0).exp() + sine(94.0) * 0.5 * (-t * 24.0).exp();
+                // The springs bottoming out: a deep thud, a clunk in the
+                // suspension and a scuff of the tyres taking the weight
+                let thud = self.thud(0, t, dt, 80.0, 34.0, 18.0) * (-t * 10.0).exp();
+                let clunk = self.filters[0].band(strike * 4.0, 240.0 * detune, rate, 0.3);
                 let n = self.noise();
-                self.lp[0] += 0.15 * (n - self.lp[0]);
-                let clunk = self.lp[0] * (-t * 35.0).exp();
-                (thud * 0.7 + clunk * 1.2) * 0.5
+                self.lp[0] += 0.12 * (n - self.lp[0]);
+                let scuff = self.lp[0] * (-t * 22.0).exp();
+                (thud * 0.85 + clunk * 0.4 + scuff * 0.9) * 0.55
             }
             Sound::Beep | Sound::GoBeep => {
                 // A clean electronic tone, square-edged, with soft ends
@@ -215,10 +279,11 @@ impl Voice {
                 sum * 0.055
             }
             Sound::Pop => {
-                let left = POP_LENGTH - t;
-                let env = (left / POP_LENGTH).powi(3);
-                let crack = self.noise() * (1.0 - t / 0.015).max(0.0);
-                (crack * 0.35 + sine(70.0) * 0.3) * env
+                // A backfire: a sharp crack out of the pipe over a low boom
+                let n = self.noise();
+                let crack = self.filters[0].band(n * (-t * 90.0).exp(), 1700.0 * detune, rate, 1.2);
+                let boom = self.thud(0, t, dt, 110.0, 55.0, 40.0) * (-t * 38.0).exp();
+                (crack * 1.4 + boom * 0.6) * 0.5
             }
             Sound::Whistle => {
                 // A chord blown through a pipe: breathy at the start, the
@@ -275,6 +340,10 @@ pub struct AudioParams {
     /// 1 out in the wilds) and how far into the day (0 night .. 1 day).
     quiet: AtomicU32,
     daylight: AtomicU32,
+    /// What's around you: woods, water and town (each 0..1).
+    scene: [AtomicU32; 3],
+    /// How loud your own engine is in the mix (1 as designed).
+    engine_level: AtomicU32,
     /// The steam train: how loud its engine is here, chuffs a second, and
     /// where it is (pan, behind); and the nearest crossing's bell
     /// (loudness, pan, behind).
@@ -312,6 +381,8 @@ impl AudioParams {
             scrape: level(0.0),
             quiet: level(0.0),
             daylight: level(1.0),
+            scene: std::array::from_fn(|_| level(0.0)),
+            engine_level: level(1.0),
             train: std::array::from_fn(|_| level(0.0)),
             bell: std::array::from_fn(|_| level(0.0)),
             room: std::array::from_fn(|_| level(0.0)),
@@ -337,7 +408,7 @@ impl AudioParams {
         let seed = self.seed.fetch_add(0x9e37_79b9, Ordering::Relaxed) | 1;
         if let Ok(mut queue) = self.queue.lock() {
             if queue.len() < MAX_VOICES {
-                queue.push(Voice { sound, gain: gain.min(1.5), place: place.clamped(), ear: Spatial::default(), delay: delay.max(0.0), t: 0.0, seed, lp: [0.0; 2] });
+                queue.push(Voice::new(sound, gain.min(1.5), place.clamped(), delay.max(0.0), seed));
             }
         }
     }
@@ -372,6 +443,20 @@ impl AudioParams {
     pub fn set_ambience(&self, quiet: f32, daylight: f32) {
         Self::set(&self.quiet, quiet.clamp(0.0, 1.0));
         Self::set(&self.daylight, daylight.clamp(0.0, 1.0));
+    }
+
+    /// Your own engine's loudness in the mix (1 as designed, 0 silent).
+    #[allow(dead_code)]
+    pub fn set_engine_level(&self, v: f32) {
+        Self::set(&self.engine_level, v.clamp(0.0, 2.0));
+    }
+
+    /// What's around you, each 0..1: `forest` (trees close by), `water`
+    /// (a lake or the sea in earshot) and `town`.
+    pub fn set_scene(&self, forest: f32, water: f32, town: f32) {
+        Self::set(&self.scene[0], forest.clamp(0.0, 1.0));
+        Self::set(&self.scene[1], water.clamp(0.0, 1.0));
+        Self::set(&self.scene[2], town.clamp(0.0, 1.0));
     }
 
     /// Other car `slot` (0 the nearest): its `speed`, `level` (0 silent ..
@@ -441,12 +526,12 @@ impl AudioParams {
     }
 }
 
-/// How long a backfire pop rings (seconds).
-const POP_LENGTH: f32 = 0.07;
 /// Top speed (units/s) in each gear.
 const GEAR_TOPS: [f32; 6] = [38.0, 64.0, 90.0, 115.0, 140.0, 175.0];
 /// How long the power is cut through a gear change (seconds).
 const SHIFT_CUT: f32 = 0.09;
+/// How long the throttle is blipped through a change down (seconds).
+const BLIP: f32 = 0.12;
 
 /// Engine revs (0..1) at `speed`: each gear runs from a little above idle
 /// up to the red line, then the next one picks up lower down.
@@ -519,6 +604,211 @@ impl Spatial {
         self.at = (self.at + 1) % EAR_RING;
         let (gl, gr) = pan_gains(place.pan * EAR_SHADOW);
         if place.pan >= 0.0 { (late * gl, s * gr) } else { (s * gl, late * gr) }
+    }
+}
+
+/// A resonant filter (state-variable): low, band and high pass from one
+/// pair of states. Cheap, and stable up to a sixth of the sample rate.
+#[derive(Clone, Copy, Default)]
+struct Svf {
+    low: f32,
+    band: f32,
+}
+
+impl Svf {
+    /// One sample through at centre `freq` (Hz), damping `damp` (about
+    /// 1/Q: small rings long and narrow, 1 or more is broad): (low, band, high).
+    fn run(&mut self, x: f32, freq: f32, rate: f32, damp: f32) -> (f32, f32, f32) {
+        let f = 2.0 * (std::f32::consts::PI * (freq / rate).min(0.16)).sin();
+        let high = x - self.low - damp * self.band;
+        self.band += f * high;
+        self.low += f * self.band;
+        (self.low, self.band, high)
+    }
+
+    fn band(&mut self, x: f32, freq: f32, rate: f32, damp: f32) -> f32 {
+        self.run(x, freq, rate, damp).1
+    }
+}
+
+/// A delay line, read between samples.
+struct Delay {
+    buf: Vec<f32>,
+    at: usize,
+}
+
+impl Delay {
+    fn new(longest: f32, rate: f32) -> Self {
+        Self { buf: vec![0.0; (longest * rate) as usize + 3], at: 0 }
+    }
+
+    /// What went in `lag` seconds ago.
+    fn read(&self, lag: f32, rate: f32) -> f32 {
+        let len = self.buf.len();
+        let lag = (lag * rate).clamp(1.0, (len - 2) as f32);
+        let (whole, part) = (lag as usize, lag.fract());
+        let back = |k: usize| self.buf[(self.at + len - k) % len];
+        back(whole) * (1.0 - part) + back(whole + 1) * part
+    }
+
+    fn write(&mut self, x: f32) {
+        self.buf[self.at] = x;
+        self.at = (self.at + 1) % self.buf.len();
+    }
+}
+
+/// Engine speed at idle and at the red line (rpm).
+const IDLE_RPM: f32 = 850.0;
+const RED_LINE: f32 = 8200.0;
+/// Which bank of a cross-plane V8 each firing in turn goes out of. Each
+/// bank's own pulses come unevenly spaced, and that is the V8's burble.
+const BANK_ORDER: [usize; 8] = [0, 1, 0, 0, 1, 0, 1, 1];
+/// Each bank's exhaust: the round trip of a pressure wave down the pipe
+/// and back (seconds), a touch different side to side so they don't ring
+/// as one.
+const PIPE_TRIPS: [f32; 2] = [0.0047, 0.0054];
+/// How much of each wave the open end of the pipe throws back (inverted).
+const PIPE_REFLECT: f32 = 0.55;
+/// Pressure pulses in flight at once, at most.
+const PULSES: usize = 10;
+
+/// One cylinder's exhaust pulse as it leaves the valve: how long ago, how
+/// strong, how wide (seconds) and which bank.
+#[derive(Clone, Copy, Default)]
+struct Pulse {
+    age: f32,
+    amp: f32,
+    width: f32,
+    bank: usize,
+}
+
+/// An engine, built up from what makes the noise: each cylinder firing a
+/// pulse of pressure into its bank's exhaust, the pipes ringing at their
+/// own lengths, the silencer's body, the intake gasping air, and all of it
+/// pushed harder (and grittier) the more throttle it's given.
+struct Engine {
+    /// Through the four-stroke cycle (two turns of the crank), 0..1, and the
+    /// next firing due.
+    cycle: f32,
+    next: usize,
+    next_at: f32,
+    pulses: [Pulse; PULSES],
+    pipes: [Delay; 2],
+    pipe_lp: [f32; 2],
+    body: Svf,
+    tone: f32,
+    intake: Svf,
+    intake_env: f32,
+    dc: [f32; 2],
+    rng: u32,
+    /// Scales the pipes' lengths: another car's exhaust sounds its own.
+    pipe_scale: f32,
+}
+
+impl Engine {
+    fn new(rate: f32, pipe_scale: f32, seed: u32) -> Self {
+        let longest = PIPE_TRIPS[1] * pipe_scale * 1.2;
+        Self {
+            cycle: 0.0,
+            next: 0,
+            next_at: 0.0,
+            pulses: [Pulse::default(); PULSES],
+            pipes: [Delay::new(longest, rate), Delay::new(longest, rate)],
+            pipe_lp: [0.0; 2],
+            body: Svf::default(),
+            tone: 0.0,
+            intake: Svf::default(),
+            intake_env: 0.0,
+            dc: [0.0; 2],
+            rng: seed | 1,
+            pipe_scale,
+        }
+    }
+
+    fn noise(&mut self) -> f32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        (self.rng >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+
+    /// The next sample at `revs` (0..1, as `engine_revs`), `load` (0 off the
+    /// throttle .. 1 flat out) and `overrun` (0..1: high revs and no
+    /// throttle, when it misfires and crackles).
+    fn sample(&mut self, revs: f32, load: f32, overrun: f32, rate: f32) -> f32 {
+        let dt = 1.0 / rate;
+        let rpm = IDLE_RPM + ((revs - 0.2) / 0.8).max(0.0) * (RED_LINE - IDLE_RPM);
+        // Firing: eight a cycle, each a touch early or late
+        self.cycle += rpm / 120.0 * dt;
+        while self.cycle >= self.next_at {
+            let k = self.next % 8;
+            self.next += 1;
+            let jitter = self.noise() * (0.002 + 0.006 * (1.0 - revs));
+            self.next_at = self.next as f32 / 8.0 + jitter;
+            // Combustion: strong and steady on the power; weak, lumpy and
+            // now and then missing altogether off it
+            let lumpy = 0.07 + 0.25 * (1.0 - load) * (1.0 - revs);
+            let mut amp = (0.3 + 0.7 * load) * (1.0 + self.noise() * lumpy);
+            let mut width = 28.0 / (6.0 * rpm) * (1.25 - 0.35 * load);
+            if overrun > 0.0 && self.noise() > 1.0 - 0.3 * overrun {
+                amp *= 0.15;
+            }
+            // Overrun crackle: unburnt fuel going off in the pipe, a sharp
+            // narrow spike
+            if overrun > 0.0 && self.noise() > 1.0 - 0.07 * overrun {
+                amp = 1.6 + self.noise() * 0.5;
+                width = 0.00025;
+            }
+            if let Some(slot) = self.pulses.iter_mut().find(|p| p.amp == 0.0) {
+                *slot = Pulse { age: 0.0, amp, width, bank: BANK_ORDER[k] };
+            }
+        }
+        if self.cycle >= 1.0 {
+            self.cycle -= 1.0;
+            self.next_at -= 1.0;
+            self.next -= 8;
+        }
+        // Each pulse: a quick rise and a slower fall
+        let mut banks = [0.0_f32; 2];
+        for p in &mut self.pulses {
+            if p.amp == 0.0 {
+                continue;
+            }
+            let x = p.age / p.width;
+            banks[p.bank] += p.amp * x * (1.0 - x).exp();
+            p.age += dt;
+            if x > 9.0 {
+                p.amp = 0.0;
+            }
+        }
+        // The pipes: what comes back off the open end, inverted and dulled,
+        // reinforces some notes and cancels others as the revs sweep through
+        let mut out = 0.0;
+        for b in 0..2 {
+            let back = self.pipes[b].read(PIPE_TRIPS[b] * self.pipe_scale, rate);
+            self.pipe_lp[b] += 0.45 * (back - self.pipe_lp[b]);
+            let y = banks[b] - PIPE_REFLECT * self.pipe_lp[b];
+            self.pipes[b].write(y);
+            out += y;
+        }
+        // The silencer's body: a deep resonance under it all
+        let body = self.body.band(out, 105.0, rate, 0.6);
+        out += body * 0.5;
+        // Brighter the harder it's pushed and the faster it spins
+        let cutoff = 700.0 + 3500.0 * load + 1800.0 * revs;
+        self.tone += (1.0 - (-TAU * cutoff * dt).exp()) * (out - self.tone);
+        // The intake: air roaring in, swelling with each gulp
+        self.intake_env += ((banks[0] + banks[1]).abs() - self.intake_env) * 0.01;
+        let gasp = self.noise() * self.intake_env;
+        let intake = self.intake.band(gasp, 500.0 + 1700.0 * revs, rate, 0.7) * (0.15 + 0.85 * load) * revs;
+        // Pushed into the edge of distortion: grit under load
+        let drive = 1.2 + 2.8 * load;
+        let mut y = (self.tone * drive).tanh() / drive.sqrt() + intake * 0.5;
+        // Keep it centred
+        let x = y;
+        y = x - self.dc[0] + 0.995 * self.dc[1];
+        self.dc = [x, y];
+        y
     }
 }
 
@@ -639,11 +929,143 @@ impl Room {
     }
 }
 
+/// Creatures calling at once, at most.
+const MAX_CALLS: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallKind {
+    None,
+    /// A quick run of chirps, each sweeping down.
+    Chirps,
+    /// A songbird's warble: a fluttering high tune in short phrases.
+    Warble,
+    /// A wood pigeon: soft low coos in a lilting rhythm.
+    Coo,
+    /// A gull's cry, falling away.
+    Gull,
+    /// An owl: hoo... hoo-hoo.
+    Owl,
+    /// A frog croaking.
+    Frog,
+}
+
+/// A creature calling: what, how far in, its own pitch, how loud and from where.
+struct Call {
+    kind: CallKind,
+    t: f32,
+    pitch: f32,
+    phase: f32,
+    level: f32,
+    place: Place,
+    ear: Spatial,
+    seed: u32,
+}
+
+impl Call {
+    fn noise(&mut self) -> f32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 17;
+        self.seed ^= self.seed << 5;
+        (self.seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+
+    /// Advance the oscillator at `f` Hz and give its sine.
+    fn osc(&mut self, f: f32, dt: f32) -> f32 {
+        self.phase = (self.phase + f * dt).fract();
+        (self.phase * TAU).sin()
+    }
+
+    fn next(&mut self, dt: f32) -> Option<f32> {
+        let t = self.t;
+        self.t += dt;
+        let p = self.pitch;
+        let v = match self.kind {
+            CallKind::None => return None,
+            CallKind::Chirps => {
+                if t > 0.3 + p * 0.35 { return None; }
+                let chirp = (t * 9.0 * p).fract();
+                let f = p * (4300.0 - 1900.0 * chirp);
+                let env = (1.0 - chirp).powi(2) * (chirp * 30.0).min(1.0);
+                self.osc(f, dt) * env * 0.05
+            }
+            CallKind::Warble => {
+                if t > 1.1 { return None; }
+                // Phrases of notes hopping about, with a fast trill on each
+                let note = (t * 7.0) as u32;
+                let hop = [0.0, 0.25, -0.1, 0.4, 0.15, -0.2, 0.3, 0.05][(note.wrapping_mul(2654435761) >> 29) as usize];
+                let trill = (t * 32.0 * TAU).sin() * 0.06;
+                let f = p * 3100.0 * (1.0 + hop + trill);
+                let u = (t * 7.0).fract();
+                let env = (u * 12.0).min(1.0) * (1.0 - u).powf(0.7) * (1.0 - t / 1.1);
+                self.osc(f, dt) * env * 0.04
+            }
+            CallKind::Coo => {
+                if t > 2.2 { return None; }
+                // coo-COO-coo, coo-coo
+                let starts = [0.0, 0.35, 0.9, 1.45, 1.75];
+                let lens = [0.3, 0.5, 0.3, 0.25, 0.3];
+                let mut env = 0.0;
+                for (s, l) in starts.iter().zip(lens) {
+                    if t >= *s && t < s + l {
+                        let u = (t - s) / l;
+                        env = (u * std::f32::consts::PI).sin().powf(1.5) * if l > 0.4 { 1.0 } else { 0.75 };
+                    }
+                }
+                let f = p * 480.0 * (1.0 + 0.05 * env);
+                let s = self.osc(f, dt);
+                (s + (2.0 * self.phase * TAU).sin() * 0.15) * env * 0.05
+            }
+            CallKind::Gull => {
+                if t > 1.2 { return None; }
+                // Two or three falling cries, nasal (rich in harmonics)
+                let u = (t / 0.4).fract();
+                let f = p * (1250.0 - 500.0 * u);
+                let s = self.osc(f, dt);
+                let nasal = (s * 3.0).tanh() + (3.0 * self.phase * TAU).sin() * 0.3;
+                let env = (u * 15.0).min(1.0) * (1.0 - u).powf(1.5);
+                nasal * env * 0.03
+            }
+            CallKind::Owl => {
+                if t > 1.6 { return None; }
+                // hoo ... hoo-hoo, soft and breathy
+                let starts = [0.0, 0.85, 1.15];
+                let mut env = 0.0;
+                for s in starts {
+                    if t >= s && t < s + 0.35 {
+                        env = ((t - s) / 0.35 * std::f32::consts::PI).sin();
+                    }
+                }
+                let breath = self.noise() * 0.15;
+                (self.osc(p * 370.0, dt) + breath) * env * 0.05
+            }
+            CallKind::Frog => {
+                if t > 0.45 { return None; }
+                // A croak: a rapid rattle of pulses through a throaty note
+                let rattle = if (t * 34.0 * p).fract() < 0.3 { 1.0 } else { 0.0 };
+                let s = self.osc(p * 330.0, dt);
+                let env = (t * 20.0).min(1.0) * (1.0 - t / 0.45);
+                (s * 2.5).tanh() * rattle * env * 0.04
+            }
+        };
+        Some(v)
+    }
+}
+
+/// A cricket: its pitch, chirps a second, how long a burst of them runs,
+/// where it is, and its own clock and phase.
+struct Cricket {
+    pitch: f32,
+    rate: f32,
+    burst: f32,
+    pan: f32,
+    time: f32,
+    phase: f32,
+}
+
 /// One of the other cars you can hear.
-#[derive(Default)]
 struct OtherVoice {
     rpm: f32,
-    phase: f32,
+    engine: Engine,
     lp: f32,
     /// Where it's heard from, eased toward where it is so it glides.
     place: Place,
@@ -653,14 +1075,14 @@ struct OtherVoice {
 struct EngineSource {
     params: Arc<AudioParams>,
     sample_rate: u32,
-    // Engine oscillator phases
-    phase_fire: f32,
-    phase_exhaust: f32,
-    phase_sub: f32,
-    // Low-pass filter state
-    lp_state: f32,
-    // Gravel filter states (one per "wheel")
+    engine: Engine,
+    /// A blip of throttle through a change down (seconds left), and how
+    /// long since the throttle was last lifted.
+    blip: f32,
+    lifted: f32,
+    // Gravel filter states (one per "wheel"), and the stones' crunch
     gravel_lp: [f32; 4],
+    gravel_crunch: Svf,
     /// Engine revs (0..1), eased toward what the speed and gear give, the
     /// revs a moment ago (a sudden drop is a change up), and how long the
     /// power stays cut for the change.
@@ -669,8 +1091,12 @@ struct EngineSource {
     shift: f32,
     /// Bouncing off the rev limiter.
     limiter_phase: f32,
-    squeal_phase: f32,
-    squeal_lp: f32,
+    /// Tyre squeal: rubber resonances rung by the slip, a flutter as it
+    /// sticks and lets go, and a scrub of rubber before it really squeals.
+    squeal: [Svf; 3],
+    squeal_wander: f32,
+    squeal_flutter: f32,
+    scrub: Svf,
     wind_lp: f32,
     rumble_phase: f32,
     others: [OtherVoice; OTHER_CARS],
@@ -686,14 +1112,26 @@ struct EngineSource {
     crowd_time: f32,
     scrape_lp: [f32; 2],
     scrape_level: f32,
-    /// Birdsong by day, crickets by night: when the next call comes, and
-    /// the one sounding now (time into it, pitch).
-    ambient_wait: f32,
-    call: f32,
-    call_pitch: f32,
-    call_phase: f32,
-    cricket_phase: f32,
-    cricket_time: f32,
+    /// The countryside's bed: wind gusting (its level and where it's
+    /// heading), leaves, waves and a town's hum.
+    gust: f32,
+    gust_target: f32,
+    gust_wait: f32,
+    wind_bed: [f32; 2],
+    wind_svf: Svf,
+    leaves_lp: f32,
+    leaves_flutter: f32,
+    waves: [f32; 2],
+    wave_time: f32,
+    hum: Svf,
+    /// Creatures calling, each from its own direction, and when the next
+    /// one starts; crickets chirping, each its own pitch and pace.
+    calls: Vec<Call>,
+    call_wait: f32,
+    crickets: [Cricket; 3],
+    forest: f32,
+    water: f32,
+    town: f32,
     /// The train's chuff (how far through the current one, filter state)
     /// and the crossing bell's strokes.
     chuff: f32,
@@ -714,18 +1152,28 @@ impl EngineSource {
     fn new(params: Arc<AudioParams>, sample_rate: u32) -> Self {
         Self {
             params, sample_rate,
-            phase_fire: 0.0, phase_exhaust: 0.0, phase_sub: 0.0,
-            lp_state: 0.0,
+            engine: Engine::new(sample_rate as f32, 1.0, 0x5eed_1234),
+            blip: 0.0,
+            lifted: 10.0,
             gravel_lp: [0.0; 4],
+            gravel_crunch: Svf::default(),
             rpm: 0.2,
             last_target: 0.2,
             shift: 0.0,
             limiter_phase: 0.0,
-            squeal_phase: 0.0,
-            squeal_lp: 0.0,
+            squeal: [Svf::default(); 3],
+            squeal_wander: 0.0,
+            squeal_flutter: 0.0,
+            scrub: Svf::default(),
             wind_lp: 0.0,
             rumble_phase: 0.0,
-            others: Default::default(),
+            others: std::array::from_fn(|k| OtherVoice {
+                rpm: 0.2,
+                engine: Engine::new(sample_rate as f32, 0.85 + 0.2 * k as f32, 0x0dd_ba11 + k as u32 * 7919),
+                lp: 0.0,
+                place: Place::CENTRE,
+                ear: Spatial::default(),
+            }),
             rain_lp: 0.0,
             swish_lp: 0.0,
             roll_lp: [0.0; 2],
@@ -735,12 +1183,26 @@ impl EngineSource {
             crowd_time: 0.0,
             scrape_lp: [0.0; 2],
             scrape_level: 0.0,
-            ambient_wait: 2.0,
-            call: -1.0,
-            call_pitch: 1.0,
-            call_phase: 0.0,
-            cricket_phase: 0.0,
-            cricket_time: 0.0,
+            gust: 0.5,
+            gust_target: 0.5,
+            gust_wait: 0.0,
+            wind_bed: [0.0; 2],
+            wind_svf: Svf::default(),
+            leaves_lp: 0.0,
+            leaves_flutter: 0.0,
+            waves: [0.0; 2],
+            wave_time: 0.0,
+            hum: Svf::default(),
+            calls: Vec::with_capacity(MAX_CALLS),
+            call_wait: 1.5,
+            crickets: [
+                Cricket { pitch: 4300.0, rate: 21.0, burst: 1.6, pan: -0.6, time: 0.0, phase: 0.0 },
+                Cricket { pitch: 4750.0, rate: 26.0, burst: 2.1, pan: 0.5, time: 0.4, phase: 0.0 },
+                Cricket { pitch: 3900.0, rate: 17.0, burst: 1.1, pan: 0.1, time: 0.9, phase: 0.0 },
+            ],
+            forest: 0.0,
+            water: 0.0,
+            town: 0.0,
             chuff: 0.0,
             chuff_lp: [0.0; 2],
             bell_time: 0.0,
@@ -781,96 +1243,91 @@ impl EngineSource {
 
         // ── Engine ──
         // Revs climb through the gears and drop back at each change up;
-        // eased so a shift is quick but not a click
-        let target_rpm = engine_revs(speed.abs());
-        if target_rpm < self.last_target - 0.2 && throttle > 0.3 {
+        // held still (or nearly), the throttle revs it freely
+        let geared = engine_revs(speed.abs());
+        let free = (0.2 + 0.75 * throttle) * (1.0 - speed.abs() / 25.0).clamp(0.0, 1.0);
+        let target_rpm = geared.max(free);
+        if geared < self.last_target - 0.2 && throttle > 0.3 {
             self.shift = SHIFT_CUT;
         }
-        self.last_target = target_rpm;
-        self.rpm += (target_rpm - self.rpm) * (dt / 0.06).min(1.0);
-        let rpm_t = self.rpm;
-        // Firing frequency: 4-cylinder, 4-stroke = 2 fires per rev
-        // At idle: 800rpm → 800/60*2 = 26.7Hz
-        // At max:  7000rpm → 7000/60*2 = 233Hz
-        let fire_freq = 26.0 + rpm_t * 207.0;
+        // A change down off the throttle: a blip to match the revs
+        if geared > self.last_target + 0.15 && throttle < 0.3 {
+            self.blip = BLIP;
+        }
+        self.last_target = geared;
+        // Revs rise quickly under power, fall more slowly
+        let ease = if target_rpm > self.rpm { 0.05 } else { 0.09 };
+        self.rpm += (target_rpm - self.rpm) * (dt / ease).min(1.0);
 
         // Power cut for a moment through each change up, and chopped on
         // and off against the limiter flat out in top
         let mut power: f32 = 1.0;
         if self.shift > 0.0 {
             self.shift -= dt;
-            power = 0.35;
+            power = 0.4;
         }
         if target_rpm > 0.995 && throttle > 0.5 {
             self.limiter_phase = (self.limiter_phase + 14.0 * dt).fract();
             if self.limiter_phase > 0.6 {
-                power = power.min(0.45);
+                power = power.min(0.3);
             }
         }
-        let load = throttle * power;
+        let mut load = throttle * power;
+        if self.blip > 0.0 {
+            self.blip -= dt;
+            load = load.max(0.7);
+        }
+        // Off the throttle at high revs it misfires and crackles, most just
+        // after the lift
+        if load > 0.3 {
+            self.lifted = 0.0;
+        } else {
+            self.lifted += dt;
+        }
+        let overrun = if load < 0.15 { ((self.rpm - 0.45) / 0.4).clamp(0.0, 1.0) * (0.03 + 0.97 * (-self.lifted / 1.2).exp()) } else { 0.0 };
+        let rate = self.sample_rate as f32;
+        // Louder up the revs and on the power
+        let vol = (0.2 + 0.57 * self.rpm) * (0.55 + 0.45 * load);
+        let engine = self.engine.sample(self.rpm, load, overrun, rate) * vol * p.get(&p.engine_level);
 
-        // Volume: louder with RPM, and on the power
-        let vol = (0.05 + rpm_t * 0.10) * (0.6 + 0.4 * load);
-
-        // 1. Firing pulse — square-ish wave with duty cycle ~30%
-        //    This gives the rhythmic "throb" of each cylinder firing
-        self.phase_fire += fire_freq * dt;
-        if self.phase_fire > 1.0 { self.phase_fire -= 1.0; }
-        let pulse = if self.phase_fire < 0.3 { 1.0 } else { -0.3 };
-
-        // 2. Exhaust resonance — sine at 1.5x firing freq
-        //    The exhaust pipe resonates, giving the "note" character
-        self.phase_exhaust += fire_freq * 1.5 * dt;
-        if self.phase_exhaust > 1.0 { self.phase_exhaust -= 1.0; }
-        let exhaust = (self.phase_exhaust * TAU).sin() * 0.6;
-
-        // 3. Sub-bass rumble — half the firing frequency
-        //    Deep throb you feel in your chest
-        self.phase_sub += fire_freq * 0.5 * dt;
-        if self.phase_sub > 1.0 { self.phase_sub -= 1.0; }
-        let sub = (self.phase_sub * TAU).sin() * 0.4;
-
-        // 4. Mechanical noise — filtered random noise, less at high RPM
-        let mech = self.noise() * 0.15 * (1.0 - rpm_t * 0.6);
-
-        // 5. Combine and apply amplitude modulation (throb envelope)
-        let throb_env = 0.7 + 0.3 * (self.phase_fire * TAU).sin();
-        let raw_engine = (pulse + exhaust + sub + mech) * vol * throb_env;
-
-        // 6. Simple one-pole low-pass filter to warm it up
-        //    Cutoff rises with RPM, and opens further on the power: muffled
-        //    at idle and on the overrun, a harder edge under load
-        let lp_alpha = (0.02 + rpm_t * 0.15 + load * 0.06).min(0.99);
-        self.lp_state += lp_alpha * (raw_engine - self.lp_state);
-        let engine = self.lp_state;
-
-        // ── Tyre squeal on tarmac: a wavering tone with a scratchy edge ──
-        let squeal = if paved && sliding > 6.0 {
-            let intensity = ((sliding - 6.0) / 25.0).min(1.0);
-            let wobble = self.noise_n(4) * 60.0;
-            self.squeal_phase += (980.0 + intensity * 180.0 + wobble) * dt;
-            if self.squeal_phase > 1.0 { self.squeal_phase -= 1.0; }
-            let tone = (self.squeal_phase * TAU).sin();
+        // ── Tyres on tarmac: a scrub of rubber as they start to slip, then
+        //    a squeal, rubber resonances rung by the slip, wandering in
+        //    pitch and fluttering as the tread sticks and lets go ──
+        let squeal = if paved && sliding > 3.0 {
             let n = self.noise_n(3);
-            self.squeal_lp += 0.35 * (n - self.squeal_lp);
-            (tone * 0.7 + (n - self.squeal_lp) * 0.3) * 0.045 * intensity
+            let scrub = self.scrub.band(n, 420.0, rate, 1.2) * ((sliding - 3.0) / 10.0).min(1.0) * 0.05;
+            let mut sq = 0.0;
+            if sliding > 7.0 {
+                let intensity = ((sliding - 7.0) / 22.0).min(1.0);
+                self.squeal_wander += (self.noise_n(4) * 0.5 - self.squeal_wander) * 0.0004;
+                let flutter_target = if self.chance() < 0.004 { self.chance() } else { self.squeal_flutter };
+                self.squeal_flutter += (flutter_target - self.squeal_flutter) * 0.02;
+                let shift = 1.0 + self.squeal_wander * 0.25 + intensity * 0.12;
+                let excite = n * (0.55 + 0.45 * self.squeal_flutter);
+                for (k, (f, amp)) in [(820.0, 1.0), (1270.0, 0.7), (1890.0, 0.35)].into_iter().enumerate() {
+                    sq += self.squeal[k].band(excite, f * shift, rate, 0.025) * amp;
+                }
+                sq *= 0.12 * intensity;
+            }
+            scrub + sq
         } else {
             0.0
         };
 
-        // ── Tire gravel — 4 independent low-passed noise sources ──
-        //    Sounds like loose surface rumble, not a screech
+        // ── Sliding on gravel: a rumble of loose ground under the tyres and
+        //    the stones crunching and spitting ──
         let gravel = if !paved && sliding > 8.0 {
-            let intensity = ((sliding - 8.0) / 50.0).min(1.0);
+            let intensity = ((sliding - 8.0) / 40.0).min(1.0);
             let mut total = 0.0;
             for i in 0..4 {
                 let raw = self.noise_n(i + 1);
-                // Low-pass each "wheel" independently — gives texture
-                let alpha = 0.08 + (i as f32) * 0.02; // slightly different cutoff per wheel
+                let alpha = 0.08 + (i as f32) * 0.02;
                 self.gravel_lp[i] += alpha * (raw - self.gravel_lp[i]);
                 total += self.gravel_lp[i];
             }
-            total * 0.05 * intensity
+            let stone = if self.chance() < 0.08 + 0.2 * intensity { self.noise_n(2) } else { 0.0 };
+            let crunch = self.gravel_crunch.band(stone, 1900.0, rate, 1.1);
+            (total * 0.05 + crunch * 0.12) * intensity
         } else { 0.0 };
 
         // ── Tyres rolling: a low road roar on tarmac rising with speed;
@@ -915,12 +1372,11 @@ impl EngineSource {
             let ease = (dt / 0.05).min(1.0);
             car.place.pan += (target.pan - car.place.pan) * ease;
             car.place.behind += (target.behind - car.place.behind) * ease;
-            let freq = (30.0 + car.rpm * 220.0) * p.get(&p.other_pitch[k]) * (1.0 + k as f32 * 0.03);
-            car.phase += freq * dt;
-            if car.phase > 1.0 { car.phase -= 1.0; }
-            let raw = if car.phase < 0.35 { 1.0 } else { -0.4 } + (car.phase * 3.0 * TAU).sin() * 0.4;
-            car.lp += (0.08 + car.rpm * 0.2) * (raw - car.lp);
-            let v = car.lp * 0.09 * level;
+            // Further off, duller
+            let pitch = p.get(&p.other_pitch[k]);
+            let raw = car.engine.sample((car.rpm * pitch).min(1.1), 0.75, 0.0, rate);
+            car.lp += (0.12 + 0.88 * level) * (raw - car.lp);
+            let v = car.lp * (0.25 + 0.35 * car.rpm) * level;
             let (l, r) = car.ear.place(v, car.place, self.sample_rate as f32);
             other_l += l;
             other_r += r;
@@ -974,45 +1430,100 @@ impl EngineSource {
         if self.rumble_phase > 1.0 { self.rumble_phase -= 1.0; }
         let buzz = if self.rumble_phase < 0.5 { 1.0 } else { -1.0 } * 0.05 * rumble;
 
-        // ── Out in the country: birds calling by day, crickets by night,
-        //    heard once the engine's quiet enough ──
-        let quiet = p.get(&p.quiet) * (1.0 - (speed.abs() / 60.0).min(1.0) * 0.7);
+        // ── The world around you: wind always, gusting; leaves in the
+        //    woods, waves by the water, a hum in town; creatures calling
+        //    by day and night. The engine and the speed drown most of it ──
         let daylight = p.get(&p.daylight);
-        let ambient = if quiet > 0.02 {
-            let mut v = 0.0;
-            // A call: a quick run of chirps, each sweeping down in pitch
-            if self.call >= 0.0 {
-                let t = self.call;
-                self.call += dt;
-                let chirp = (t * 9.0).fract();
-                let f = self.call_pitch * (4200.0 - 1800.0 * chirp);
-                self.call_phase += f * dt;
-                if self.call_phase > 1.0 { self.call_phase -= 1.0; }
-                let env = (1.0 - chirp).powi(2) * (chirp * 30.0).min(1.0);
-                v += (self.call_phase * TAU).sin() * env * 0.045 * daylight;
-                if t > 0.35 + self.call_pitch * 0.3 {
-                    self.call = -1.0;
-                }
+        let quiet = p.get(&p.quiet);
+        let ease = (dt / 1.5).min(1.0);
+        self.forest += (p.get(&p.scene[0]) - self.forest) * ease;
+        self.water += (p.get(&p.scene[1]) - self.water) * ease;
+        self.town += (p.get(&p.scene[2]) - self.town) * ease;
+        let hush = 1.0 - (speed.abs() / 70.0).min(1.0) * 0.6;
+        // Gusts: the wind wanders toward a new strength every few seconds
+        self.gust_wait -= dt;
+        if self.gust_wait <= 0.0 {
+            self.gust_target = 0.2 + self.chance() * 0.8;
+            self.gust_wait = 1.5 + self.chance() * 4.0;
+        }
+        self.gust += (self.gust_target - self.gust) * (dt / 1.2).min(1.0);
+        let n = self.noise_n(5);
+        let whoosh = self.wind_svf.band(n, 220.0 + 380.0 * self.gust, rate, 1.3);
+        self.wind_bed[0] += 0.01 * (n - self.wind_bed[0]);
+        let open_air = 1.0 - 0.5 * self.town;
+        let mut bed = (whoosh * 0.22 + self.wind_bed[0] * 0.3) * (0.2 + 0.8 * self.gust) * open_air;
+        // Leaves: bright noise fluttering in the gusts
+        let n = self.noise_n(1);
+        self.leaves_lp += 0.6 * (n - self.leaves_lp);
+        self.leaves_flutter += (self.chance() - self.leaves_flutter) * 0.004;
+        bed += (n - self.leaves_lp) * self.gust * self.gust * (0.4 + 0.6 * self.leaves_flutter) * 0.07 * self.forest;
+        // Waves: a swell of surf every several seconds, hiss as each breaks
+        if self.water > 0.01 {
+            self.wave_time += dt;
+            let swell = (0.5 - 0.5 * (self.wave_time * TAU / 6.5).cos()).powi(2);
+            let n = self.noise_n(2);
+            self.waves[0] += (0.02 + 0.1 * swell) * (n - self.waves[0]);
+            self.waves[1] += 0.01 * (self.waves[0] - self.waves[1]);
+            bed += (self.waves[0] - self.waves[1] * 0.5) * (0.15 + swell) * 0.14 * self.water;
+        }
+        // A town's hum: traffic and life a street or two away
+        if self.town > 0.01 {
+            let n = self.noise_n(4);
+            bed += self.hum.band(n, 160.0, rate, 0.8) * 0.05 * self.town;
+        }
+        let ambient = bed * hush;
+        let (mut amb_l, mut amb_r) = (0.0, 0.0);
+        // Calls: birds by day (and gulls by the water), owls and frogs at
+        // night; more of them out in the wilds than by the road
+        let lively = (0.4 + 0.6 * quiet) * hush;
+        self.call_wait -= dt * (0.6 + 0.8 * self.forest + 0.4 * quiet);
+        if self.call_wait <= 0.0 && self.calls.len() < MAX_CALLS && lively > 0.05 {
+            let night = 1.0 - daylight;
+            let pick = self.chance();
+            let kind = if night > 0.6 {
+                if self.water > 0.3 && pick < 0.6 { CallKind::Frog } else if self.forest > 0.2 && pick < 0.35 { CallKind::Owl } else { CallKind::None }
+            } else if self.water > 0.4 && pick < 0.3 {
+                CallKind::Gull
+            } else if pick < 0.45 {
+                CallKind::Chirps
+            } else if pick < 0.8 {
+                CallKind::Warble
             } else {
-                self.ambient_wait -= dt;
-                if self.ambient_wait <= 0.0 {
-                    self.call = 0.0;
-                    self.call_pitch = 0.8 + self.chance() * 0.5;
-                    self.ambient_wait = 0.6 + self.chance() * 3.0;
-                }
+                CallKind::Coo
+            };
+            if kind != CallKind::None {
+                let place = Place { pan: self.chance() * 2.0 - 1.0, behind: self.chance() * self.chance() };
+                let level = 0.4 + 0.6 * self.chance();
+                let pitch = 0.85 + 0.3 * self.chance();
+                let seed = self.noise_states[5] | 1;
+                self.calls.push(Call { kind, t: 0.0, pitch, phase: 0.0, level, place, ear: Spatial::default(), seed });
             }
-            // Crickets: a high trill in bursts, a few a second
-            self.cricket_phase += 4600.0 * dt;
-            if self.cricket_phase > 1.0 { self.cricket_phase -= 1.0; }
-            self.cricket_time += dt;
-            let trill = (self.cricket_phase * TAU).sin();
-            let pulse = if (self.cricket_time * 22.0).fract() < 0.5 && (self.cricket_time * 1.7).fract() < 0.6 { 1.0 } else { 0.0 };
-            v += trill * pulse * 0.013 * (1.0 - daylight);
-            v * quiet
-        } else {
-            0.0
-        };
-
+            self.call_wait = 0.4 + self.chance() * 2.5;
+        }
+        self.calls.retain_mut(|c| match c.next(dt) {
+            Some(v) => {
+                let (l, r) = c.ear.place(v * c.level * lively * 1.6, c.place, rate);
+                amb_l += l;
+                amb_r += r;
+                true
+            }
+            None => false,
+        });
+        // Crickets at night, each chirping its own pitch and pace
+        let night = (1.0 - daylight * 1.5).max(0.0);
+        if night > 0.01 {
+            for c in &mut self.crickets {
+                c.time += dt;
+                c.phase = (c.phase + c.pitch * dt).fract();
+                let pulse = (c.time * c.rate).fract();
+                let on = (c.time / c.burst).fract() < 0.55;
+                let env = if on { (1.0 - pulse * 2.0).max(0.0).powi(2) } else { 0.0 };
+                let v = (c.phase * TAU).sin() * env * 0.012 * night * lively;
+                let (gl, gr) = pan_gains(c.pan);
+                amb_l += v * gl;
+                amb_r += v * gr;
+            }
+        }
         // ── The steam train: a chuff of exhaust four times a turn of the
         //    wheels, the first of each four hardest ──
         let train_level = p.get(&p.train[0]);
@@ -1046,7 +1557,7 @@ impl EngineSource {
         // a wash of their own)
         let close = engine + squeal + gravel + roll + grind + buzz;
         let centre = close + wind + rain_sound + crowd + ambient;
-        let (mut left, mut right) = (centre + other_l, centre + other_r);
+        let (mut left, mut right) = (centre + other_l + amb_l, centre + other_r + amb_r);
         let mut send = close + (other_l + other_r) * 0.5;
 
         // ── One-shot sounds, each from where it happened ──
@@ -1180,7 +1691,7 @@ mod tests {
 
     /// Render `sound` on its own: (peak, RMS) over its length.
     fn render(sound: Sound, gain: f32) -> (f32, f32) {
-        let mut v = Voice { sound, gain, place: Place::CENTRE, ear: Spatial::default(), delay: 0.0, t: 0.0, seed: 0x1234_5679, lp: [0.0; 2] };
+        let mut v = Voice::new(sound, gain, Place::CENTRE, 0.0, 0x1234_5679);
         let dt = 1.0 / 44100.0;
         let (mut peak, mut sum, mut n) = (0.0_f32, 0.0, 0);
         while let Some(s) = v.next(dt) {
@@ -1317,7 +1828,7 @@ mod tests {
     fn sounds_from_behind_are_duller() {
         // Brightness: how much the sound changes sample to sample
         let measure = |behind: f32| {
-            let mut v = Voice { sound: Sound::Clang, gain: 1.0, place: Place { pan: 0.0, behind }, ear: Spatial::default(), delay: 0.0, t: 0.0, seed: 77, lp: [0.0; 2] };
+            let mut v = Voice::new(Sound::Clang, 1.0, Place { pan: 0.0, behind }, 0.0, 77);
             let (mut level, mut edge, mut last) = (0.0, 0.0, 0.0);
             let rate = 44100.0;
             while let Some(s) = v.next(1.0 / rate) {
@@ -1450,6 +1961,12 @@ mod tests {
         run(&mut source, 6.0, Box::new(|u| p.set_ambience(1.0, 1.0 - u)));
 
         let path = std::env::var("STUMBLER_AUDIO_DEMO").unwrap_or_else(|_| "audio-demo.wav".into());
+        write_wav(&path, rate, &samples);
+        println!("wrote {path}");
+    }
+
+    /// 16-bit stereo `samples` (interleaved) as a WAV file at `path`.
+    fn write_wav(path: &str, rate: u32, samples: &[i16]) {
         let data = (samples.len() * 2) as u32;
         let mut wav = Vec::with_capacity(44 + data as usize);
         wav.extend_from_slice(b"RIFF");
@@ -1467,8 +1984,138 @@ mod tests {
         for s in samples {
             wav.extend_from_slice(&s.to_le_bytes());
         }
-        std::fs::write(&path, wav).unwrap();
-        println!("wrote {path}");
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// Render `seconds` of the mix to a WAV in `dir`, calling `each` with how
+    /// far through (0..1) every 64 frames to drive it.
+    fn clip(dir: &str, name: &str, seconds: f32, setup: impl Fn(&AudioParams), mut each: impl FnMut(&AudioParams, f32)) {
+        let rate = 44100;
+        let params = Arc::new(AudioParams::new());
+        let mut source = EngineSource::new(Arc::clone(&params), rate);
+        setup(&params);
+        // Let eased levels settle before listening, then start the clip's
+        // own sounds afresh
+        for _ in 0..2 * rate as usize {
+            each(&params, 0.0);
+            source.next();
+            source.next();
+        }
+        source.voices.clear();
+        params.queue.lock().unwrap().clear();
+        setup(&params);
+        let frames = (seconds * rate as f32) as usize;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for k in 0..frames {
+            if k % 64 == 0 {
+                each(&params, k as f32 / frames as f32);
+            }
+            for _ in 0..2 {
+                samples.push((source.next().unwrap() * 32767.0) as i16);
+            }
+        }
+        write_wav(&format!("{dir}/{name}.wav"), rate, &samples);
+    }
+
+    /// Dev aid: short labelled clips of each kind of sound, to listen to
+    /// (and turn into spectrograms) when changing them. Written to
+    /// `$STUMBLER_AUDIO_OUT` (default `target/audio-clips`).
+    #[test]
+    #[ignore]
+    fn audio_clips() {
+        let dir = std::env::var("STUMBLER_AUDIO_OUT").unwrap_or_else(|_| "target/audio-clips".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.as_str();
+        // Engine
+        clip(d, "01-engine-idle", 3.0, |p| p.set_throttle(0.0), |_, _| ());
+        clip(d, "02-engine-full-throttle-through-gears", 8.0, |_| (), |p, u| {
+            p.set_throttle(1.0);
+            p.set_speed(175.0 * (u * 1.1).min(1.0).powf(0.85));
+        });
+        clip(d, "03-engine-lift-and-coast", 4.0, |_| (), |p, u| {
+            p.set_throttle(if u < 0.25 { 1.0 } else { 0.0 });
+            p.set_speed(if u < 0.25 { 110.0 } else { 110.0 - (u - 0.25) * 80.0 });
+            if (u * 4000.0) as u32 == 1001 { p.trigger_pop(); }
+        });
+        clip(d, "04-engine-part-throttle-cruise", 4.0, |_| (), |p, u| {
+            p.set_throttle(0.35 + 0.1 * (u * 12.0).sin());
+            p.set_speed(80.0);
+        });
+        clip(d, "05-engine-brake-and-downshift-into-corner", 4.0, |_| (), |p, u| {
+            p.set_throttle(if u < 0.55 { 0.0 } else { 1.0 });
+            p.set_speed(if u < 0.55 { 150.0 - u / 0.55 * 100.0 } else { 50.0 + (u - 0.55) * 120.0 });
+        });
+        // Impacts, light then hard
+        for (k, (sound, name)) in [(Sound::Clang, "wall"), (Sound::Crunch, "car"), (Sound::Thunk, "tree"), (Sound::Landing, "landing"), (Sound::Splash, "splash"), (Sound::Pop, "backfire")].into_iter().enumerate() {
+            clip(d, &format!("1{k}-hit-{name}-light-then-hard"), 2.6, move |p| {
+                p.play(sound, 0.3, Place::CENTRE, 0.2);
+                p.play(sound, 1.1, Place::CENTRE, 1.3);
+            }, |p, _| p.set_speed(60.0));
+        }
+        // Tyres and surfaces
+        clip(d, "20-skid-tarmac", 3.0, |_| (), |p, u| {
+            p.set_speed(90.0 - u * 50.0);
+            p.set_sliding(30.0 * (1.0 - u));
+            p.set_throttle(0.2);
+        });
+        clip(d, "21-slide-gravel", 3.0, |p| p.set_paved(false), |p, u| {
+            p.set_speed(70.0);
+            p.set_sliding(35.0 * (1.0 - u * 0.5));
+            p.set_throttle(0.8);
+        });
+        clip(d, "22-kerb", 2.0, |_| (), |p, u| {
+            p.set_speed(80.0);
+            p.set_throttle(0.6);
+            p.set_rumble(if u > 0.25 && u < 0.7 { 1.0 } else { 0.0 });
+        });
+        clip(d, "23-rolling-gravel-road", 3.0, |p| p.set_paved(false), |p, _| {
+            p.set_speed(60.0);
+            p.set_throttle(0.5);
+        });
+        clip(d, "24-scrape", 2.0, |_| (), |p, _| {
+            p.set_speed(50.0);
+            p.set_scrape(0.8);
+        });
+        // Ambience, parked and then driving slowly
+        clip(d, "30-ambience-country-day-parked", 10.0, |p| p.set_ambience(1.0, 1.0), |_, _| ());
+        clip(d, "31-ambience-country-night-parked", 10.0, |p| p.set_ambience(1.0, 0.0), |_, _| ());
+        clip(d, "32-ambience-country-day-driving", 6.0, |p| p.set_ambience(1.0, 1.0), |p, _| {
+            p.set_speed(45.0);
+            p.set_throttle(0.4);
+        });
+        clip(d, "33-ambience-by-the-road-day", 6.0, |p| p.set_ambience(0.3, 1.0), |_, _| ());
+        clip(d, "37-ambience-woods-day", 10.0, |p| { p.set_ambience(1.0, 1.0); p.set_scene(1.0, 0.0, 0.0); }, |_, _| ());
+        clip(d, "38-ambience-woods-night", 10.0, |p| { p.set_ambience(1.0, 0.0); p.set_scene(1.0, 0.0, 0.0); }, |_, _| ());
+        clip(d, "39-ambience-shore-day", 10.0, |p| { p.set_ambience(1.0, 1.0); p.set_scene(0.0, 1.0, 0.0); }, |_, _| ());
+        clip(d, "3a-ambience-lake-night", 10.0, |p| { p.set_ambience(1.0, 0.0); p.set_scene(0.2, 1.0, 0.0); }, |_, _| ());
+        clip(d, "3b-ambience-town", 8.0, |p| { p.set_ambience(0.2, 1.0); p.set_scene(0.0, 0.0, 1.0); }, |_, _| ());
+        clip(d, "34-rain", 5.0, |p| p.set_rain(1.0, 1.0), |p, _| {
+            p.set_speed(70.0);
+            p.set_throttle(0.5);
+        });
+        clip(d, "35-crowd", 5.0, |p| p.set_crowd(0.8), |_, _| ());
+        clip(d, "36-wind-at-top-speed", 4.0, |_| (), |p, _| {
+            p.set_speed(170.0);
+            p.set_throttle(1.0);
+        });
+        // Others
+        clip(d, "40-rival-passes-on-the-left", 4.0, |_| (), |p, u| {
+            p.set_throttle(0.8);
+            p.set_speed(130.0);
+            let a = u * std::f32::consts::PI;
+            let place = Place { pan: -a.sin(), behind: ((0.2 + a.cos()) / 0.8).clamp(0.0, 1.0) };
+            let near = 1.0 - (u - 0.5).abs() * 1.6;
+            p.set_other(0, 150.0, near.max(0.0).powi(2), if u < 0.5 { 1.08 } else { 0.92 }, place);
+        });
+        // The world on its own, engine off, to judge the ambience by
+        for (name, quiet, day, scene) in [("day", 1.0, 1.0, (0.0, 0.0, 0.0)), ("woods-day", 1.0, 1.0, (1.0, 0.0, 0.0)), ("woods-night", 1.0, 0.0, (1.0, 0.0, 0.0)), ("shore-day", 1.0, 1.0, (0.0, 1.0, 0.0)), ("lake-night", 1.0, 0.0, (0.2, 1.0, 0.0)), ("town", 0.2, 1.0, (0.0, 0.0, 1.0))] {
+            clip(d, &format!("50-stem-ambience-{name}"), 10.0, move |p| {
+                p.set_engine_level(0.0);
+                p.set_ambience(quiet, day);
+                p.set_scene(scene.0, scene.1, scene.2);
+            }, |_, _| ());
+        }
+        println!("wrote clips to {dir}");
     }
 
     /// How much of one core the mix takes with everything going at once.
@@ -1502,6 +2149,45 @@ mod tests {
         let used = start.elapsed().as_secs_f32() / 10.0;
         println!("audio: {:.2}% of a core ({sum})", used * 100.0);
         assert!(used < 0.1);
+    }
+
+    /// The engine on its own at `revs` and `load`: (RMS, brightness as the
+    /// share of the signal's change sample to sample).
+    fn engine_at(revs: f32, load: f32) -> (f32, f32) {
+        let mut e = Engine::new(44100.0, 1.0, 99);
+        let (mut sum, mut edge, mut last) = (0.0, 0.0, 0.0);
+        for k in 0..44100 {
+            let v = e.sample(revs, load, 0.0, 44100.0);
+            assert!(v.is_finite());
+            if k > 4410 {
+                sum += v * v;
+                edge += (v - last) * (v - last);
+            }
+            last = v;
+        }
+        ((sum / 39690.0).sqrt(), (edge / sum).sqrt())
+    }
+
+    #[test]
+    fn the_engine_hardens_on_the_power() {
+        for revs in [0.3, 0.6, 0.9] {
+            let (off_level, off_bright) = engine_at(revs, 0.0);
+            let (on_level, on_bright) = engine_at(revs, 1.0);
+            assert!(on_level > off_level * 1.5, "revs {revs}: no louder on the power ({on_level} vs {off_level})");
+            assert!(on_bright > off_bright, "revs {revs}: no brighter on the power");
+        }
+    }
+
+    /// A hard knock into a wall is over quickly: no bell-like ring after it.
+    #[test]
+    fn a_wall_hit_thuds_rather_than_rings() {
+        let mut v = Voice::new(Sound::Clang, 1.2, Place::CENTRE, 0.0, 4242);
+        let dt = 1.0 / 44100.0;
+        let (mut early, mut late) = (0.0, 0.0);
+        while let Some(s) = v.next(dt) {
+            if v.t < 0.25 { early += s * s } else { late += s * s }
+        }
+        assert!(late < early * 0.05, "rings on: {late} after vs {early} at first");
     }
 
     #[test]
