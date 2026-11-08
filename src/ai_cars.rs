@@ -5,8 +5,13 @@ use glam::{Vec2, Vec3};
 use crate::boosts::Boost;
 use crate::physics::{CarInput, CarPhysics, Ground, WHEELBASE};
 
-/// Lateral grip the AI plans corners with (units/s²); below the tyre limit.
-const PLAN_GRIP: f32 = 44.0;
+/// Lateral grip the AI plans corners with (units/s²). The car holds about
+/// 50 in slow and middling corners; in fast ones the steering lock is the
+/// limit, and a driver arriving a touch hot lets it carry them round.
+const PLAN_GRIP: f32 = 52.0;
+/// With another car right beside or ahead, drivers leave themselves a
+/// little in hand rather than racing on the limit.
+const TRAFFIC_MARGIN: f32 = 0.96;
 /// How far a racing line may run from a circuit's centreline: to within a
 /// car's width and a little of the edge.
 pub const RACING_ROOM: f32 = crate::road::ROAD_HALF_WIDTH - 7.0;
@@ -36,8 +41,21 @@ const LAUNCH_SPEED: f32 = 55.0;
 const LAUNCH_MERGE: f32 = 3.0;
 /// Corners this far ahead (units) shape how drivers pass and defend.
 const CORNER_LOOKAHEAD: f32 = 160.0;
-/// Braking deceleration the AI plans with (units/s²).
-const PLAN_BRAKE: f32 = 45.0;
+/// Braking deceleration the AI plans with (units/s²): the car manages
+/// about 66 in a straight line, less while turning in.
+const PLAN_BRAKE: f32 = 58.0;
+/// Points either side (4 units apart) a racing line's curvature is measured
+/// over: about the arc a car really drives through it. Shorter windows see
+/// the line's kinks at each apex and slow for them, worst through chicanes.
+const CURVE_SPAN: isize = 10;
+/// The same along a road's centreline, which a car has to follow bend for
+/// bend: a much shorter window.
+const CURVE_SPAN_CENTRE: isize = 4;
+/// However gentle the long window makes a bend look, no faster than this
+/// times what the short one says: a real hairpin stays a hairpin.
+const KINK_ALLOWANCE: f32 = 1.1;
+/// How far ahead (seconds) a driver reads its speed plan.
+const PLAN_REACTION: f32 = 0.16;
 /// Corners worth drifting: turning at least this far (radians) within
 /// `DRIFT_REACH` units, taken between these speeds (units/s).
 const DRIFT_TURN: f32 = 1.2;
@@ -155,18 +173,27 @@ impl AiTrack {
         let at = |i: isize| wrap(i, n, closed);
         let gap = |i: usize| points[i].distance(points[at(i as isize + 1)]).max(0.1);
 
-        // Corner speed from curvature (heading change over a short window)
-        let span = 4;
-        let mut speed: Vec<f32> = (0..n)
+        // Corner speed from curvature: the heading change over the stretch
+        // a car actually smooths a bend into, not the line's every kink
+        let span = if room > 0.0 { CURVE_SPAN } else { CURVE_SPAN_CENTRE };
+        // Signed turn at each point, so a window's total can pass half a
+        // turn (a hairpin) and a chicane's two halves cancel
+        let turn_at: Vec<f32> = (0..n as isize)
             .map(|i| {
-                let a = points[at(i as isize - span)];
-                let b = points[i];
-                let c = points[at(i as isize + span)];
-                let d1 = (b - a).normalize_or_zero();
-                let d2 = (c - b).normalize_or_zero();
-                let angle = d1.perp_dot(d2).atan2(d1.dot(d2)).abs();
-                let curvature = angle / ((a.distance(b) + b.distance(c)) * 0.5).max(0.1);
-                (PLAN_GRIP / curvature.max(1e-5)).sqrt().min(top_speed)
+                let d1 = (points[at(i)] - points[at(i - 1)]).normalize_or_zero();
+                let d2 = (points[at(i + 1)] - points[at(i)]).normalize_or_zero();
+                d1.perp_dot(d2).atan2(d1.dot(d2))
+            })
+            .collect();
+        let corner_speed = |i: isize, span: isize| {
+            let angle = ((i - span + 1)..(i + span)).map(|k| turn_at[at(k)]).sum::<f32>().abs();
+            let length = ((i - span)..(i + span)).map(|k| gap(at(k))).sum::<f32>();
+            (PLAN_GRIP * length.max(0.1) / angle.max(1e-5)).sqrt()
+        };
+        let mut speed: Vec<f32> = (0..n as isize)
+            .map(|i| {
+                let close = corner_speed(i, CURVE_SPAN_CENTRE);
+                corner_speed(i, span).min(close * KINK_ALLOWANCE).min(top_speed)
             })
             .collect();
 
@@ -501,10 +528,14 @@ impl AiDriver {
             (wheel_angle / car.steer_limit()).clamp(-1.0, 1.0)
         };
 
-        // Speed: plan from the profile a little ahead (reaction time)
-        let plan_idx = track.at(self.progress_idx + (speed.abs() * 0.25 / spacing) as usize);
+        // Speed: the profile just ahead (its braking curves already leave
+        // room to slow for what's coming, so looking further only lifts early)
+        let plan_idx = track.at(self.progress_idx + (speed.abs() * PLAN_REACTION / spacing) as usize + 1);
         // Corner speeds come down with the grip in the wet
         let mut planned = track.speed[plan_idx] * self.pace * self.grip.sqrt();
+        if company {
+            planned *= TRAFFIC_MARGIN;
+        }
         // Into a braking zone: now and then (more often with someone close
         // behind) a driver leaves it too late and runs wide
         let braking = planned < speed - 10.0;
@@ -531,14 +562,16 @@ impl AiDriver {
         let error = target_speed - speed;
         let (mut throttle, brake) = if urgent && error < 0.0 {
             (0.0, (-error / 8.0).clamp(0.3, 1.0))
-        } else if error > 5.0 {
+        } else if error > 2.0 {
             (1.0, 0.0)
-        } else if error > 0.0 {
-            (error / 5.0, 0.0)
-        } else if error > -8.0 {
+        } else if error > -1.0 {
+            // On the plan: hold it there rather than coasting off it
+            ((error + 1.0) / 3.0, 0.0)
+        } else if error > -3.0 {
             (0.0, 0.0)
         } else {
-            (0.0, ((-error - 8.0) / 20.0).clamp(0.2, 1.0))
+            // Over it: brake as hard as the overshoot asks, straight away
+            (0.0, ((-error - 3.0) / 8.0).clamp(0.3, 1.0))
         };
         // Ease off while sliding or landing, to get the grip back
         let vel_dir = Vec2::new(car.vel.x, car.vel.z).normalize_or_zero();

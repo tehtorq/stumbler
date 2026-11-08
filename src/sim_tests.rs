@@ -426,11 +426,6 @@ fn terrain_fits_snugly_around_roads() {
     }
 }
 
-/// Laps of circuit `name` (from its start line), driven by the AI's choices
-/// either as they are or rounded to what a keyboard can do (full or nothing
-/// on each key, the steering eased in as the game does). Returns (seconds
-/// per lap, worst distance off the line, seconds spent off the road,
-/// seconds with all four wheels in the air).
 /// The real map in the wet: everything has rain-soaked grip.
 struct WetGround;
 impl crate::physics::Ground for WetGround {
@@ -440,15 +435,27 @@ impl crate::physics::Ground for WetGround {
     fn water(&self, x: f32, z: f32) -> Option<f32> { WorldGround.water(x, z) }
 }
 
+/// A simulated keyboard player changes which keys they're holding this often
+/// (about 15 times a second: quick tapping, but not every frame).
+const KEY_DECISION_FRAMES: usize = 4;
+/// They let the wheel settle within this much of where they want it.
+const KEY_BAND: f32 = 0.08;
+
+/// Laps of circuit `name` (from its start line), driven by the AI's choices
+/// either as they are or as a keyboard player would manage them: full or
+/// nothing on each key, tapping to hold the wheel and pedals about where
+/// they want them, the steering eased in and out as the game does. Returns
+/// (seconds per lap, worst distance off the line, seconds spent off the
+/// road, seconds with all four wheels in the air).
 fn drive_laps(name: &str, laps: u32, keyboard: bool) -> (f32, f32, f32, f32) {
     drive_laps_on(name, laps, keyboard, false)
 }
 
 fn drive_laps_on(name: &str, laps: u32, keyboard: bool, wet: bool) -> (f32, f32, f32, f32) {
-    drive_laps_with(name, laps, keyboard, wet, crate::physics::SETUPS[0])
+    drive_laps_with(name, laps, keyboard, wet, crate::physics::SETUPS[0], 1.0)
 }
 
-fn drive_laps_with(name: &str, laps: u32, keyboard: bool, wet: bool, setup: crate::physics::Setup) -> (f32, f32, f32, f32) {
+fn drive_laps_with(name: &str, laps: u32, keyboard: bool, wet: bool, setup: crate::physics::Setup, pace: f32) -> (f32, f32, f32, f32) {
     let ground: &dyn crate::physics::Ground = if wet { &WetGround } else { &WorldGround };
     let net = network();
     let layout_names: Vec<&str> = crate::layout::build(terrain::TERRAIN_HALF_SIZE).circuits.iter().map(|c| c.name).collect();
@@ -459,21 +466,46 @@ fn drive_laps_with(name: &str, laps: u32, keyboard: bool, wet: bool, setup: crat
     let n = track.len();
     let (pos, yaw) = track.pose(0, 0.0);
     let mut car = CarPhysics::new_on(ground, Vec3::new(pos.x, 0.0, pos.y), yaw);
-    let mut driver = AiDriver::new(0, Personality::plain(1.0, 0.0), 1.0);
+    let mut driver = AiDriver::new(0, Personality::plain(pace, 0.0), 1.0);
     car.setup = setup;
     driver.grip = if wet { crate::weather::WET_GRIP } else { 1.0 };
     let dt = 1.0 / 60.0;
     let (mut t, mut steer, mut worst, mut off, mut air) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
     let mut laps_done = 0;
     let mut last = 0;
+    // The keys a keyboard player is holding, and how far their pedal taps
+    // have run ahead of (or behind) what they wanted
+    let (mut key, mut gas, mut brake) = (0.0_f32, false, false);
+    let (mut gas_owed, mut brake_owed) = (0.0_f32, 0.0_f32);
+    let mut frame = 0usize;
     while laps_done < laps && t < 600.0 {
         let mut input = driver.input(&track, &car, &[], dt);
         if keyboard {
-            let target = if input.steer > 0.25 { 1.0 } else if input.steer < -0.25 { -1.0 } else { 0.0 };
+            // Like a player on keys: hold one toward where they want the
+            // wheel and let go once it's there, and tap the pedals so they're
+            // down about as much of the time as they'd press them, deciding
+            // a few times a second rather than every frame
+            gas_owed += input.throttle - gas as u8 as f32;
+            brake_owed += input.brake - brake as u8 as f32;
+            if frame % KEY_DECISION_FRAMES == 0 {
+                // Press toward where they want the wheel, or the other way if
+                // it's gone past; near enough, keep doing as they were (and
+                // let go if they want it straight)
+                if input.steer > steer + KEY_BAND {
+                    key = 1.0;
+                } else if input.steer < steer - KEY_BAND {
+                    key = -1.0;
+                } else if input.steer.abs() < KEY_BAND {
+                    key = 0.0;
+                }
+                gas = gas_owed > 0.0;
+                brake = brake_owed > 0.0;
+            }
+            frame += 1;
             let tune = crate::tuning::get();
-            let rate = if target == 0.0 || target * steer < 0.0 { tune.steer_return } else { tune.steer_in };
-            steer += (target - steer).clamp(-rate * dt, rate * dt);
-            input = CarInput { steer, throttle: if input.throttle > 0.5 { 1.0 } else { 0.0 }, brake: if input.brake > 0.2 { 1.0 } else { 0.0 }, handbrake: false };
+            let rate = if key == 0.0 || key * steer < 0.0 { tune.steer_return } else { tune.steer_in };
+            steer += (key - steer).clamp(-rate * dt, rate * dt);
+            input = CarInput { steer, throttle: gas as u8 as f32, brake: brake as u8 as f32, handbrake: false };
         }
         car.update(ground, dt, input);
         t += dt;
@@ -511,7 +543,13 @@ fn keyboard_driving_stays_on_the_road_without_taking_off() {
     // as smooth analogue inputs, and nothing on a circuit should launch a car
     for name in ["STUMBLER RING", "MONACO"] {
         let (a_lap, _, _, _) = drive_laps(name, 1, false);
-        let (k_lap, worst, off, air) = drive_laps(name, 1, true);
+        // A player on the keys drives at the pace they can manage cleanly,
+        // not the edge an analogue driver can hold: their best clean lap
+        let (k_lap, worst, off, air) = [1.0, 0.97, 0.94]
+            .iter()
+            .map(|&pace| drive_laps_with(name, 1, true, false, crate::physics::SETUPS[0], pace))
+            .min_by(|a, b| (a.0 + a.2 * 100.0).total_cmp(&(b.0 + b.2 * 100.0)))
+            .unwrap();
         println!("{name}: keyboard {k_lap:.1}s vs analogue {a_lap:.1}s, {worst:.0} off the line, {off:.1}s off the road, {air:.1}s in the air");
         assert!(k_lap < a_lap * 1.05, "{name}: keyboard lap {k_lap:.1}s vs {a_lap:.1}s");
         assert!(off < 0.5 && worst < 30.0, "{name}: ran off the road ({worst:.0} off the line, {off:.1}s)");
@@ -687,6 +725,11 @@ fn race_report(name: &str, player_pace: f32, seed: u32) -> RaceStats {
                 knock(i + 1, i + j + 2, hit, &mut stats);
             }
         }
+        // The causeway walls, as in the game
+        hit_walls(&mut player);
+        for car in &mut cars {
+            hit_walls(&mut car.physics);
+        }
         race.update(dt, Vec2::new(player.pos.x, player.pos.z), &mut cars, &track);
         for (k, car) in cars.iter().enumerate() {
             if car.driver.drifting() && !was_drifting[k] {
@@ -793,7 +836,12 @@ fn race_seed_sweep() {
 fn keyboard_driving_in_the_wet_stays_on_the_road() {
     // Slower in the rain, but still drivable on the keys
     let (dry, _, _, _) = drive_laps("MONACO", 1, true);
-    let (wet, worst, off, _) = drive_laps_on("MONACO", 1, true, true);
+    // As in the dry, a player on the keys backs off to a pace they can hold
+    let (wet, worst, off, _) = [1.0, 0.97, 0.94]
+        .iter()
+        .map(|&pace| drive_laps_with("MONACO", 1, true, true, crate::physics::SETUPS[0], pace))
+        .min_by(|a, b| (a.0 + a.2 * 100.0 + (a.1 - 30.0).max(0.0) * 10.0).total_cmp(&(b.0 + b.2 * 100.0 + (b.1 - 30.0).max(0.0) * 10.0)))
+        .unwrap();
     println!("Monaco on the keys: dry {dry:.1}s, wet {wet:.1}s, {worst:.0} off the line, {off:.1}s off the road");
     assert!(wet > dry, "the wet should cost time");
     assert!(off < 0.5 && worst < 30.0, "ran off the road in the wet ({worst:.0} off the line, {off:.1}s)");
@@ -1760,4 +1808,81 @@ fn causeway_walls_keep_cars_out_of_the_water() {
     println!("{tried} runs at causeway edges");
     assert!(tried > 50, "only {tried} runs: found no causeways?");
     assert!(lost.is_empty(), "{} of {tried} runs off the causeway, e.g.\n{}", lost.len(), lost.iter().take(8).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+#[test]
+#[ignore]
+fn chicane_report() {
+    // Where the AI on its racing line runs well under its own speed plan
+    for name in ["STUMBLER RING", "MONACO", "SUZUKA", "MONZA"] {
+        let net = network();
+        let layout_names: Vec<&str> = crate::layout::build(terrain::TERRAIN_HALF_SIZE).circuits.iter().map(|c| c.name).collect();
+        let k = layout_names.iter().position(|&n| n == name).expect("circuit");
+        let points = net.paths.iter().filter(|p| p.circuit()).nth(k).unwrap().points.clone();
+        let track = AiTrack::racing(points, crate::AI_TOP_SPEED, crate::ai_cars::RACING_ROOM);
+        let n = track.len();
+        let (pos, yaw) = track.pose(0, 0.0);
+        let mut car = CarPhysics::new_on(&WorldGround, Vec3::new(pos.x, 0.0, pos.y), yaw);
+        let mut driver = AiDriver::new(0, Personality::plain(std::env::var("CPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0), 0.0), 1.0);
+        let dt = 1.0 / 60.0;
+        let mut actual = vec![0.0_f32; n];
+        let mut steer = vec![0.0_f32; n];
+        let mut brake = vec![0.0_f32; n];
+        let mut slide = vec![0.0_f32; n];
+        let (mut t, mut last, mut laps, mut lap_t) = (0.0_f32, 0, 0, 0.0);
+        let (mut worst, mut off) = (0.0_f32, 0.0_f32);
+        while laps < 2 && t < 600.0 {
+            let input = driver.input(&track, &car, &[], dt);
+            car.update(&WorldGround, dt, input);
+            t += dt;
+            if laps == 1 {
+                let i = driver.progress_idx;
+                let p = Vec2::new(car.pos.x, car.pos.z);
+                worst = worst.max(track.points[i].distance(p));
+                if road::on_road(p.x, p.y) < 0.5 { off += dt; }
+                actual[i] = car.speed;
+                steer[i] = input.steer;
+                brake[i] = input.brake - input.throttle;
+                slide[i] = car.sideslip();
+            }
+            if driver.progress_idx < last && last > n * 3 / 4 {
+                laps += 1;
+                if laps == 1 { lap_t = t; } else { lap_t = t - lap_t; }
+            }
+            last = driver.progress_idx;
+        }
+        let plan: f32 = (0..n).map(|i| track.points[i].distance(track.points[(i + 1) % n]) / track.speed[i].max(1.0)).sum();
+        println!("{name}: lap {lap_t:.1}s, plan {plan:.1}s, off-line {worst:.0}, off-road {off:.1}s");
+        let window = std::env::var("CHICANE_WINDOW").ok().and_then(|w| { let (a, b) = w.split_once('-')?; Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)) });
+        let only = std::env::var("CHICANE_TRACK").ok();
+        for i in (0..n).step_by(3) {
+            if only.as_deref().is_some_and(|o| o != name) { break; }
+            let show = match window { Some((a, b)) => i >= a && i <= b, None => actual[i] > 0.0 && actual[i] < track.speed[i] - 3.0 && brake[i] > -0.9 };
+            if show {
+                println!("  {i:4} plan {:5.1} actual {:5.1} steer {:+.2} pedal {:+.2} slip {:+.2}", track.speed[i], actual[i], steer[i], brake[i], slide[i]);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn race_finish_sweep() {
+    // How many races (of each circuit, both player paces) fail to finish
+    let only = std::env::var("RQ_ONLY").ok();
+    for name in ["STUMBLER RING", "SUZUKA", "MONACO"].into_iter().filter(|n| only.as_deref().is_none_or(|o| o == *n)) {
+        let mut failed = Vec::new();
+        let (mut knocks, mut off, mut runs) = (0, 0.0, 0);
+        let paces: Vec<f32> = std::env::var("RQ_PACE").ok().map(|p| vec![p.parse().unwrap()]).unwrap_or(vec![1.0, 0.92]);
+        let seeds: Vec<u32> = std::env::var("RQ_SEED").ok().map(|p| vec![p.parse().unwrap()]).unwrap_or((1..=15).step_by(2).collect());
+        for &pace in &paces {
+            for &seed in &seeds {
+                match std::panic::catch_unwind(|| race_report(name, pace, seed)) {
+                    Ok(s) => { knocks += s.rival_contacts + s.player_contacts; off += s.off_road; runs += 1; }
+                    Err(_) => failed.push((pace, seed)),
+                }
+            }
+        }
+        println!("{name}: {} failed {failed:?}; per race {:.1} knocks, {:.1}s off road", failed.len(), knocks as f32 / runs as f32, off / runs as f32);
+    }
 }
